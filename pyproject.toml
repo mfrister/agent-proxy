@@ -14,4 +14,4 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["test_addon.py"]
+testpaths = ["test_addon.py", "test_functional.py"]

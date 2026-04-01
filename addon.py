@@ -176,8 +176,10 @@ class LoggingAddon:
 
 def create_app(state: ProxyState) -> Flask:
     app = Flask(__name__)
-    # Silence werkzeug request logs — the proxy's own LoggingAddon handles that
+    # Silence werkzeug request logs and Flask startup banner
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    import flask.cli
+    flask.cli.show_server_banner = lambda *_a, **_kw: None
 
     @app.get("/denied")
     def get_denied():
