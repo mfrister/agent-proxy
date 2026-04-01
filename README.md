@@ -28,6 +28,12 @@ export SSL_CERT_FILE=~/.mitmproxy/mitmproxy-ca-cert.pem
 
 The CA cert is generated on first run at `~/.mitmproxy/` (or the path set by `--set confdir=`).
 
+**Lima VM:** Instead of setting the env vars manually, run `setup-lima-proxy.sh` to install the CA cert into the VM's system trust store and write the proxy env to `/etc/profile.d/proxy.sh` in one step:
+
+```bash
+./setup-lima-proxy.sh [<vm-name>] [--proxy-port <port>]
+```
+
 ## Configuration
 
 **`config.yaml`** — domain allowlist:
