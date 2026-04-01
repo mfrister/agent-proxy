@@ -1,0 +1,2 @@
+allowed_hosts:
+  - api.anthropic.com
