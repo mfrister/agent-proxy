@@ -75,7 +75,7 @@ class AllowlistAddon:
 
     def running(self):
         """Start the management API in a background thread."""
-        port = int(os.environ.get("PROXY_MGMT_PORT", "8081"))
+        port = int(os.environ.get("PROXY_MGMT_PORT", "8082"))
         threading.Thread(
             target=lambda: create_app(self.state).run(
                 host="127.0.0.1", port=port, use_reloader=False

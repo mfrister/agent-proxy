@@ -63,11 +63,11 @@ allowed_hosts:
 |---|---|---|
 | `PROXY_CONFIG` | `config.yaml` | Path to allowlist YAML |
 | `PROXY_CREDENTIALS` | `[]` | JSON credential mappings |
-| `PROXY_MGMT_PORT` | `8081` | Management API port |
+| `PROXY_MGMT_PORT` | `8082` | Management API port |
 
 ## Management API
 
-Runs on `127.0.0.1:8081` (not proxied).
+Runs on `127.0.0.1:8082` (not proxied).
 
 | Method | Path | Body | Description |
 |---|---|---|---|
