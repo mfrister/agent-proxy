@@ -6,6 +6,8 @@ dependencies = [
     "mitmproxy>=10",
     "flask>=3",
     "pyyaml>=6",
+    "textual>=1.0",
+    "httpx>=0.27",
 ]
 
 [dependency-groups]

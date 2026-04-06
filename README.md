@@ -65,6 +65,38 @@ allowed_hosts:
 | `PROXY_CREDENTIALS` | `[]` | JSON credential mappings |
 | `PROXY_MGMT_PORT` | `8082` | Management API port |
 
+## Terminal UI
+
+A terminal UI for monitoring and managing the proxy at runtime:
+
+```bash
+uv run python tui.py
+# or with a custom port:
+uv run python tui.py --port 9000
+```
+
+The port defaults to `$PROXY_MGMT_PORT` (or 8082 if unset).
+
+![TUI screenshot](docs/tui-screenshot.svg)
+
+The UI polls every 5 seconds and shows two panels:
+
+- **DENIED** — recent blocked connections, deduplicated by host, newest first. The full URL of the highlighted row is shown below the panels.
+- **ALLOWED** — current allowlist: permanent hosts and temporary allows with live countdown.
+
+Key bindings:
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` or `k` / `j` | Navigate rows |
+| `Tab` | Switch focus between panels |
+| `1` / `2` / `3` | Select duration: 1m / 10m / 2h |
+| `d` | Cycle through durations |
+| `t` | Temporarily allow the selected denied host |
+| `p` | Permanently allow the selected denied host |
+| `r` | Force refresh |
+| `q` | Quit |
+
 ## Management API
 
 Runs on `127.0.0.1:8082` (not proxied).
