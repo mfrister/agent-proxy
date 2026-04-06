@@ -1,2 +1,3 @@
 allowed_hosts:
   - api.anthropic.com
+  - platform.claude.com
