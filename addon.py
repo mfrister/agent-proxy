@@ -202,7 +202,7 @@ def create_app(state: ProxyState) -> Flask:
     def temp_allow():
         body = flask_request.get_json(force=True)
         host = body["host"]
-        duration = float(body["duration_seconds"])
+        duration = float(body.get("duration_seconds", 300))
         with state.temp_lock:
             state.temp_allows[host] = time.time() + duration
         return jsonify({"ok": True})

@@ -73,7 +73,7 @@ Runs on `127.0.0.1:8082` (not proxied).
 |---|---|---|---|
 | GET | `/allowlist` | — | Permanent + active temporary allows |
 | GET | `/denied` | — | Recent denied requests |
-| POST | `/allow/temp` | `{"host": "…", "duration_seconds": 60}` | Add TTL-based allow |
+| POST | `/allow/temp` | `{"host": "…", "duration_seconds": 60}` | Add TTL-based allow; `duration_seconds` defaults to 300 |
 | POST | `/allow/permanent` | `{"host": "…"}` | Append to `config.yaml` and reload |
 
 Reload allowlist without restart: `kill -HUP <pid>`
