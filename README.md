@@ -2,7 +2,7 @@
 
 **Warning:** This is an experimental more-or-less vibe-coded project. I've had a look a the code, but haven't thoroughly vetted it.
 
-mitmproxy addon that acts as the sole HTTP/HTTPS egress point for an LLM agent sandbox. Enforces a domain allowlist, brokers API credentials so real secrets never enter the sandbox, and exposes a management API for runtime changes.
+mitmproxy addon that acts as the sole HTTP/HTTPS egress point for an LLM agent sandbox. Enforces a domain allowlist, brokers API credentials so real secrets never enter the sandbox, strips unwanted `Set-Cookie` response headers, and exposes a management API for runtime changes.
 
 ## Setup
 
@@ -38,13 +38,19 @@ The CA cert is generated on first run at `~/.mitmproxy/` (or the path set by `--
 
 ## Configuration
 
-**`config.yaml`** — domain allowlist:
+**`config.yaml`** — domain allowlist and per-host options:
 
 ```yaml
 allowed_hosts:
-  - api.anthropic.com
-  - github.com
+  - host: api.anthropic.com       # all Set-Cookie headers pass through (default)
+  - host: platform.claude.com
+    allow_response_cookies: []    # strip all Set-Cookie headers
+  - host: internal.example.com
+    allow_response_cookies:
+      - csrftoken                 # only csrftoken passes through; others stripped
 ```
+
+When `allow_response_cookies` is absent, all `Set-Cookie` headers from that host pass through unchanged. An empty list strips everything; a non-empty list is an allowlist.
 
 **`PROXY_CREDENTIALS`** — credential mappings (JSON array). Two modes are supported:
 

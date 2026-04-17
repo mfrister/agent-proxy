@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -52,6 +53,25 @@ class EchoHandler(BaseHTTPRequestHandler):
         pass
 
 
+class CookieHandler(BaseHTTPRequestHandler):
+    """Returns a fixed set of Set-Cookie headers to test proxy cookie filtering."""
+
+    COOKIES = ["csrftoken=abc123", "session=xyz789", "tracker=evil"]
+
+    def do_GET(self):
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        for cookie in self.COOKIES:
+            self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
 class _ForceProxyHandler(urllib.request.ProxyHandler):
     """ProxyHandler that ignores no_proxy — needed because the system no_proxy
     typically excludes 127.0.0.1/localhost, which is where our echo server runs."""
@@ -74,27 +94,17 @@ def agent_opener(proxy_url: str) -> urllib.request.OpenerDirector:
     )
 
 
-# ── Fixture ────────────────────────────────────────────────────────────────────
+# ── Fixture factory ────────────────────────────────────────────────────────────
 
-@pytest.fixture(scope="module")
-def proxy(tmp_path_factory):
-    tmp = tmp_path_factory.mktemp("functional")
-
-    # Echo server in a background thread
+@contextmanager
+def _proxy_context(tmp, handler_class, config_text, creds="[]"):
+    """Spin up an HTTP server and a mitmdump proxy; yield connection details."""
     server_port = free_port()
-    server = HTTPServer(("127.0.0.1", server_port), EchoHandler)
+    server = HTTPServer(("127.0.0.1", server_port), handler_class)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    # Minimal allowlist: only the echo server host
     config = tmp / "config.yaml"
-    config.write_text("allowed_hosts:\n  - 127.0.0.1\n")
-
-    creds = json.dumps([{
-        "host": "127.0.0.1",
-        "header": "X-Api-Key",
-        "fake_value": "fake-key",
-        "real_value": "real-key",
-    }])
+    config.write_text(config_text)
 
     proxy_port = free_port()
     proc = subprocess.Popen(
@@ -111,7 +121,6 @@ def proxy(tmp_path_factory):
         stderr=subprocess.DEVNULL,
     )
 
-    # Wait up to 10 s for proxy to bind
     deadline = time.time() + 10
     while time.time() < deadline:
         try:
@@ -123,14 +132,45 @@ def proxy(tmp_path_factory):
         proc.terminate()
         pytest.fail("Proxy did not start in time")
 
-    yield {
-        "opener": agent_opener(f"http://127.0.0.1:{proxy_port}"),
-        "server_url": f"http://127.0.0.1:{server_port}",
-    }
+    try:
+        yield {
+            "opener": agent_opener(f"http://127.0.0.1:{proxy_port}"),
+            "server_url": f"http://127.0.0.1:{server_port}",
+        }
+    finally:
+        proc.terminate()
+        proc.wait()
+        server.shutdown()
 
-    proc.terminate()
-    proc.wait()
-    server.shutdown()
+
+@pytest.fixture(scope="module")
+def proxy(tmp_path_factory):
+    creds = json.dumps([{
+        "host": "127.0.0.1",
+        "header": "X-Api-Key",
+        "fake_value": "fake-key",
+        "real_value": "real-key",
+    }])
+    with _proxy_context(
+        tmp_path_factory.mktemp("functional"),
+        EchoHandler,
+        "allowed_hosts:\n  - host: 127.0.0.1\n",
+        creds,
+    ) as ctx:
+        yield ctx
+
+
+@pytest.fixture(scope="module")
+def proxy_cookie(tmp_path_factory):
+    with _proxy_context(
+        tmp_path_factory.mktemp("functional_cookie"),
+        CookieHandler,
+        "allowed_hosts:\n"
+        "  - host: 127.0.0.1\n"
+        "    allow_response_cookies:\n"
+        "      - csrftoken\n",
+    ) as ctx:
+        yield ctx
 
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
@@ -155,3 +195,20 @@ def test_credential_swap(proxy):
     data = json.loads(proxy["opener"].open(req).read())
     # Echo server must see the real key, never the fake one
     assert data["headers"].get("x-api-key") == "real-key"
+
+
+# ── Cookie filtering tests ──────────────────────────────────────────────────────
+
+def test_cookie_filtering_keeps_allowed(proxy_cookie):
+    resp = proxy_cookie["opener"].open(proxy_cookie["server_url"] + "/")
+    cookies = resp.info().get_all("set-cookie") or []
+    cookie_names = [c.split("=")[0].strip() for c in cookies]
+    assert "csrftoken" in cookie_names
+
+
+def test_cookie_filtering_strips_others(proxy_cookie):
+    resp = proxy_cookie["opener"].open(proxy_cookie["server_url"] + "/")
+    cookies = resp.info().get_all("set-cookie") or []
+    cookie_names = [c.split("=")[0].strip() for c in cookies]
+    assert "session" not in cookie_names
+    assert "tracker" not in cookie_names

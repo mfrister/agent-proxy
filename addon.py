@@ -18,6 +18,16 @@ Credential mapping format:
   Inject mode (proxy adds the header unconditionally; omit fake_value):
   [{"host": "api.example.com", "header": "Cookie",
     "real_value": "session=abc123"}]
+
+Config YAML format:
+
+  allowed_hosts:
+    - api.anthropic.com                   # plain string: all cookies pass through
+    - host: platform.claude.com
+      allow_response_cookies: []          # no cookies allowed (all stripped)
+    - host: internal.example.com
+      allow_response_cookies:
+        - csrftoken                       # only csrftoken passes through
 """
 
 import collections
@@ -39,6 +49,12 @@ from mitmproxy.http import HTTPFlow
 # ── Shared state ──────────────────────────────────────────────────────────────
 
 @dataclass
+class HostConfig:
+    allow_response_cookies: list[str] | None = None
+    # None means no restriction; a list (even empty) enables filtering
+
+
+@dataclass
 class ProxyState:
     allowlist: set            # permanent allowed hosts
     allowlist_path: str       # path to config YAML, used by SIGHUP reload
@@ -47,6 +63,7 @@ class ProxyState:
     temp_lock: threading.Lock
     deny_log: collections.deque  # maxlen=1000, entries: {timestamp,host,url,method}
     deny_lock: threading.Lock
+    host_config: dict         # host -> HostConfig
 
 
 # ── Config loaders ─────────────────────────────────────────────────────────────
@@ -56,9 +73,29 @@ def load_allowlist(path: str) -> set:
     try:
         with open(path) as f:
             data = yaml.safe_load(f) or {}
-        return set(data.get("allowed_hosts", []))
+        result = []
+        for item in data.get("allowed_hosts", []):
+            result.append(item["host"])
+        return set(result)
     except FileNotFoundError:
         return set()
+
+
+def load_host_config(path: str) -> dict:
+    """Load per-host config from YAML. Returns empty dict if file is missing."""
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        result = {}
+        for item in data.get("allowed_hosts", []):
+            if not isinstance(item, str):
+                host = item["host"]
+                result[host] = HostConfig(
+                    allow_response_cookies=item.get("allow_response_cookies")
+                )
+        return result
+    except FileNotFoundError:
+        return {}
 
 
 def load_credentials() -> list:
@@ -167,6 +204,20 @@ class CredentialBrokerAddon:
                         "expected_fake": fake,
                     }))
 
+    def response(self, flow: HTTPFlow):
+        host = flow.request.pretty_host
+        cfg = self.state.host_config.get(host)
+        if cfg is None or cfg.allow_response_cookies is None:
+            return
+        allowed = set(cfg.allow_response_cookies)
+        kept = [
+            v for v in flow.response.headers.get_all("set-cookie")
+            if v.split("=")[0].strip() in allowed
+        ]
+        flow.response.headers.pop("set-cookie", None)
+        for v in kept:
+            flow.response.headers.add("set-cookie", v)
+
 
 class LoggingAddon:
     """Structured JSON logging of all allowed outbound requests."""
@@ -233,12 +284,14 @@ def create_app(state: ProxyState) -> Flask:
         except FileNotFoundError:
             data = {}
         hosts = data.get("allowed_hosts", [])
-        if host not in hosts:
-            hosts.append(host)
+        host_names = [h if isinstance(h, str) else h["host"] for h in hosts]
+        if host not in host_names:
+            hosts.append({"host": host})
             data["allowed_hosts"] = hosts
             with open(state.allowlist_path, "w") as f:
                 yaml.safe_dump(data, f)
         state.allowlist = load_allowlist(state.allowlist_path)
+        state.host_config = load_host_config(state.allowlist_path)
         return jsonify({"ok": True})
 
     return app
@@ -249,6 +302,7 @@ def create_app(state: ProxyState) -> Flask:
 def setup_sighup(state: ProxyState):
     def handler(signum, frame):
         state.allowlist = load_allowlist(state.allowlist_path)
+        state.host_config = load_host_config(state.allowlist_path)
         print(json.dumps({
             "event": "sighup_reload",
             "host_count": len(state.allowlist),
@@ -268,6 +322,7 @@ state = ProxyState(
     temp_lock=threading.Lock(),
     deny_log=collections.deque(maxlen=1000),
     deny_lock=threading.Lock(),
+    host_config=load_host_config(_config_path),
 )
 
 setup_sighup(state)

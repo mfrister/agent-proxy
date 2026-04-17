@@ -30,6 +30,7 @@ def make_state(**overrides):
         temp_lock=threading.Lock(),
         deny_log=collections.deque(maxlen=1000),
         deny_lock=threading.Lock(),
+        host_config={},
     )
     defaults.update(overrides)
     return ProxyState(**defaults)
@@ -231,7 +232,7 @@ class TestSighupReload:
         from addon import load_allowlist, setup_sighup
 
         config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts:\n  - original.com\n")
+        config.write_text("allowed_hosts:\n  - host: original.com\n")
 
         state = make_state(
             allowlist={"original.com"},
@@ -240,7 +241,7 @@ class TestSighupReload:
         setup_sighup(state)
 
         # Update config on disk then signal
-        config.write_text("allowed_hosts:\n  - original.com\n  - new.com\n")
+        config.write_text("allowed_hosts:\n  - host: original.com\n  - host: new.com\n")
         os.kill(os.getpid(), signal.SIGHUP)
         time.sleep(0.05)
 
@@ -256,7 +257,7 @@ def mgmt(tmp_path):
     from addon import create_app
 
     config = tmp_path / "config.yaml"
-    config.write_text("allowed_hosts:\n  - existing.com\n")
+    config.write_text("allowed_hosts:\n  - host: existing.com\n")
 
     state = make_state(
         allowlist={"existing.com"},
@@ -320,11 +321,105 @@ class TestManagementAPI:
         config_path = mgmt._state.allowlist_path
         with open(config_path) as f:
             data = yaml.safe_load(f)
-        assert "written.com" in data["allowed_hosts"]
+        host_names = [
+            h if isinstance(h, str) else h["host"]
+            for h in data["allowed_hosts"]
+        ]
+        assert "written.com" in host_names
 
     def test_post_allow_permanent_idempotent(self, mgmt):
         mgmt.post("/allow/permanent", json={"host": "existing.com"})
         mgmt.post("/allow/permanent", json={"host": "existing.com"})
         with open(mgmt._state.allowlist_path) as f:
             data = yaml.safe_load(f)
-        assert data["allowed_hosts"].count("existing.com") == 1
+        host_names = [
+            h if isinstance(h, str) else h["host"]
+            for h in data["allowed_hosts"]
+        ]
+        assert host_names.count("existing.com") == 1
+
+    def test_post_allow_permanent_writes_dict_format(self, mgmt):
+        mgmt.post("/allow/permanent", json={"host": "newdict.com"})
+        with open(mgmt._state.allowlist_path) as f:
+            data = yaml.safe_load(f)
+        hosts = data["allowed_hosts"]
+        assert any(
+            (isinstance(h, dict) and h["host"] == "newdict.com") for h in hosts
+        )
+
+
+# ── Cookie allowlist (response side) ──────────────────────────────────────────
+
+def make_response_flow(host, set_cookie_headers=None):
+    """Return a mock HTTPFlow with response Set-Cookie headers."""
+    from unittest.mock import MagicMock
+    flow = MagicMock()
+    flow.request.pretty_host = host
+    cookies = list(set_cookie_headers or [])
+
+    # Simulate mitmproxy Headers.get_all / pop / add
+    stored = list(cookies)
+
+    def get_all(name):
+        if name.lower() == "set-cookie":
+            return list(stored)
+        return []
+
+    def pop(name, default=None):
+        if name.lower() == "set-cookie":
+            stored.clear()
+
+    def add(name, value):
+        if name.lower() == "set-cookie":
+            stored.append(value)
+
+    flow.response.headers.get_all = get_all
+    flow.response.headers.pop = pop
+    flow.response.headers.add = add
+    flow.response._stored = stored
+    return flow
+
+
+class TestCookieAllowlist:
+    def test_host_absent_passes_all_cookies(self):
+        from addon import CredentialBrokerAddon
+        state = make_state(host_config={})
+        addon = CredentialBrokerAddon(state)
+        flow = make_response_flow("other.com", ["session=abc", "tracker=xyz"])
+        addon.response(flow)
+        assert flow.response._stored == ["session=abc", "tracker=xyz"]
+
+    def test_host_config_none_restriction_passes_all(self):
+        from addon import CredentialBrokerAddon, HostConfig
+        state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=None)})
+        addon = CredentialBrokerAddon(state)
+        flow = make_response_flow("example.com", ["session=abc", "tracker=xyz"])
+        addon.response(flow)
+        assert flow.response._stored == ["session=abc", "tracker=xyz"]
+
+    def test_empty_allowlist_strips_all_cookies(self):
+        from addon import CredentialBrokerAddon, HostConfig
+        state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=[])})
+        addon = CredentialBrokerAddon(state)
+        flow = make_response_flow("example.com", ["session=abc", "tracker=xyz"])
+        addon.response(flow)
+        assert flow.response._stored == []
+
+    def test_allowlist_keeps_only_named_cookie(self):
+        from addon import CredentialBrokerAddon, HostConfig
+        state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=["csrftoken"])})
+        addon = CredentialBrokerAddon(state)
+        flow = make_response_flow("example.com", ["csrftoken=abc123", "session=xyz"])
+        addon.response(flow)
+        assert flow.response._stored == ["csrftoken=abc123"]
+
+    def test_multiple_set_cookie_headers_filtered(self):
+        from addon import CredentialBrokerAddon, HostConfig
+        state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=["csrftoken", "lang"])})
+        addon = CredentialBrokerAddon(state)
+        flow = make_response_flow(
+            "example.com",
+            ["csrftoken=abc", "session=xyz", "lang=en", "tracker=1"],
+        )
+        addon.response(flow)
+        assert set(flow.response._stored) == {"csrftoken=abc", "lang=en"}
