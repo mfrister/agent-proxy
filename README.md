@@ -46,7 +46,9 @@ allowed_hosts:
   - github.com
 ```
 
-**`PROXY_CREDENTIALS`** — credential mappings (JSON array). The proxy swaps `fake_value` for `real_value` on matching requests, so the agent only ever sees fake keys:
+**`PROXY_CREDENTIALS`** — credential mappings (JSON array). Two modes are supported:
+
+**Swap mode** — the agent uses a placeholder value; the proxy replaces it with the real credential before forwarding. Requests with any other non-empty value are blocked (guards against prompt injection).
 
 ```json
 [
@@ -55,6 +57,18 @@ allowed_hosts:
     "header": "Authorization",
     "fake_value": "Bearer sk-fake",
     "real_value": "Bearer sk-real"
+  }
+]
+```
+
+**Inject mode** — the proxy unconditionally sets the header, regardless of what the agent sent. Useful for cookies or other credentials the agent should never handle itself. Omit `fake_value`:
+
+```json
+[
+  {
+    "host": "internal.example.com",
+    "header": "Cookie",
+    "real_value": "session=abc123"
   }
 ]
 ```

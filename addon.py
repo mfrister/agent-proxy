@@ -10,8 +10,14 @@ Environment variables:
   PROXY_MGMT_PORT     management API port (default: 8081)
 
 Credential mapping format:
+
+  Swap mode (agent uses a placeholder; proxy replaces it with the real value):
   [{"host": "api.example.com", "header": "Authorization",
     "fake_value": "Bearer sk-fake", "real_value": "Bearer sk-real"}]
+
+  Inject mode (proxy adds the header unconditionally; omit fake_value):
+  [{"host": "api.example.com", "header": "Cookie",
+    "real_value": "session=abc123"}]
 """
 
 import collections
@@ -110,9 +116,16 @@ class AllowlistAddon:
 
 class CredentialBrokerAddon:
     """
-    For configured hosts, swaps the fake credential value for the real one.
-    If an unexpected (non-fake, non-empty) value is seen, the request is
-    blocked — this indicates prompt injection or agent misbehavior.
+    For configured hosts, handles two credential modes:
+
+    Swap mode (fake_value present): replaces the agent's placeholder value with
+    the real credential. Blocks if an unexpected non-empty value is seen (prompt
+    injection / agent misbehavior).
+
+    Inject mode (no fake_value): unconditionally sets the header to real_value,
+    regardless of what the agent sent. Useful for cookies or other credentials
+    the agent should never need to supply itself.
+
     Real credentials are never logged.
     """
 
@@ -129,26 +142,30 @@ class CredentialBrokerAddon:
             if cred["host"] != host:
                 continue
             header = cred["header"]
-            fake = cred["fake_value"]
             real = cred["real_value"]
+            fake = cred.get("fake_value")
 
-            current = flow.request.headers.get(header, "")
-            if current == fake:
+            if fake is None:
+                # Inject mode: set the header unconditionally
                 flow.request.headers[header] = real
-            elif current:
-                # Non-empty value that isn't the expected fake — block and alert
-                flow.response = http.Response.make(
-                    403,
-                    f"Credential mismatch on {host}: unexpected value in {header}",
-                    {"Content-Type": "text/plain"},
-                )
-                # Log fake (confirms expected identity) but never real value
-                print(json.dumps({
-                    "event": "credential_mismatch",
-                    "host": host,
-                    "header": header,
-                    "expected_fake": fake,
-                }))
+            else:
+                current = flow.request.headers.get(header, "")
+                if current == fake:
+                    flow.request.headers[header] = real
+                elif current:
+                    # Non-empty value that isn't the expected fake — block and alert
+                    flow.response = http.Response.make(
+                        403,
+                        f"Credential mismatch on {host}: unexpected value in {header}",
+                        {"Content-Type": "text/plain"},
+                    )
+                    # Log fake (confirms expected identity) but never real value
+                    print(json.dumps({
+                        "event": "credential_mismatch",
+                        "host": host,
+                        "header": header,
+                        "expected_fake": fake,
+                    }))
 
 
 class LoggingAddon:

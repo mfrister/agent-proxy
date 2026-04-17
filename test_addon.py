@@ -171,6 +171,33 @@ class TestCredentialBrokerAddon:
         assert flow.response.status_code == 403
         assert b"Blocked" in flow.response.content
 
+    def test_inject_mode_sets_header_when_absent(self):
+        from addon import CredentialBrokerAddon
+        inject_cred = {"host": "api.example.com", "header": "Cookie", "real_value": "session=abc123"}
+        addon = CredentialBrokerAddon(make_state(credentials=[inject_cred]))
+        flow = make_flow("api.example.com", headers={})
+        addon.request(flow)
+        assert flow.request.headers["Cookie"] == "session=abc123"
+        assert flow.response is None
+
+    def test_inject_mode_overwrites_existing_header(self):
+        from addon import CredentialBrokerAddon
+        inject_cred = {"host": "api.example.com", "header": "Cookie", "real_value": "session=abc123"}
+        addon = CredentialBrokerAddon(make_state(credentials=[inject_cred]))
+        flow = make_flow("api.example.com", headers={"Cookie": "old=value"})
+        addon.request(flow)
+        assert flow.request.headers["Cookie"] == "session=abc123"
+        assert flow.response is None
+
+    def test_inject_mode_does_not_affect_other_hosts(self):
+        from addon import CredentialBrokerAddon
+        inject_cred = {"host": "api.example.com", "header": "Cookie", "real_value": "session=abc123"}
+        addon = CredentialBrokerAddon(make_state(credentials=[inject_cred]))
+        flow = make_flow("other.com", headers={})
+        addon.request(flow)
+        assert "Cookie" not in flow.request.headers
+        assert flow.response is None
+
 
 # ── LoggingAddon ───────────────────────────────────────────────────────────────
 
