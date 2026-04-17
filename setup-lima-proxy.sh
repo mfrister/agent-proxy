@@ -88,6 +88,7 @@ export http_proxy=http://host.lima.internal:${PROXY_PORT}
 export https_proxy=http://host.lima.internal:${PROXY_PORT}
 export NO_PROXY=localhost,127.0.0.1,host.lima.internal
 export no_proxy=localhost,127.0.0.1,host.lima.internal
+export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/mitmproxy-ca.crt
 EOF
   sudo chmod 644 /etc/profile.d/proxy.sh
   echo 'Proxy env written to /etc/profile.d/proxy.sh'
