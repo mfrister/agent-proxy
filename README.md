@@ -1,5 +1,7 @@
 # agent-proxy
 
+**Warning:** This is an experimental more-or-less vibe-coded project. I've had a look a the code, but haven't thoroughly vetted it.
+
 mitmproxy addon that acts as the sole HTTP/HTTPS egress point for an LLM agent sandbox. Enforces a domain allowlist, brokers API credentials so real secrets never enter the sandbox, and exposes a management API for runtime changes.
 
 ## Setup
@@ -116,3 +118,7 @@ Reload allowlist without restart: `kill -HUP <pid>`
 uv run pytest            # unit tests
 uv run pytest test_functional.py -v   # integration tests (starts real proxy)
 ```
+
+## License
+
+MIT
