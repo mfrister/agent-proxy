@@ -584,3 +584,417 @@ class TestCookieAllowlist:
         )
         addon.response(flow)
         assert set(flow.response._stored) == {"csrftoken=abc", "lang=en"}
+
+
+# ── ClaudeAuthManager ──────────────────────────────────────────────────────────
+
+class TestClaudeAuthManager:
+    """Unit tests for claude_auth.ClaudeAuthManager."""
+
+    def _manager(self, tmp_path, **kwargs):
+        from claude_auth import ClaudeAuthManager
+        return ClaudeAuthManager(
+            token_file=tmp_path / "tokens.json",
+            auth_url="https://auth.example.com/oauth/authorize",
+            token_url="https://auth.example.com/oauth/token",
+            client_id="test-client",
+            scopes="openid",
+            **kwargs,
+        )
+
+    def test_status_not_logged_in(self, tmp_path):
+        mgr = self._manager(tmp_path)
+        assert mgr.status() == {"logged_in": False}
+
+    def test_get_header_value_returns_none_when_not_logged_in(self, tmp_path):
+        mgr = self._manager(tmp_path)
+        assert mgr.get_header_value() is None
+
+    def test_start_login_returns_url_with_pkce_params(self, tmp_path):
+        import urllib.parse
+        mgr = self._manager(tmp_path)
+        url = mgr.start_login("http://localhost:8082/claude/callback")
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query)
+        assert parsed.netloc == "auth.example.com"
+        assert params["response_type"] == ["code"]
+        assert params["code_challenge_method"] == ["S256"]
+        assert params["redirect_uri"] == ["http://localhost:8082/claude/callback"]
+        assert "code_challenge" in params
+        assert "state" in params
+
+    def test_complete_login_state_mismatch_raises(self, tmp_path):
+        from claude_auth import ClaudeAuthError
+        mgr = self._manager(tmp_path)
+        mgr.start_login("http://localhost:8082/claude/callback")
+        with pytest.raises(ClaudeAuthError, match="State mismatch"):
+            mgr.complete_login("some-code", "wrong-state")
+
+    def test_complete_login_without_start_raises(self, tmp_path):
+        from claude_auth import ClaudeAuthError
+        mgr = self._manager(tmp_path)
+        with pytest.raises(ClaudeAuthError):
+            mgr.complete_login("code", "state")
+
+    # ── helpers ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _mock_post(status=200, json_body=None, text=None):
+        """Return a context manager that patches httpx.post with a fake response."""
+        from unittest.mock import MagicMock, patch
+        mock_resp = MagicMock()
+        mock_resp.status_code = status
+        mock_resp.json.return_value = json_body or {}
+        mock_resp.text = text or ""
+        return patch("httpx.post", return_value=mock_resp)
+
+    @staticmethod
+    def _get_state(url):
+        import urllib.parse
+        return urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["state"][0]
+
+    # ── tests ──────────────────────────────────────────────────────────────────
+
+    def test_complete_login_stores_tokens(self, tmp_path):
+        mgr = self._manager(tmp_path)
+        url = mgr.start_login("http://localhost:8082/claude/callback")
+        state_val = self._get_state(url)
+
+        with self._mock_post(json_body={
+            "access_token": "real-access-token",
+            "refresh_token": "real-refresh-token",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        }):
+            mgr.complete_login("auth-code", state_val)
+
+        assert mgr.status()["logged_in"] is True
+        assert mgr.status()["has_refresh_token"] is True
+        assert mgr.get_header_value() == "Bearer real-access-token"
+
+    def test_tokens_persisted_to_disk(self, tmp_path):
+        from claude_auth import ClaudeAuthManager
+        mgr = self._manager(tmp_path)
+        url = mgr.start_login("http://localhost:8082/claude/callback")
+        state_val = self._get_state(url)
+
+        with self._mock_post(json_body={
+            "access_token": "persisted-token",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        }):
+            mgr.complete_login("code", state_val)
+
+        # New manager loads from disk
+        mgr2 = ClaudeAuthManager(
+            token_file=tmp_path / "tokens.json",
+            auth_url="https://auth.example.com/oauth/authorize",
+            token_url="https://auth.example.com/oauth/token",
+            client_id="test-client",
+        )
+        assert mgr2.get_header_value() == "Bearer persisted-token"
+
+    def test_token_file_permissions_are_0600(self, tmp_path):
+        import stat
+        mgr = self._manager(tmp_path)
+        url = mgr.start_login("http://localhost:8082/claude/callback")
+        state_val = self._get_state(url)
+
+        with self._mock_post(json_body={
+            "access_token": "tok", "expires_in": 3600, "token_type": "Bearer"
+        }):
+            mgr.complete_login("code", state_val)
+        mode = stat.S_IMODE((tmp_path / "tokens.json").stat().st_mode)
+        assert mode == 0o600
+
+    def test_get_header_value_triggers_refresh_when_near_expiry(self, tmp_path):
+        mgr = self._manager(tmp_path)
+        # Inject near-expired tokens directly
+        mgr._tokens = {
+            "access_token": "old-token",
+            "refresh_token": "refresh-tok",
+            "expires_at": time.time() + 30,  # within 60s buffer
+            "token_type": "Bearer",
+        }
+
+        with self._mock_post(json_body={
+            "access_token": "new-token",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        }):
+            result = mgr.get_header_value()
+        assert result == "Bearer new-token"
+
+    def test_refresh_failure_keeps_stale_token(self, tmp_path):
+        mgr = self._manager(tmp_path)
+        mgr._tokens = {
+            "access_token": "stale-token",
+            "refresh_token": "refresh-tok",
+            "expires_at": time.time() + 30,
+            "token_type": "Bearer",
+        }
+
+        with self._mock_post(status=500, text="server error"):
+            result = mgr.get_header_value()
+
+        # Should not raise; returns stale token
+        assert result == "Bearer stale-token"
+
+    def test_logout_clears_tokens_and_file(self, tmp_path):
+        mgr = self._manager(tmp_path)
+        url = mgr.start_login("http://localhost:8082/claude/callback")
+        state_val = self._get_state(url)
+
+        with self._mock_post(json_body={
+            "access_token": "tok", "expires_in": 3600, "token_type": "Bearer"
+        }):
+            mgr.complete_login("code", state_val)
+        assert (tmp_path / "tokens.json").exists()
+
+        mgr.logout()
+        assert not (tmp_path / "tokens.json").exists()
+        assert mgr.status() == {"logged_in": False}
+        assert mgr.get_header_value() is None
+
+    def test_http_error_on_token_exchange_raises(self, tmp_path):
+        from claude_auth import ClaudeAuthError
+        mgr = self._manager(tmp_path)
+        url = mgr.start_login("http://localhost:8082/claude/callback")
+        state_val = self._get_state(url)
+
+        with self._mock_post(status=401, text="Unauthorized"):
+            with pytest.raises(ClaudeAuthError, match="Token exchange failed"):
+                mgr.complete_login("bad-code", state_val)
+
+
+# ── CredentialBrokerAddon — !claude-subscription ───────────────────────────────
+
+class TestClaudeSubscriptionCredential:
+    """Tests for the !claude-subscription dynamic resolver in CredentialBrokerAddon."""
+
+    CRED_SUB = {
+        "host": "api.anthropic.com",
+        "header": "Authorization",
+        "fake_value": "Bearer sk-ant-proxy00-placeholder",
+        "real_value": "!claude-subscription",
+    }
+
+    def _make_auth(self, tmp_path, token="Bearer real-session-token"):
+        """Return a ClaudeAuthManager pre-loaded with a valid token."""
+        from claude_auth import ClaudeAuthManager
+        mgr = ClaudeAuthManager(token_file=tmp_path / "tokens.json")
+        if token is not None:
+            mgr._tokens = {
+                "access_token": token.removeprefix("Bearer "),
+                "token_type": "Bearer",
+                "expires_at": time.time() + 3600,
+                "refresh_token": None,
+            }
+        return mgr
+
+    def test_fake_swapped_for_real_subscription_token(self, tmp_path, capsys):
+        from addon import CredentialBrokerAddon
+        mgr = self._make_auth(tmp_path)
+        state = make_state(credentials=[self.CRED_SUB], claude_auth=mgr)
+        addon = CredentialBrokerAddon(state)
+        flow = make_flow(
+            "api.anthropic.com",
+            headers={"Authorization": "Bearer sk-ant-proxy00-placeholder"},
+        )
+        addon.request(flow)
+        assert flow.request.headers["Authorization"] == "Bearer real-session-token"
+        assert flow.response is None
+        entry = json.loads(capsys.readouterr().out)
+        assert entry["event"] == "credential_injected"
+        assert entry["mode"] == "swap"
+
+    def test_returns_503_when_not_logged_in(self, tmp_path):
+        from addon import CredentialBrokerAddon
+        mgr = self._make_auth(tmp_path, token=None)
+        state = make_state(credentials=[self.CRED_SUB], claude_auth=mgr)
+        addon = CredentialBrokerAddon(state)
+        flow = make_flow(
+            "api.anthropic.com",
+            headers={"Authorization": "Bearer sk-ant-proxy00-placeholder"},
+        )
+        addon.request(flow)
+        assert flow.response is not None
+        assert flow.response.status_code == 503
+
+    def test_returns_503_when_claude_auth_not_configured(self):
+        from addon import CredentialBrokerAddon
+        state = make_state(credentials=[self.CRED_SUB], claude_auth=None)
+        addon = CredentialBrokerAddon(state)
+        flow = make_flow(
+            "api.anthropic.com",
+            headers={"Authorization": "Bearer sk-ant-proxy00-placeholder"},
+        )
+        addon.request(flow)
+        assert flow.response is not None
+        assert flow.response.status_code == 503
+
+    def test_inject_mode_also_resolves_subscription(self, tmp_path, capsys):
+        """Inject mode (no fake_value) should also work with !claude-subscription."""
+        from addon import CredentialBrokerAddon
+        inject_cred = {
+            "host": "api.anthropic.com",
+            "header": "Authorization",
+            "real_value": "!claude-subscription",
+        }
+        mgr = self._make_auth(tmp_path)
+        state = make_state(credentials=[inject_cred], claude_auth=mgr)
+        addon = CredentialBrokerAddon(state)
+        flow = make_flow("api.anthropic.com", headers={})
+        addon.request(flow)
+        assert flow.request.headers["Authorization"] == "Bearer real-session-token"
+        assert flow.response is None
+        entry = json.loads(capsys.readouterr().out)
+        assert entry["mode"] == "inject"
+
+    def test_unexpected_value_still_blocked(self, tmp_path):
+        """Credential mismatch detection still works with !claude-subscription."""
+        from addon import CredentialBrokerAddon
+        mgr = self._make_auth(tmp_path)
+        state = make_state(credentials=[self.CRED_SUB], claude_auth=mgr)
+        addon = CredentialBrokerAddon(state)
+        flow = make_flow(
+            "api.anthropic.com",
+            headers={"Authorization": "Bearer sk-ant-injected-by-agent"},
+        )
+        addon.request(flow)
+        assert flow.response is not None
+        assert flow.response.status_code == 403
+
+
+# ── Management API — Claude endpoints ─────────────────────────────────────────
+
+@pytest.fixture
+def mgmt_claude(tmp_path):
+    """Flask test client wired to ProxyState with a live ClaudeAuthManager."""
+    from addon import create_app
+    from claude_auth import ClaudeAuthManager
+
+    config = tmp_path / "config.yaml"
+    config.write_text("allowed_hosts:\n  - host: api.anthropic.com\n")
+
+    mgr = ClaudeAuthManager(
+        token_file=tmp_path / "tokens.json",
+        auth_url="https://auth.example.com/oauth/authorize",
+        token_url="https://auth.example.com/oauth/token",
+        client_id="test-client",
+    )
+
+    state = make_state(allowlist={"api.anthropic.com"}, allowlist_path=str(config), claude_auth=mgr)
+    app = create_app(state)
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        client._state = state
+        client._mgr = mgr
+        yield client
+
+
+class TestClaudeManagementAPI:
+    def test_status_not_configured_returns_404(self, mgmt):
+        """When claude_auth is None the endpoints return 404."""
+        r = mgmt.get("/claude/status")
+        assert r.status_code == 404
+        assert "not configured" in r.get_json()["error"]
+
+    def test_status_not_logged_in(self, mgmt_claude):
+        r = mgmt_claude.get("/claude/status")
+        assert r.status_code == 200
+        assert r.get_json() == {"logged_in": False}
+
+    def test_login_redirects_to_auth_url(self, mgmt_claude):
+        r = mgmt_claude.get("/claude/login", follow_redirects=False)
+        assert r.status_code == 302
+        location = r.headers["Location"]
+        assert "auth.example.com/oauth/authorize" in location
+        assert "code_challenge" in location
+        assert "state" in location
+
+    def test_login_redirect_contains_callback_uri(self, mgmt_claude):
+        import urllib.parse
+        r = mgmt_claude.get(
+            "/claude/login?redirect_uri=http://host:8082/claude/callback",
+            follow_redirects=False,
+        )
+        location = r.headers["Location"]
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(location).query)
+        assert params["redirect_uri"] == ["http://host:8082/claude/callback"]
+
+    def test_callback_state_mismatch_returns_400(self, mgmt_claude):
+        mgmt_claude.get("/claude/login", follow_redirects=False)  # initialise state
+        r = mgmt_claude.get("/claude/callback?code=abc&state=wrong-state")
+        assert r.status_code == 400
+        assert "State mismatch" in r.data.decode()
+
+    def test_callback_missing_code_returns_400(self, mgmt_claude):
+        r = mgmt_claude.get("/claude/callback?state=whatever")
+        assert r.status_code == 400
+
+    def test_callback_oauth_error_param_returns_400(self, mgmt_claude):
+        r = mgmt_claude.get("/claude/callback?error=access_denied")
+        assert r.status_code == 400
+        assert "access_denied" in r.data.decode()
+
+    def test_full_login_callback_flow(self, mgmt_claude):
+        from unittest.mock import MagicMock, patch
+        import urllib.parse
+
+        # Step 1: initiate login
+        r = mgmt_claude.get("/claude/login", follow_redirects=False)
+        location = r.headers["Location"]
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(location).query)
+        state_val = params["state"][0]
+
+        # Step 2: mock token endpoint response
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "access_token": "live-token",
+            "refresh_token": "refresh-tok",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        }
+
+        # Step 3: simulate OAuth callback
+        with patch("httpx.post", return_value=mock_resp):
+            r = mgmt_claude.get(f"/claude/callback?code=mycode&state={state_val}")
+        assert r.status_code == 200
+        assert b"successful" in r.data
+
+        # Step 4: status reflects logged-in state
+        status = mgmt_claude.get("/claude/status").get_json()
+        assert status["logged_in"] is True
+        assert status["has_refresh_token"] is True
+
+    def test_logout_clears_state(self, mgmt_claude):
+        from unittest.mock import MagicMock, patch
+        import urllib.parse
+
+        r = mgmt_claude.get("/claude/login", follow_redirects=False)
+        state_val = urllib.parse.parse_qs(
+            urllib.parse.urlparse(r.headers["Location"]).query
+        )["state"][0]
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "access_token": "tok", "expires_in": 3600, "token_type": "Bearer"
+        }
+        with patch("httpx.post", return_value=mock_resp):
+            mgmt_claude.get(f"/claude/callback?code=c&state={state_val}")
+        assert mgmt_claude.get("/claude/status").get_json()["logged_in"] is True
+
+        r = mgmt_claude.post("/claude/logout")
+        assert r.get_json()["ok"] is True
+        assert mgmt_claude.get("/claude/status").get_json()["logged_in"] is False
+
+    def test_logout_not_configured_returns_404(self, mgmt):
+        r = mgmt.post("/claude/logout")
+        assert r.status_code == 404
+
+    def test_login_not_configured_returns_404(self, mgmt):
+        r = mgmt.get("/claude/login", follow_redirects=False)
+        assert r.status_code == 404

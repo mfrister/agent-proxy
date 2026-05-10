@@ -14,3 +14,46 @@
 allowed_hosts:
   - host: api.anthropic.com
   - host: platform.claude.com
+
+# ── Claude subscription login (optional) ──────────────────────────────────────
+#
+# Keeps real Claude session tokens out of the sandbox VM entirely.
+#
+# Setup
+# -----
+# 1. Uncomment the sections below and set token_file to a path outside the repo.
+# 2. Configure the sandbox VM with:
+#      ANTHROPIC_API_KEY=sk-ant-proxy00-placeholder   (or equivalent env var)
+#      HTTP_PROXY / HTTPS_PROXY pointing at this proxy
+# 3. Visit http://localhost:8082/claude/login in a browser on the HOST (not
+#    inside the sandbox) and complete the Claude OAuth flow.
+# 4. The proxy stores the token and automatically refreshes it before expiry.
+#    Every request from the sandbox bearing the fake token is transparently
+#    rewritten with the real session token before reaching api.anthropic.com.
+#
+# Management endpoints (all on 127.0.0.1:<management_port>, host-only):
+#   GET  /claude/login    → redirects browser to Claude OAuth
+#   GET  /claude/callback → OAuth callback; stores tokens on success
+#   GET  /claude/status   → JSON: {logged_in, expires_in_seconds, has_refresh_token}
+#   POST /claude/logout   → clears stored tokens
+#
+# credentials:
+#   - host: api.anthropic.com
+#     header: Authorization
+#     # fake_value must be what Claude Code sends; configure ANTHROPIC_API_KEY
+#     # in the sandbox VM to exactly this string.
+#     fake_value: "Bearer sk-ant-proxy00-placeholder"
+#     # The special sentinel "!claude-subscription" tells the proxy to resolve
+#     # the real value dynamically from the ClaudeAuthManager on every request.
+#     real_value: "!claude-subscription"
+#
+# claude_subscription:
+#   # Where to persist OAuth tokens across proxy restarts.
+#   # Keep this path outside the sandbox and outside the repo.
+#   token_file: /home/user/.config/agent-proxy/claude_tokens.json
+#   #
+#   # Optional overrides (defaults shown):
+#   # oauth_auth_url: https://claude.ai/oauth/authorize
+#   # oauth_token_url: https://console.anthropic.com/v1/oauth/token
+#   # client_id: 9d1c250a-e61b-48f7-9a12-c6ac30e5d9a6
+#   # scopes: "openid email profile"

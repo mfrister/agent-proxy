@@ -22,6 +22,20 @@ Config YAML format:
       header: Cookie
       real_value: "session=abc123"       # inject mode: omit fake_value
 
+  # Claude subscription mode — keeps the real session token out of the sandbox.
+  # The agent uses the fake_value below; the proxy swaps it for the live token
+  # obtained via the OAuth login flow at http://localhost:<management_port>/claude/login
+  #
+  #   credentials:
+  #     - host: api.anthropic.com
+  #       header: Authorization
+  #       fake_value: "Bearer sk-ant-proxy00-placeholder"
+  #       real_value: "!claude-subscription"   # resolved dynamically
+  #
+  #   claude_subscription:
+  #     token_file: /home/user/.config/agent-proxy/claude_tokens.json
+  #     # oauth_auth_url / oauth_token_url / client_id / scopes are optional overrides
+
   allowed_hosts:
     - api.anthropic.com                  # plain string: all cookies pass through
     - host: platform.claude.com
@@ -46,11 +60,15 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
 
 import yaml
-from flask import Flask, jsonify, request as flask_request
+from flask import Flask, jsonify, redirect, request as flask_request
 from mitmproxy import http
 from mitmproxy.http import HTTPFlow
+
+from claude_auth import ClaudeAuthError, ClaudeAuthManager
 
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -72,6 +90,7 @@ class ProxyState:
     deny_lock: threading.Lock
     host_config: dict         # host -> HostConfig
     management_port: int = 8082
+    claude_auth: Optional[ClaudeAuthManager] = None
 
 
 # ── Config loaders ─────────────────────────────────────────────────────────────
@@ -146,6 +165,36 @@ def load_management_port(path: str) -> int:
     return int(data.get("management_port", 8082))
 
 
+def load_claude_auth(path: str) -> Optional[ClaudeAuthManager]:
+    """
+    Return a ClaudeAuthManager if ``claude_subscription`` is present in the
+    config, otherwise None.
+
+    Config section (all keys except ``token_file`` are optional):
+
+      claude_subscription:
+        token_file: /home/user/.config/agent-proxy/claude_tokens.json
+        oauth_auth_url: https://claude.ai/oauth/authorize
+        oauth_token_url: https://console.anthropic.com/v1/oauth/token
+        client_id: 9d1c250a-e61b-48f7-9a12-c6ac30e5d9a6
+        scopes: "openid email profile"
+    """
+    data = load_config(path)
+    cfg = data.get("claude_subscription")
+    if not cfg:
+        return None
+
+    from claude_auth import DEFAULT_AUTH_URL, DEFAULT_CLIENT_ID, DEFAULT_SCOPES, DEFAULT_TOKEN_URL
+
+    return ClaudeAuthManager(
+        token_file=Path(cfg["token_file"]),
+        auth_url=cfg.get("oauth_auth_url", DEFAULT_AUTH_URL),
+        token_url=cfg.get("oauth_token_url", DEFAULT_TOKEN_URL),
+        client_id=cfg.get("client_id", DEFAULT_CLIENT_ID),
+        scopes=cfg.get("scopes", DEFAULT_SCOPES),
+    )
+
+
 # ── Addons ─────────────────────────────────────────────────────────────────────
 
 class AllowlistAddon:
@@ -210,6 +259,49 @@ class CredentialBrokerAddon:
     def __init__(self, state: ProxyState):
         self.state = state
 
+    def _resolve_real_value(self, raw_real: str, host: str, header: str, flow: HTTPFlow) -> Optional[str]:
+        """
+        Resolve ``real_value`` to a concrete string.
+
+        ``"!claude-subscription"`` is a dynamic resolver: calls
+        ``ClaudeAuthManager.get_header_value()`` and returns the live token.
+        Returns ``None`` and sets a 403 response on ``flow`` when resolution
+        fails so the caller can abort immediately.
+        """
+        if raw_real != "!claude-subscription":
+            return raw_real
+
+        if self.state.claude_auth is None:
+            flow.response = http.Response.make(
+                503,
+                "claude_subscription not configured in proxy config",
+                {"Content-Type": "text/plain"},
+            )
+            print(json.dumps({
+                "event": "claude_subscription_error",
+                "host": host,
+                "header": header,
+                "reason": "not_configured",
+            }))
+            return None
+
+        value = self.state.claude_auth.get_header_value()
+        if value is None:
+            flow.response = http.Response.make(
+                503,
+                "Claude subscription: not logged in — visit /claude/login on the management API",
+                {"Content-Type": "text/plain"},
+            )
+            print(json.dumps({
+                "event": "claude_subscription_error",
+                "host": host,
+                "header": header,
+                "reason": "not_logged_in",
+            }))
+            return None
+
+        return value
+
     def request(self, flow: HTTPFlow):
         # Skip flows already denied by AllowlistAddon
         if flow.response is not None:
@@ -220,11 +312,14 @@ class CredentialBrokerAddon:
             if cred["host"] != host:
                 continue
             header = cred["header"]
-            real = cred["real_value"]
+            raw_real = cred["real_value"]
             fake = cred.get("fake_value")
 
             if fake is None:
-                # Inject mode: set the header unconditionally
+                # Inject mode: resolve and set the header unconditionally
+                real = self._resolve_real_value(raw_real, host, header, flow)
+                if real is None:
+                    return
                 flow.request.headers[header] = real
                 print(json.dumps({
                     "event": "credential_injected",
@@ -235,6 +330,9 @@ class CredentialBrokerAddon:
             else:
                 current = flow.request.headers.get(header, "")
                 if current == fake:
+                    real = self._resolve_real_value(raw_real, host, header, flow)
+                    if real is None:
+                        return
                     flow.request.headers[header] = real
                     print(json.dumps({
                         "event": "credential_injected",
@@ -347,6 +445,95 @@ def create_app(state: ProxyState) -> Flask:
         state.host_config = load_host_config(state.allowlist_path)
         return jsonify({"ok": True})
 
+    # ── Claude subscription auth endpoints ──────────────────────────────────────
+    #
+    # Login flow (operator visits from a browser on the host, never from sandbox):
+    #
+    #   GET  /claude/login     → 302 redirect to Claude's OAuth authorization page
+    #   GET  /claude/callback  → exchanges the code; returns success page
+    #   GET  /claude/status    → JSON with token state / expiry
+    #   POST /claude/logout    → revokes stored tokens
+
+    def _require_claude_auth():
+        """Return (claude_auth, None) or (None, error_response)."""
+        if state.claude_auth is None:
+            return None, (
+                jsonify({"error": "claude_subscription not configured in proxy config"}),
+                404,
+            )
+        return state.claude_auth, None
+
+    @app.get("/claude/login")
+    def claude_login():
+        """
+        Redirect the operator's browser to Claude's OAuth authorization page.
+
+        Optional query parameter ``redirect_uri`` overrides the default
+        callback URL (useful when the proxy is reachable on a non-localhost
+        address).
+        """
+        auth, err = _require_claude_auth()
+        if err:
+            return err
+
+        default_callback = (
+            flask_request.url_root.rstrip("/") + "/claude/callback"
+        )
+        redirect_uri = flask_request.args.get("redirect_uri", default_callback)
+        login_url = auth.start_login(redirect_uri)
+        return redirect(login_url, code=302)
+
+    @app.get("/claude/callback")
+    def claude_callback():
+        """
+        OAuth callback — Claude redirects here after successful login.
+
+        Exchanges the authorization code for tokens and stores them.  On
+        success renders a plain-text page the operator can close.
+        """
+        auth, err = _require_claude_auth()
+        if err:
+            return err
+
+        code = flask_request.args.get("code", "")
+        state_param = flask_request.args.get("state", "")
+        error = flask_request.args.get("error", "")
+
+        if error:
+            return f"OAuth error from Claude: {error}", 400
+
+        if not code:
+            return "Missing 'code' parameter in callback", 400
+
+        try:
+            auth.complete_login(code, state_param)
+        except ClaudeAuthError as exc:
+            return f"Login failed: {exc}", 400
+
+        return (
+            "<html><body><h2>Claude login successful.</h2>"
+            "<p>You can close this tab. The proxy will now swap the fake token "
+            "for your real session token on every request to api.anthropic.com.</p>"
+            "</body></html>"
+        )
+
+    @app.get("/claude/status")
+    def claude_status():
+        """Return current token state: logged_in, expiry, refresh_token presence."""
+        auth, err = _require_claude_auth()
+        if err:
+            return err
+        return jsonify(auth.status())
+
+    @app.post("/claude/logout")
+    def claude_logout():
+        """Clear stored tokens from memory and disk."""
+        auth, err = _require_claude_auth()
+        if err:
+            return err
+        auth.logout()
+        return jsonify({"ok": True})
+
     return app
 
 
@@ -379,6 +566,7 @@ state = ProxyState(
     deny_lock=threading.Lock(),
     host_config=load_host_config(_config_path),
     management_port=load_management_port(_config_path),
+    claude_auth=load_claude_auth(_config_path),
 )
 
 setup_sighup(state)
