@@ -38,7 +38,7 @@ The CA cert is generated on first run at `~/.mitmproxy/` (or the path set by `--
 
 ## Configuration
 
-**`config.yaml`** — domain allowlist and per-host options:
+**`config.yaml`** — domain allowlist and per-host options (copy from `config.default.yaml` and customize):
 
 ```yaml
 allowed_hosts:
@@ -83,7 +83,7 @@ When `allow_response_cookies` is absent, all `Set-Cookie` headers from that host
 
 | Variable | Default | Description |
 |---|---|---|
-| `PROXY_CONFIG` | `config.yaml` | Path to allowlist YAML |
+| `PROXY_CONFIG` | `config.yaml` | Path to allowlist YAML (see `config.default.yaml` for example) |
 | `PROXY_CREDENTIALS` | `[]` | JSON credential mappings |
 | `PROXY_MGMT_PORT` | `8082` | Management API port |
 
@@ -128,7 +128,7 @@ Runs on `127.0.0.1:8082` (not proxied).
 | GET | `/allowlist` | — | Permanent + active temporary allows |
 | GET | `/denied` | — | Recent denied requests |
 | POST | `/allow/temp` | `{"host": "…", "duration_seconds": 60}` | Add TTL-based allow; `duration_seconds` defaults to 300 |
-| POST | `/allow/permanent` | `{"host": "…"}` | Append to `config.yaml` and reload |
+| POST | `/allow/permanent` | `{"host": "…"}` | Append to current config file and reload |
 
 Reload allowlist without restart: `kill -HUP <pid>`
 
