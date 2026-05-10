@@ -1,1 +1,3 @@
 /pytest-of-*
+__pycache__/
+*.pyc
