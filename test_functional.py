@@ -513,3 +513,46 @@ def test_h2_cookie_inject(proxy_h2_inject):
     assert data["headers"].get("cookie") == "session=real-session-value", (
         f"Injected cookie not found; received headers: {data['headers']}"
     )
+
+
+@pytest.fixture
+def proxy_h2_block_literal(tmp_path):
+    """Proxy with real_value written as a YAML block literal (adds trailing \\n)."""
+    config_text = (
+        "allowed_hosts:\n"
+        "  - host: 127.0.0.1\n"
+        "credentials:\n"
+        "  - host: 127.0.0.1\n"
+        "    header: cookie\n"
+        "    real_value: |\n"
+        "      session=real-session-value\n"
+    )
+    with _h2_proxy_context(tmp_path, config_text) as ctx:
+        yield ctx
+
+
+def test_h2_yaml_block_literal_cookie_inject(proxy_h2_block_literal):
+    """YAML block literals add a trailing newline to real_value.
+
+    LF (0x0a) is forbidden in HTTP/2 header values (RFC 9113 § 8.2.1).
+    Without the fix, strict servers (e.g. Cloudflare) reject the request with
+    RST_STREAM PROTOCOL_ERROR; mitmproxy surfaces this as 502.  load_credentials
+    must strip the value so the injected header is always newline-free.
+    """
+    ctx = proxy_h2_block_literal
+
+    ssl_ctx = ssl.create_default_context(cafile=ctx["mitm_ca"])
+    with httpx.Client(
+        http2=True,
+        verify=ssl_ctx,
+        proxy=httpx.Proxy(ctx["proxy_url"]),
+    ) as client:
+        resp = client.get(ctx["server_url"] + "/test")
+
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+    assert resp.http_version == "HTTP/2"
+    data = resp.json()
+    assert data["headers"].get("cookie") == "session=real-session-value", (
+        f"Injected cookie not found or has trailing newline; headers: {data['headers']}"
+    )
+
