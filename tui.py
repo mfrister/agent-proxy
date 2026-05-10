@@ -166,7 +166,7 @@ class ProxyMonitor(App[None]):
 
         denied_table.focus()
 
-        self.set_interval(5, self._refresh_data)
+        self.set_interval(1, self._refresh_data)
         self.call_after_refresh(self._refresh_data)
 
     def _focused_pane(self) -> str:
@@ -204,7 +204,7 @@ class ProxyMonitor(App[None]):
 
         now = datetime.now().strftime("%H:%M:%S")
         self.query_one("#status-bar", Static).update(
-            f"  {self.base_url}  |  Last updated: {now}  |  Polling every 5s"
+            f"  {self.base_url}  |  Last updated: {now}  |  Polling every 1s"
         )
 
     def _update_denied_table(self) -> None:
