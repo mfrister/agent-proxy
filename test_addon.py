@@ -244,20 +244,26 @@ class TestAllowlistAddon:
 # ── CredentialBrokerAddon ──────────────────────────────────────────────────────
 
 class TestCredentialBrokerAddon:
-    def test_fake_swapped_for_real(self):
+    def test_fake_swapped_for_real(self, capsys):
         from addon import CredentialBrokerAddon
         addon = CredentialBrokerAddon(make_state(credentials=[CRED]))
         flow = make_flow("api.example.com", headers={"Authorization": "Bearer sk-fake"})
         addon.request(flow)
         assert flow.request.headers["Authorization"] == "Bearer sk-real"
         assert flow.response is None
+        entry = json.loads(capsys.readouterr().out)
+        assert entry["event"] == "credential_injected"
+        assert entry["mode"] == "swap"
+        assert entry["header"] == "Authorization"
+        assert entry["host"] == "api.example.com"
 
-    def test_no_header_passes_through(self):
+    def test_no_header_passes_through(self, capsys):
         from addon import CredentialBrokerAddon
         addon = CredentialBrokerAddon(make_state(credentials=[CRED]))
         flow = make_flow("api.example.com", headers={})
         addon.request(flow)
         assert flow.response is None
+        assert capsys.readouterr().out == ""
 
     def test_unexpected_value_blocks(self):
         from addon import CredentialBrokerAddon
@@ -294,7 +300,7 @@ class TestCredentialBrokerAddon:
         assert flow.response.status_code == 403
         assert b"Blocked" in flow.response.content
 
-    def test_inject_mode_sets_header_when_absent(self):
+    def test_inject_mode_sets_header_when_absent(self, capsys):
         from addon import CredentialBrokerAddon
         inject_cred = {"host": "api.example.com", "header": "Cookie", "real_value": "session=abc123"}
         addon = CredentialBrokerAddon(make_state(credentials=[inject_cred]))
@@ -302,8 +308,11 @@ class TestCredentialBrokerAddon:
         addon.request(flow)
         assert flow.request.headers["Cookie"] == "session=abc123"
         assert flow.response is None
+        entry = json.loads(capsys.readouterr().out)
+        assert entry["event"] == "credential_injected"
+        assert entry["mode"] == "inject"
 
-    def test_inject_mode_overwrites_existing_header(self):
+    def test_inject_mode_overwrites_existing_header(self, capsys):
         from addon import CredentialBrokerAddon
         inject_cred = {"host": "api.example.com", "header": "Cookie", "real_value": "session=abc123"}
         addon = CredentialBrokerAddon(make_state(credentials=[inject_cred]))
@@ -311,6 +320,9 @@ class TestCredentialBrokerAddon:
         addon.request(flow)
         assert flow.request.headers["Cookie"] == "session=abc123"
         assert flow.response is None
+        entry = json.loads(capsys.readouterr().out)
+        assert entry["event"] == "credential_injected"
+        assert entry["mode"] == "inject"
 
     def test_inject_mode_does_not_affect_other_hosts(self):
         from addon import CredentialBrokerAddon
