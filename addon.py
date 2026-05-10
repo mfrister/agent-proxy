@@ -226,10 +226,22 @@ class CredentialBrokerAddon:
             if fake is None:
                 # Inject mode: set the header unconditionally
                 flow.request.headers[header] = real
+                print(json.dumps({
+                    "event": "credential_injected",
+                    "host": host,
+                    "header": header,
+                    "mode": "inject",
+                }))
             else:
                 current = flow.request.headers.get(header, "")
                 if current == fake:
                     flow.request.headers[header] = real
+                    print(json.dumps({
+                        "event": "credential_injected",
+                        "host": host,
+                        "header": header,
+                        "mode": "swap",
+                    }))
                 elif current:
                     # Non-empty value that isn't the expected fake — block and alert
                     flow.response = http.Response.make(
