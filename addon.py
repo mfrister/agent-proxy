@@ -5,35 +5,42 @@ Run headless:  mitmdump -s addon.py
 Run with UI:   mitmweb -s addon.py
 
 Environment variables:
-  PROXY_CONFIG        path to allowlist config YAML (default: config.yaml)
-  PROXY_CREDENTIALS   JSON array of credential mappings (default: [])
-  PROXY_MGMT_PORT     management API port (default: 8081)
-
-Credential mapping format:
-
-  Swap mode (agent uses a placeholder; proxy replaces it with the real value):
-  [{"host": "api.example.com", "header": "Authorization",
-    "fake_value": "Bearer sk-fake", "real_value": "Bearer sk-real"}]
-
-  Inject mode (proxy adds the header unconditionally; omit fake_value):
-  [{"host": "api.example.com", "header": "Cookie",
-    "real_value": "session=abc123"}]
+  PROXY_CONFIG   path to config YAML (default: config.yaml)
 
 Config YAML format:
 
+  secrets_file: /path/to/secrets.yaml   # optional; separate file with secret values
+
+  management_port: 8082                  # management API port (default: 8082)
+
+  credentials:
+    - host: api.example.com
+      header: Authorization
+      fake_value: "Bearer sk-fake"       # swap mode: agent sends fake, proxy swaps real
+      real_value: "${MY_API_KEY}"        # ${KEY} references a key in secrets_file
+    - host: internal.example.com
+      header: Cookie
+      real_value: "session=abc123"       # inject mode: omit fake_value
+
   allowed_hosts:
-    - api.anthropic.com                   # plain string: all cookies pass through
+    - api.anthropic.com                  # plain string: all cookies pass through
     - host: platform.claude.com
-      allow_response_cookies: []          # no cookies allowed (all stripped)
+      allow_response_cookies: []         # no cookies allowed (all stripped)
     - host: internal.example.com
       allow_response_cookies:
-        - csrftoken                       # only csrftoken passes through
+        - csrftoken                      # only csrftoken passes through
+
+Secrets file format (simple flat key/value map):
+
+  MY_API_KEY: "Bearer sk-real-key-here"
+  OTHER_SECRET: "some-value"
 """
 
 import collections
 import json
 import logging
 import os
+import re
 import signal
 import threading
 import time
@@ -64,44 +71,79 @@ class ProxyState:
     deny_log: collections.deque  # maxlen=1000, entries: {timestamp,host,url,method}
     deny_lock: threading.Lock
     host_config: dict         # host -> HostConfig
+    management_port: int = 8082
 
 
 # ── Config loaders ─────────────────────────────────────────────────────────────
 
-def load_allowlist(path: str) -> set:
-    """Load allowed hosts from YAML. Returns empty set if file is missing."""
+def _expand_secrets(obj, secrets: dict):
+    """Recursively expand ${KEY} references in string values using the secrets map."""
+    if isinstance(obj, str):
+        def replace(m):
+            key = m.group(1)
+            if key not in secrets:
+                raise KeyError(f"Secret key not found in secrets_file: ${{{key}}}")
+            return str(secrets[key])
+        return re.sub(r'\$\{([^}]+)\}', replace, obj)
+    if isinstance(obj, dict):
+        return {k: _expand_secrets(v, secrets) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_secrets(item, secrets) for item in obj]
+    return obj
+
+
+def load_config(path: str) -> dict:
+    """Load config YAML and expand any ${KEY} references from the secrets_file."""
     try:
         with open(path) as f:
             data = yaml.safe_load(f) or {}
-        result = []
-        for item in data.get("allowed_hosts", []):
-            result.append(item["host"])
-        return set(result)
-    except FileNotFoundError:
-        return set()
-
-
-def load_host_config(path: str) -> dict:
-    """Load per-host config from YAML. Returns empty dict if file is missing."""
-    try:
-        with open(path) as f:
-            data = yaml.safe_load(f) or {}
-        result = {}
-        for item in data.get("allowed_hosts", []):
-            if not isinstance(item, str):
-                host = item["host"]
-                result[host] = HostConfig(
-                    allow_response_cookies=item.get("allow_response_cookies")
-                )
-        return result
     except FileNotFoundError:
         return {}
 
+    secrets = {}
+    secrets_path = data.get("secrets_file")
+    if secrets_path:
+        with open(secrets_path) as f:
+            secrets = yaml.safe_load(f) or {}
 
-def load_credentials() -> list:
-    """Parse credential mappings from PROXY_CREDENTIALS env var (JSON array)."""
-    raw = os.environ.get("PROXY_CREDENTIALS", "[]")
-    return json.loads(raw)
+    return _expand_secrets(data, secrets)
+
+
+def load_allowlist(path: str) -> set:
+    """Load allowed hosts from config YAML."""
+    data = load_config(path)
+    result = []
+    for item in data.get("allowed_hosts", []):
+        if isinstance(item, str):
+            result.append(item)
+        else:
+            result.append(item["host"])
+    return set(result)
+
+
+def load_host_config(path: str) -> dict:
+    """Load per-host config (cookie rules) from config YAML."""
+    data = load_config(path)
+    result = {}
+    for item in data.get("allowed_hosts", []):
+        if not isinstance(item, str):
+            host = item["host"]
+            result[host] = HostConfig(
+                allow_response_cookies=item.get("allow_response_cookies")
+            )
+    return result
+
+
+def load_credentials(path: str) -> list:
+    """Load credential mappings from config YAML."""
+    data = load_config(path)
+    return data.get("credentials", [])
+
+
+def load_management_port(path: str) -> int:
+    """Load management API port from config YAML."""
+    data = load_config(path)
+    return int(data.get("management_port", 8082))
 
 
 # ── Addons ─────────────────────────────────────────────────────────────────────
@@ -118,10 +160,9 @@ class AllowlistAddon:
 
     def running(self):
         """Start the management API in a background thread."""
-        port = int(os.environ.get("PROXY_MGMT_PORT", "8082"))
         threading.Thread(
             target=lambda: create_app(self.state).run(
-                host="127.0.0.1", port=port, use_reloader=False
+                host="127.0.0.1", port=self.state.management_port, use_reloader=False
             ),
             daemon=True,
         ).start()
@@ -303,9 +344,11 @@ def setup_sighup(state: ProxyState):
     def handler(signum, frame):
         state.allowlist = load_allowlist(state.allowlist_path)
         state.host_config = load_host_config(state.allowlist_path)
+        state.credentials = load_credentials(state.allowlist_path)
         print(json.dumps({
             "event": "sighup_reload",
             "host_count": len(state.allowlist),
+            "credential_count": len(state.credentials),
         }))
     signal.signal(signal.SIGHUP, handler)
 
@@ -317,12 +360,13 @@ _config_path = os.environ.get("PROXY_CONFIG", "config.yaml")
 state = ProxyState(
     allowlist=load_allowlist(_config_path),
     allowlist_path=_config_path,
-    credentials=load_credentials(),
+    credentials=load_credentials(_config_path),
     temp_allows={},
     temp_lock=threading.Lock(),
     deny_log=collections.deque(maxlen=1000),
     deny_lock=threading.Lock(),
     host_config=load_host_config(_config_path),
+    management_port=load_management_port(_config_path),
 )
 
 setup_sighup(state)

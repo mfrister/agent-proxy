@@ -31,6 +31,7 @@ def make_state(**overrides):
         deny_log=collections.deque(maxlen=1000),
         deny_lock=threading.Lock(),
         host_config={},
+        management_port=8082,
     )
     defaults.update(overrides)
     return ProxyState(**defaults)
@@ -55,6 +56,127 @@ CRED = {
     "fake_value": "Bearer sk-fake",
     "real_value": "Bearer sk-real",
 }
+
+
+# ── load_config ────────────────────────────────────────────────────────────────
+
+class TestLoadConfig:
+    def test_missing_file_returns_empty(self, tmp_path):
+        from addon import load_config
+        result = load_config(str(tmp_path / "nonexistent.yaml"))
+        assert result == {}
+
+    def test_basic_config_loaded(self, tmp_path):
+        from addon import load_config
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "management_port: 9000\n"
+            "allowed_hosts:\n"
+            "  - host: example.com\n"
+        )
+        result = load_config(str(config))
+        assert result["management_port"] == 9000
+        assert result["allowed_hosts"][0]["host"] == "example.com"
+
+    def test_secrets_expanded(self, tmp_path):
+        from addon import load_config
+        secrets = tmp_path / "secrets.yaml"
+        secrets.write_text("MY_KEY: real-value\n")
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            f"secrets_file: {secrets}\n"
+            "credentials:\n"
+            "  - host: api.example.com\n"
+            "    header: Authorization\n"
+            "    fake_value: fake\n"
+            "    real_value: \"${MY_KEY}\"\n"
+        )
+        result = load_config(str(config))
+        assert result["credentials"][0]["real_value"] == "real-value"
+
+    def test_missing_secret_key_raises(self, tmp_path):
+        from addon import load_config
+        secrets = tmp_path / "secrets.yaml"
+        secrets.write_text("OTHER_KEY: something\n")
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            f"secrets_file: {secrets}\n"
+            "credentials:\n"
+            "  - host: api.example.com\n"
+            "    real_value: \"${MISSING_KEY}\"\n"
+        )
+        with pytest.raises(KeyError, match="MISSING_KEY"):
+            load_config(str(config))
+
+    def test_missing_secrets_file_raises(self, tmp_path):
+        from addon import load_config
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "secrets_file: /nonexistent/secrets.yaml\n"
+            "allowed_hosts: []\n"
+        )
+        with pytest.raises(FileNotFoundError):
+            load_config(str(config))
+
+    def test_no_secrets_file_plain_values_unchanged(self, tmp_path):
+        from addon import load_config
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "credentials:\n"
+            "  - host: api.example.com\n"
+            "    real_value: plain-value\n"
+        )
+        result = load_config(str(config))
+        assert result["credentials"][0]["real_value"] == "plain-value"
+
+    def test_multiple_secrets_expanded(self, tmp_path):
+        from addon import load_config
+        secrets = tmp_path / "secrets.yaml"
+        secrets.write_text("KEY_A: value-a\nKEY_B: value-b\n")
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            f"secrets_file: {secrets}\n"
+            "credentials:\n"
+            "  - host: a.com\n"
+            "    real_value: \"${KEY_A}\"\n"
+            "  - host: b.com\n"
+            "    real_value: \"${KEY_B}\"\n"
+        )
+        result = load_config(str(config))
+        assert result["credentials"][0]["real_value"] == "value-a"
+        assert result["credentials"][1]["real_value"] == "value-b"
+
+    def test_load_credentials_from_config(self, tmp_path):
+        from addon import load_credentials
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "credentials:\n"
+            "  - host: api.example.com\n"
+            "    header: Authorization\n"
+            "    fake_value: fake\n"
+            "    real_value: real\n"
+        )
+        creds = load_credentials(str(config))
+        assert len(creds) == 1
+        assert creds[0]["real_value"] == "real"
+
+    def test_load_credentials_empty_when_absent(self, tmp_path):
+        from addon import load_credentials
+        config = tmp_path / "config.yaml"
+        config.write_text("allowed_hosts:\n  - host: example.com\n")
+        assert load_credentials(str(config)) == []
+
+    def test_load_management_port_from_config(self, tmp_path):
+        from addon import load_management_port
+        config = tmp_path / "config.yaml"
+        config.write_text("management_port: 9999\n")
+        assert load_management_port(str(config)) == 9999
+
+    def test_load_management_port_default(self, tmp_path):
+        from addon import load_management_port
+        config = tmp_path / "config.yaml"
+        config.write_text("allowed_hosts: []\n")
+        assert load_management_port(str(config)) == 8082
 
 
 # ── AllowlistAddon ─────────────────────────────────────────────────────────────
@@ -240,13 +362,40 @@ class TestSighupReload:
         )
         setup_sighup(state)
 
-        # Update config on disk then signal
         config.write_text("allowed_hosts:\n  - host: original.com\n  - host: new.com\n")
         os.kill(os.getpid(), signal.SIGHUP)
         time.sleep(0.05)
 
         assert "new.com" in state.allowlist
         assert "original.com" in state.allowlist
+
+    def test_sighup_reloads_credentials(self, tmp_path):
+        from addon import setup_sighup
+
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "credentials:\n"
+            "  - host: api.example.com\n"
+            "    header: Authorization\n"
+            "    real_value: old-value\n"
+        )
+
+        state = make_state(
+            credentials=[{"host": "api.example.com", "header": "Authorization", "real_value": "old-value"}],
+            allowlist_path=str(config),
+        )
+        setup_sighup(state)
+
+        config.write_text(
+            "credentials:\n"
+            "  - host: api.example.com\n"
+            "    header: Authorization\n"
+            "    real_value: new-value\n"
+        )
+        os.kill(os.getpid(), signal.SIGHUP)
+        time.sleep(0.05)
+
+        assert state.credentials[0]["real_value"] == "new-value"
 
 
 # ── Management API ─────────────────────────────────────────────────────────────

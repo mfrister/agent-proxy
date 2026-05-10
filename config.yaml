@@ -1,3 +1,16 @@
+# Path to a YAML file containing secret values (key: value pairs).
+# Keep this file outside the codebase so agents never see real credentials.
+# Example: secrets_file: /home/user/.config/agent-proxy/secrets.yaml
+#
+# Credentials support ${KEY} references resolved from that file:
+#   credentials:
+#     - host: api.openai.com
+#       header: Authorization
+#       fake_value: "Bearer sk-fake"
+#       real_value: "${OPENAI_API_KEY}"
+
+# management_port: 8082   # port for the management API (default: 8082)
+
 allowed_hosts:
   - host: api.anthropic.com
   - host: platform.claude.com

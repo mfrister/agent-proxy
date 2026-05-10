@@ -97,14 +97,15 @@ def agent_opener(proxy_url: str) -> urllib.request.OpenerDirector:
 # ── Fixture factory ────────────────────────────────────────────────────────────
 
 @contextmanager
-def _proxy_context(tmp, handler_class, config_text, creds="[]"):
+def _proxy_context(tmp, handler_class, config_text):
     """Spin up an HTTP server and a mitmdump proxy; yield connection details."""
     server_port = free_port()
     server = HTTPServer(("127.0.0.1", server_port), handler_class)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
+    management_port = free_port()
     config = tmp / "config.yaml"
-    config.write_text(config_text)
+    config.write_text(config_text + f"\nmanagement_port: {management_port}\n")
 
     proxy_port = free_port()
     proc = subprocess.Popen(
@@ -114,8 +115,6 @@ def _proxy_context(tmp, handler_class, config_text, creds="[]"):
         env={
             **os.environ,
             "PROXY_CONFIG": str(config),
-            "PROXY_CREDENTIALS": creds,
-            "PROXY_MGMT_PORT": str(free_port()),
         },
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -145,17 +144,19 @@ def _proxy_context(tmp, handler_class, config_text, creds="[]"):
 
 @pytest.fixture(scope="module")
 def proxy(tmp_path_factory):
-    creds = json.dumps([{
-        "host": "127.0.0.1",
-        "header": "X-Api-Key",
-        "fake_value": "fake-key",
-        "real_value": "real-key",
-    }])
+    config_text = (
+        "allowed_hosts:\n"
+        "  - host: 127.0.0.1\n"
+        "credentials:\n"
+        "  - host: 127.0.0.1\n"
+        "    header: X-Api-Key\n"
+        "    fake_value: fake-key\n"
+        "    real_value: real-key\n"
+    )
     with _proxy_context(
         tmp_path_factory.mktemp("functional"),
         EchoHandler,
-        "allowed_hosts:\n  - host: 127.0.0.1\n",
-        creds,
+        config_text,
     ) as ctx:
         yield ctx
 
@@ -170,6 +171,25 @@ def proxy_cookie(tmp_path_factory):
         "    allow_response_cookies:\n"
         "      - csrftoken\n",
     ) as ctx:
+        yield ctx
+
+
+@pytest.fixture
+def proxy_secrets(tmp_path):
+    """Proxy fixture that loads real_value from a secrets_file."""
+    secrets = tmp_path / "secrets.yaml"
+    secrets.write_text("REAL_API_KEY: real-key\n")
+    config_text = (
+        f"secrets_file: {secrets}\n"
+        "allowed_hosts:\n"
+        "  - host: 127.0.0.1\n"
+        "credentials:\n"
+        "  - host: 127.0.0.1\n"
+        "    header: X-Api-Key\n"
+        "    fake_value: fake-key\n"
+        '    real_value: "${REAL_API_KEY}"\n'
+    )
+    with _proxy_context(tmp_path, EchoHandler, config_text) as ctx:
         yield ctx
 
 
@@ -194,6 +214,16 @@ def test_credential_swap(proxy):
     )
     data = json.loads(proxy["opener"].open(req).read())
     # Echo server must see the real key, never the fake one
+    assert data["headers"].get("x-api-key") == "real-key"
+
+
+def test_credential_swap_with_secrets_file(proxy_secrets):
+    """Credential real_value resolved from a secrets_file at startup."""
+    req = urllib.request.Request(
+        proxy_secrets["server_url"] + "/api",
+        headers={"X-Api-Key": "fake-key"},
+    )
+    data = json.loads(proxy_secrets["opener"].open(req).read())
     assert data["headers"].get("x-api-key") == "real-key"
 
 
