@@ -224,8 +224,12 @@ class CredentialBrokerAddon:
             fake = cred.get("fake_value")
 
             if fake is None:
-                # Inject mode: set the header unconditionally
-                flow.request.headers[header] = real
+                # Inject mode: set the header unconditionally.
+                # Lowercase the name: HTTP/2 forbids uppercase header names, and
+                # the mitmproxy h2 layer only normalises case when the incoming
+                # request was HTTP/1.1; if the agent already spoke HTTP/2 the
+                # header is forwarded as stored, so we must store it lowercase.
+                flow.request.headers[header.lower()] = real
                 print(json.dumps({
                     "event": "credential_injected",
                     "host": host,
@@ -235,7 +239,7 @@ class CredentialBrokerAddon:
             else:
                 current = flow.request.headers.get(header, "")
                 if current == fake:
-                    flow.request.headers[header] = real
+                    flow.request.headers[header.lower()] = real
                     print(json.dumps({
                         "event": "credential_injected",
                         "host": host,

@@ -39,12 +39,17 @@ def make_state(**overrides):
 
 def make_flow(host, method="GET", path="/", headers=None):
     """Return a mock HTTPFlow with the given request properties."""
+    from mitmproxy.http import Headers
     flow = MagicMock()
     flow.request.pretty_host = host
     flow.request.pretty_url = f"http://{host}{path}"
     flow.request.method = method
     flow.request.path = path
-    flow.request.headers = dict(headers or {})
+    # Use mitmproxy's case-insensitive Headers so that addon.py header-name
+    # lowercasing (required for HTTP/2) is transparent to lookups.
+    flow.request.headers = Headers(
+        [(k.encode(), v.encode()) for k, v in (headers or {}).items()]
+    )
     flow.response = None
     return flow
 
