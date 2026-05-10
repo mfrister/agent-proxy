@@ -137,7 +137,15 @@ def load_host_config(path: str) -> dict:
 def load_credentials(path: str) -> list:
     """Load credential mappings from config YAML."""
     data = load_config(path)
-    return data.get("credentials", [])
+    creds = data.get("credentials", [])
+    # YAML block literals (|) and folded scalars (>) add a trailing newline.
+    # Strip all credential values so that LF/CR never reach HTTP/2 header fields,
+    # where they are forbidden (RFC 9113 § 8.2.1) and cause PROTOCOL_ERROR.
+    for cred in creds:
+        for key in ("real_value", "fake_value"):
+            if key in cred and isinstance(cred[key], str):
+                cred[key] = cred[key].strip()
+    return creds
 
 
 def load_management_port(path: str) -> int:

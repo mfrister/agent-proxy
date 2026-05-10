@@ -165,6 +165,39 @@ class TestLoadConfig:
         assert len(creds) == 1
         assert creds[0]["real_value"] == "real"
 
+    def test_load_credentials_strips_yaml_block_literal_newline(self, tmp_path):
+        # YAML block literals (|) and folded scalars (>) append a trailing \n.
+        # That \n is forbidden in HTTP/2 header values (RFC 9113 § 8.2.1) and
+        # causes PROTOCOL_ERROR on strict servers (e.g. Cloudflare).  The loader
+        # must strip it so that injected values are always whitespace-free.
+        from addon import load_credentials
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "credentials:\n"
+            "  - host: api.example.com\n"
+            "    header: cookie\n"
+            "    real_value: |\n"
+            "      session=abc123; other=xyz\n"
+        )
+        creds = load_credentials(str(config))
+        assert creds[0]["real_value"] == "session=abc123; other=xyz"
+
+    def test_load_credentials_strips_fake_value_whitespace(self, tmp_path):
+        from addon import load_credentials
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "credentials:\n"
+            "  - host: api.example.com\n"
+            "    header: Authorization\n"
+            "    fake_value: |\n"
+            "      Bearer fake-token\n"
+            "    real_value: |\n"
+            "      Bearer real-token\n"
+        )
+        creds = load_credentials(str(config))
+        assert creds[0]["fake_value"] == "Bearer fake-token"
+        assert creds[0]["real_value"] == "Bearer real-token"
+
     def test_load_credentials_empty_when_absent(self, tmp_path):
         from addon import load_credentials
         config = tmp_path / "config.yaml"
