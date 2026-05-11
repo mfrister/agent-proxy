@@ -40,7 +40,6 @@ import collections
 import json
 import logging
 import os
-import re
 import signal
 import threading
 import time
@@ -52,14 +51,10 @@ from flask import Flask, jsonify, request as flask_request
 from mitmproxy import http
 from mitmproxy.http import HTTPFlow
 
+from config import Config, ConfigLoader, HostConfig
+
 
 # ── Shared state ──────────────────────────────────────────────────────────────
-
-@dataclass
-class HostConfig:
-    allow_response_cookies: list[str] | None = None
-    # None means no restriction; a list (even empty) enables filtering
-
 
 @dataclass
 class ProxyState:
@@ -72,86 +67,6 @@ class ProxyState:
     deny_lock: threading.Lock
     host_config: dict         # host -> HostConfig
     management_port: int = 8082
-
-
-# ── Config loaders ─────────────────────────────────────────────────────────────
-
-def _expand_secrets(obj, secrets: dict):
-    """Recursively expand ${KEY} references in string values using the secrets map."""
-    if isinstance(obj, str):
-        def replace(m):
-            key = m.group(1)
-            if key not in secrets:
-                raise KeyError(f"Secret key not found in secrets_file: ${{{key}}}")
-            return str(secrets[key])
-        return re.sub(r'\$\{([^}]+)\}', replace, obj)
-    if isinstance(obj, dict):
-        return {k: _expand_secrets(v, secrets) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_expand_secrets(item, secrets) for item in obj]
-    return obj
-
-
-def load_config(path: str) -> dict:
-    """Load config YAML and expand any ${KEY} references from the secrets_file."""
-    try:
-        with open(path) as f:
-            data = yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        return {}
-
-    secrets = {}
-    secrets_path = data.get("secrets_file")
-    if secrets_path:
-        with open(secrets_path) as f:
-            secrets = yaml.safe_load(f) or {}
-
-    return _expand_secrets(data, secrets)
-
-
-def load_allowlist(path: str) -> set:
-    """Load allowed hosts from config YAML."""
-    data = load_config(path)
-    result = []
-    for item in data.get("allowed_hosts", []):
-        if isinstance(item, str):
-            result.append(item)
-        else:
-            result.append(item["host"])
-    return set(result)
-
-
-def load_host_config(path: str) -> dict:
-    """Load per-host config (cookie rules) from config YAML."""
-    data = load_config(path)
-    result = {}
-    for item in data.get("allowed_hosts", []):
-        if not isinstance(item, str):
-            host = item["host"]
-            result[host] = HostConfig(
-                allow_response_cookies=item.get("allow_response_cookies")
-            )
-    return result
-
-
-def load_credentials(path: str) -> list:
-    """Load credential mappings from config YAML."""
-    data = load_config(path)
-    creds = data.get("credentials", [])
-    # YAML block literals (|) and folded scalars (>) add a trailing newline.
-    # Strip all credential values so that LF/CR never reach HTTP/2 header fields,
-    # where they are forbidden (RFC 9113 § 8.2.1) and cause PROTOCOL_ERROR.
-    for cred in creds:
-        for key in ("real_value", "fake_value"):
-            if key in cred and isinstance(cred[key], str):
-                cred[key] = cred[key].strip()
-    return creds
-
-
-def load_management_port(path: str) -> int:
-    """Load management API port from config YAML."""
-    data = load_config(path)
-    return int(data.get("management_port", 8082))
 
 
 # ── Addons ─────────────────────────────────────────────────────────────────────
@@ -355,8 +270,9 @@ def create_app(state: ProxyState) -> Flask:
             data["allowed_hosts"] = hosts
             with open(state.allowlist_path, "w") as f:
                 yaml.safe_dump(data, f)
-        state.allowlist = load_allowlist(state.allowlist_path)
-        state.host_config = load_host_config(state.allowlist_path)
+        cfg = ConfigLoader(state.allowlist_path).load()
+        state.allowlist = cfg.allowlist
+        state.host_config = cfg.host_config
         return jsonify({"ok": True})
 
     return app
@@ -366,9 +282,10 @@ def create_app(state: ProxyState) -> Flask:
 
 def setup_sighup(state: ProxyState):
     def handler(signum, frame):
-        state.allowlist = load_allowlist(state.allowlist_path)
-        state.host_config = load_host_config(state.allowlist_path)
-        state.credentials = load_credentials(state.allowlist_path)
+        cfg = ConfigLoader(state.allowlist_path).load()
+        state.allowlist = cfg.allowlist
+        state.host_config = cfg.host_config
+        state.credentials = cfg.credentials
         print(json.dumps({
             "event": "sighup_reload",
             "host_count": len(state.allowlist),
@@ -380,17 +297,19 @@ def setup_sighup(state: ProxyState):
 # ── mitmproxy entry point ──────────────────────────────────────────────────────
 
 _config_path = os.environ.get("PROXY_CONFIG", "config.yaml")
+_loader = ConfigLoader(_config_path)
+_cfg = _loader.load()
 
 state = ProxyState(
-    allowlist=load_allowlist(_config_path),
+    allowlist=_cfg.allowlist,
     allowlist_path=_config_path,
-    credentials=load_credentials(_config_path),
+    credentials=_cfg.credentials,
     temp_allows={},
     temp_lock=threading.Lock(),
     deny_log=collections.deque(maxlen=1000),
     deny_lock=threading.Lock(),
-    host_config=load_host_config(_config_path),
-    management_port=load_management_port(_config_path),
+    host_config=_cfg.host_config,
+    management_port=_cfg.management_port,
 )
 
 setup_sighup(state)
