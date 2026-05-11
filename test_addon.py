@@ -63,159 +63,6 @@ CRED = {
 }
 
 
-# ── load_config ────────────────────────────────────────────────────────────────
-
-class TestLoadConfig:
-    def test_missing_file_returns_empty(self, tmp_path):
-        from addon import load_config
-        result = load_config(str(tmp_path / "nonexistent.yaml"))
-        assert result == {}
-
-    def test_basic_config_loaded(self, tmp_path):
-        from addon import load_config
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "management_port: 9000\n"
-            "allowed_hosts:\n"
-            "  - host: example.com\n"
-        )
-        result = load_config(str(config))
-        assert result["management_port"] == 9000
-        assert result["allowed_hosts"][0]["host"] == "example.com"
-
-    def test_secrets_expanded(self, tmp_path):
-        from addon import load_config
-        secrets = tmp_path / "secrets.yaml"
-        secrets.write_text("MY_KEY: real-value\n")
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            f"secrets_file: {secrets}\n"
-            "credentials:\n"
-            "  - host: api.example.com\n"
-            "    header: Authorization\n"
-            "    fake_value: fake\n"
-            "    real_value: \"${MY_KEY}\"\n"
-        )
-        result = load_config(str(config))
-        assert result["credentials"][0]["real_value"] == "real-value"
-
-    def test_missing_secret_key_raises(self, tmp_path):
-        from addon import load_config
-        secrets = tmp_path / "secrets.yaml"
-        secrets.write_text("OTHER_KEY: something\n")
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            f"secrets_file: {secrets}\n"
-            "credentials:\n"
-            "  - host: api.example.com\n"
-            "    real_value: \"${MISSING_KEY}\"\n"
-        )
-        with pytest.raises(KeyError, match="MISSING_KEY"):
-            load_config(str(config))
-
-    def test_missing_secrets_file_raises(self, tmp_path):
-        from addon import load_config
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "secrets_file: /nonexistent/secrets.yaml\n"
-            "allowed_hosts: []\n"
-        )
-        with pytest.raises(FileNotFoundError):
-            load_config(str(config))
-
-    def test_no_secrets_file_plain_values_unchanged(self, tmp_path):
-        from addon import load_config
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "credentials:\n"
-            "  - host: api.example.com\n"
-            "    real_value: plain-value\n"
-        )
-        result = load_config(str(config))
-        assert result["credentials"][0]["real_value"] == "plain-value"
-
-    def test_multiple_secrets_expanded(self, tmp_path):
-        from addon import load_config
-        secrets = tmp_path / "secrets.yaml"
-        secrets.write_text("KEY_A: value-a\nKEY_B: value-b\n")
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            f"secrets_file: {secrets}\n"
-            "credentials:\n"
-            "  - host: a.com\n"
-            "    real_value: \"${KEY_A}\"\n"
-            "  - host: b.com\n"
-            "    real_value: \"${KEY_B}\"\n"
-        )
-        result = load_config(str(config))
-        assert result["credentials"][0]["real_value"] == "value-a"
-        assert result["credentials"][1]["real_value"] == "value-b"
-
-    def test_load_credentials_from_config(self, tmp_path):
-        from addon import load_credentials
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "credentials:\n"
-            "  - host: api.example.com\n"
-            "    header: Authorization\n"
-            "    fake_value: fake\n"
-            "    real_value: real\n"
-        )
-        creds = load_credentials(str(config))
-        assert len(creds) == 1
-        assert creds[0]["real_value"] == "real"
-
-    def test_load_credentials_strips_yaml_block_literal_newline(self, tmp_path):
-        # YAML block literals (|) and folded scalars (>) append a trailing \n.
-        # That \n is forbidden in HTTP/2 header values (RFC 9113 § 8.2.1) and
-        # causes PROTOCOL_ERROR on strict servers (e.g. Cloudflare).  The loader
-        # must strip it so that injected values are always whitespace-free.
-        from addon import load_credentials
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "credentials:\n"
-            "  - host: api.example.com\n"
-            "    header: cookie\n"
-            "    real_value: |\n"
-            "      session=abc123; other=xyz\n"
-        )
-        creds = load_credentials(str(config))
-        assert creds[0]["real_value"] == "session=abc123; other=xyz"
-
-    def test_load_credentials_strips_fake_value_whitespace(self, tmp_path):
-        from addon import load_credentials
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "credentials:\n"
-            "  - host: api.example.com\n"
-            "    header: Authorization\n"
-            "    fake_value: |\n"
-            "      Bearer fake-token\n"
-            "    real_value: |\n"
-            "      Bearer real-token\n"
-        )
-        creds = load_credentials(str(config))
-        assert creds[0]["fake_value"] == "Bearer fake-token"
-        assert creds[0]["real_value"] == "Bearer real-token"
-
-    def test_load_credentials_empty_when_absent(self, tmp_path):
-        from addon import load_credentials
-        config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts:\n  - host: example.com\n")
-        assert load_credentials(str(config)) == []
-
-    def test_load_management_port_from_config(self, tmp_path):
-        from addon import load_management_port
-        config = tmp_path / "config.yaml"
-        config.write_text("management_port: 9999\n")
-        assert load_management_port(str(config)) == 9999
-
-    def test_load_management_port_default(self, tmp_path):
-        from addon import load_management_port
-        config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts: []\n")
-        assert load_management_port(str(config)) == 8082
-
 
 # ── AllowlistAddon ─────────────────────────────────────────────────────────────
 
@@ -401,7 +248,7 @@ class TestLoggingAddon:
 
 class TestSighupReload:
     def test_sighup_reloads_allowlist(self, tmp_path):
-        from addon import load_allowlist, setup_sighup
+        from addon import setup_sighup
 
         config = tmp_path / "config.yaml"
         config.write_text("allowed_hosts:\n  - host: original.com\n")
@@ -589,7 +436,8 @@ class TestCookieAllowlist:
         assert flow.response._stored == ["session=abc", "tracker=xyz"]
 
     def test_host_config_none_restriction_passes_all(self):
-        from addon import CredentialBrokerAddon, HostConfig
+        from addon import CredentialBrokerAddon
+        from config import HostConfig
         state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=None)})
         addon = CredentialBrokerAddon(state)
         flow = make_response_flow("example.com", ["session=abc", "tracker=xyz"])
@@ -597,7 +445,8 @@ class TestCookieAllowlist:
         assert flow.response._stored == ["session=abc", "tracker=xyz"]
 
     def test_empty_allowlist_strips_all_cookies(self):
-        from addon import CredentialBrokerAddon, HostConfig
+        from addon import CredentialBrokerAddon
+        from config import HostConfig
         state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=[])})
         addon = CredentialBrokerAddon(state)
         flow = make_response_flow("example.com", ["session=abc", "tracker=xyz"])
@@ -605,7 +454,8 @@ class TestCookieAllowlist:
         assert flow.response._stored == []
 
     def test_allowlist_keeps_only_named_cookie(self):
-        from addon import CredentialBrokerAddon, HostConfig
+        from addon import CredentialBrokerAddon
+        from config import HostConfig
         state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=["csrftoken"])})
         addon = CredentialBrokerAddon(state)
         flow = make_response_flow("example.com", ["csrftoken=abc123", "session=xyz"])
@@ -613,7 +463,8 @@ class TestCookieAllowlist:
         assert flow.response._stored == ["csrftoken=abc123"]
 
     def test_multiple_set_cookie_headers_filtered(self):
-        from addon import CredentialBrokerAddon, HostConfig
+        from addon import CredentialBrokerAddon
+        from config import HostConfig
         state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=["csrftoken", "lang"])})
         addon = CredentialBrokerAddon(state)
         flow = make_response_flow(
