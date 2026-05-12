@@ -21,17 +21,21 @@ import yaml
 def make_state(**overrides):
     """Return a ProxyState with sensible defaults, merged with any overrides."""
     from addon import ProxyState
+    from config import Config
 
+    config = Config(
+        allowlist=overrides.pop("allowlist", {"allowed.com"}),
+        credentials=overrides.pop("credentials", []),
+        host_config=overrides.pop("host_config", {}),
+        management_port=overrides.pop("management_port", 8082),
+    )
     defaults = dict(
-        allowlist={"allowed.com"},
+        config=config,
         allowlist_path="config.yaml",
-        credentials=[],
         temp_allows={},
         temp_lock=threading.Lock(),
         deny_log=collections.deque(maxlen=1000),
         deny_lock=threading.Lock(),
-        host_config={},
-        management_port=8082,
     )
     defaults.update(overrides)
     return ProxyState(**defaults)
@@ -263,8 +267,8 @@ class TestSighupReload:
         os.kill(os.getpid(), signal.SIGHUP)
         time.sleep(0.05)
 
-        assert "new.com" in state.allowlist
-        assert "original.com" in state.allowlist
+        assert "new.com" in state.config.allowlist
+        assert "original.com" in state.config.allowlist
 
     def test_sighup_reloads_credentials(self, tmp_path):
         from addon import setup_sighup
@@ -292,7 +296,7 @@ class TestSighupReload:
         os.kill(os.getpid(), signal.SIGHUP)
         time.sleep(0.05)
 
-        assert state.credentials[0]["real_value"] == "new-value"
+        assert state.config.credentials[0]["real_value"] == "new-value"
 
 
 # ── Management API ─────────────────────────────────────────────────────────────
@@ -360,7 +364,7 @@ class TestManagementAPI:
     def test_post_allow_permanent_updates_state(self, mgmt):
         r = mgmt.post("/allow/permanent", json={"host": "new.com"})
         assert r.get_json()["ok"] is True
-        assert "new.com" in mgmt._state.allowlist
+        assert "new.com" in mgmt._state.config.allowlist
 
     def test_post_allow_permanent_writes_file(self, mgmt, tmp_path):
         mgmt.post("/allow/permanent", json={"host": "written.com"})

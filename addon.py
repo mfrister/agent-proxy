@@ -58,15 +58,12 @@ from config import Config, ConfigLoader, HostConfig
 
 @dataclass
 class ProxyState:
-    allowlist: set            # permanent allowed hosts
+    config: Config
     allowlist_path: str       # path to config YAML, used by SIGHUP reload
-    credentials: list         # [{host, header, fake_value, real_value}]
     temp_allows: dict         # host -> expires_at (epoch seconds)
     temp_lock: threading.Lock
     deny_log: collections.deque  # maxlen=1000, entries: {timestamp,host,url,method}
     deny_lock: threading.Lock
-    host_config: dict         # host -> HostConfig
-    management_port: int = 8082
 
 
 # ── Addons ─────────────────────────────────────────────────────────────────────
@@ -85,7 +82,7 @@ class AllowlistAddon:
         """Start the management API in a background thread."""
         threading.Thread(
             target=lambda: create_app(self.state).run(
-                host="127.0.0.1", port=self.state.management_port, use_reloader=False
+                host="127.0.0.1", port=self.state.config.management_port, use_reloader=False
             ),
             daemon=True,
         ).start()
@@ -94,7 +91,7 @@ class AllowlistAddon:
         host = flow.request.pretty_host
         s = self.state
 
-        if host in s.allowlist:
+        if host in s.config.allowlist:
             return
 
         with s.temp_lock:
@@ -139,7 +136,7 @@ class CredentialBrokerAddon:
             return
 
         host = flow.request.pretty_host
-        for cred in self.state.credentials:
+        for cred in self.state.config.credentials:
             if cred["host"] != host:
                 continue
             header = cred["header"]
@@ -186,7 +183,7 @@ class CredentialBrokerAddon:
 
     def response(self, flow: HTTPFlow):
         host = flow.request.pretty_host
-        cfg = self.state.host_config.get(host)
+        cfg = self.state.config.host_config.get(host)
         if cfg is None or cfg.allow_response_cookies is None:
             return
         allowed = set(cfg.allow_response_cookies)
@@ -205,7 +202,7 @@ class LoggingAddon:
     def __init__(self, state: ProxyState):
         self.state = state
         # Headers that carry credentials — excluded from logs
-        self._sensitive = {cred["header"].lower() for cred in state.credentials}
+        self._sensitive = {cred["header"].lower() for cred in state.config.credentials}
 
     def request(self, flow: HTTPFlow):
         # Skip flows already denied upstream
@@ -242,7 +239,7 @@ def create_app(state: ProxyState) -> Flask:
                 h: exp for h, exp in state.temp_allows.items() if now < exp
             }
         return jsonify({
-            "permanent": sorted(state.allowlist),
+            "permanent": sorted(state.config.allowlist),
             "temporary": active_temps,
         })
 
@@ -270,9 +267,7 @@ def create_app(state: ProxyState) -> Flask:
             data["allowed_hosts"] = hosts
             with open(state.allowlist_path, "w") as f:
                 yaml.safe_dump(data, f)
-        cfg = ConfigLoader(state.allowlist_path).load()
-        state.allowlist = cfg.allowlist
-        state.host_config = cfg.host_config
+        state.config = ConfigLoader(state.allowlist_path).load()
         return jsonify({"ok": True})
 
     return app
@@ -282,14 +277,11 @@ def create_app(state: ProxyState) -> Flask:
 
 def setup_sighup(state: ProxyState):
     def handler(signum, frame):
-        cfg = ConfigLoader(state.allowlist_path).load()
-        state.allowlist = cfg.allowlist
-        state.host_config = cfg.host_config
-        state.credentials = cfg.credentials
+        state.config = ConfigLoader(state.allowlist_path).load()
         print(json.dumps({
             "event": "sighup_reload",
-            "host_count": len(state.allowlist),
-            "credential_count": len(state.credentials),
+            "host_count": len(state.config.allowlist),
+            "credential_count": len(state.config.credentials),
         }))
     signal.signal(signal.SIGHUP, handler)
 
@@ -301,15 +293,12 @@ _loader = ConfigLoader(_config_path)
 _cfg = _loader.load()
 
 state = ProxyState(
-    allowlist=_cfg.allowlist,
+    config=_cfg,
     allowlist_path=_config_path,
-    credentials=_cfg.credentials,
     temp_allows={},
     temp_lock=threading.Lock(),
     deny_log=collections.deque(maxlen=1000),
     deny_lock=threading.Lock(),
-    host_config=_cfg.host_config,
-    management_port=_cfg.management_port,
 )
 
 setup_sighup(state)
