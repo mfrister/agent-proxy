@@ -644,7 +644,7 @@ wheels = [
 
 [[package]]
 name = "mitmproxy"
-version = "12.2.2"
+version = "12.2.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aioquic" },
@@ -676,7 +676,7 @@ dependencies = [
     { name = "zstandard" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7d/14/32b4c3a9c3380e0cf1bed1976951e70510c06f1ba7c0dc46f9e69e3965ae/mitmproxy-12.2.2-py3-none-any.whl", hash = "sha256:7b111ba3b83b34b0d9b653044685db7c3f5fbc63b39b8f06439642da83910713", size = 1651385, upload-time = "2026-04-12T21:49:54.312Z" },
+    { url = "https://files.pythonhosted.org/packages/e0/56/0df365a56624472c397b45788b64a5c10ecabf0de3858bf538b42875a268/mitmproxy-12.2.3-py3-none-any.whl", hash = "sha256:df75ccd15ccb39ab55ce9dd4130312270e8ba208eb927a7cbe50cb52678ec722", size = 1652028, upload-time = "2026-05-12T14:09:49.694Z" },
 ]
 
 [[package]]
@@ -871,15 +871,15 @@ wheels = [
 
 [[package]]
 name = "pyopenssl"
-version = "25.3.0"
+version = "26.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
     { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/80/be/97b83a464498a79103036bc74d1038df4a7ef0e402cfaf4d5e113fb14759/pyopenssl-25.3.0.tar.gz", hash = "sha256:c981cb0a3fd84e8602d7afc209522773b94c1c2446a3c710a75b06fe1beae329", size = 184073, upload-time = "2025-09-17T00:32:21.037Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8e/11/a62e1d33b373da2b2c2cd9eb508147871c80f12b1cacde3c5d314922afdd/pyopenssl-26.0.0.tar.gz", hash = "sha256:f293934e52936f2e3413b89c6ce36df66a0b34ae1ea3a053b8c5020ff2f513fc", size = 185534, upload-time = "2026-03-15T14:28:26.353Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d1/81/ef2b1dfd1862567d573a4fdbc9f969067621764fbb74338496840a1d2977/pyopenssl-25.3.0-py3-none-any.whl", hash = "sha256:1fda6fc034d5e3d179d39e59c1895c9faeaf40a79de5fc4cbbfbe0d36f4a77b6", size = 57268, upload-time = "2025-09-17T00:32:19.474Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/7d/d4f7d908fa8415571771b30669251d57c3cf313b36a856e6d7548ae01619/pyopenssl-26.0.0-py3-none-any.whl", hash = "sha256:df94d28498848b98cc1c0ffb8ef1e71e40210d3b0a8064c9d29571ed2904bf81", size = 57969, upload-time = "2026-03-15T14:28:24.864Z" },
 ]
 
 [[package]]
