@@ -151,7 +151,7 @@ def load_management_port(path: str) -> int:
 class AllowlistAddon:
     """
     Checks every request against the permanent allowlist and active temporary
-    allows. Denied requests receive a 403 response and are logged.
+    allows. Denied requests receive a 503 response and are logged.
     Also starts the management API when mitmproxy is running.
     """
 
@@ -180,7 +180,9 @@ class AllowlistAddon:
                 return
 
         flow.response = http.Response.make(
-            403, f"Blocked: {host}", {"Content-Type": "text/plain"}
+            503,
+            f"Request to {host} is pending human approval. Retry the request after approval is granted.",
+            {"Content-Type": "text/plain", "Retry-After": "5"},
         )
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),

@@ -189,13 +189,15 @@ class TestAllowlistAddon:
         addon.request(flow)
         assert flow.response is None
 
-    def test_blocked_host_gets_403(self):
+    def test_blocked_host_gets_503(self):
         from addon import AllowlistAddon
         addon = AllowlistAddon(make_state(allowlist=set()))
         flow = make_flow("evil.com")
         addon.request(flow)
         assert flow.response is not None
-        assert flow.response.status_code == 403
+        assert flow.response.status_code == 503
+        assert b"pending human approval" in flow.response.content
+        assert flow.response.headers.get("Retry-After") == "5"
 
     def test_blocked_host_logged(self):
         from addon import AllowlistAddon
@@ -230,7 +232,7 @@ class TestAllowlistAddon:
         flow = make_flow("temp.com")
         addon.request(flow)
         assert flow.response is not None
-        assert flow.response.status_code == 403
+        assert flow.response.status_code == 503
 
     def test_multiple_denials_all_logged(self):
         from addon import AllowlistAddon
@@ -293,12 +295,12 @@ class TestCredentialBrokerAddon:
         from mitmproxy import http
         addon = CredentialBrokerAddon(make_state(credentials=[CRED]))
         flow = make_flow("api.example.com", headers={"Authorization": "Bearer injected"})
-        # Simulate AllowlistAddon already set a 403
-        flow.response = http.Response.make(403, "Blocked")
+        # Simulate AllowlistAddon already set a 503
+        flow.response = http.Response.make(503, "pending human approval")
         addon.request(flow)
         # Should not overwrite the existing response
-        assert flow.response.status_code == 403
-        assert b"Blocked" in flow.response.content
+        assert flow.response.status_code == 503
+        assert b"pending human approval" in flow.response.content
 
     def test_inject_mode_sets_header_when_absent(self, capsys):
         from addon import CredentialBrokerAddon
@@ -354,7 +356,7 @@ class TestLoggingAddon:
         from mitmproxy import http
         addon = LoggingAddon(make_state())
         flow = make_flow("evil.com")
-        flow.response = http.Response.make(403, "Blocked")
+        flow.response = http.Response.make(503, "pending human approval")
         addon.request(flow)
         assert capsys.readouterr().out == ""
 
