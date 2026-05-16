@@ -195,10 +195,10 @@ def proxy_secrets(tmp_path):
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
 
-def test_blocked_domain_returns_403(proxy):
+def test_blocked_domain_returns_503(proxy):
     with pytest.raises(urllib.error.HTTPError) as exc:
         proxy["opener"].open("http://blocked.example.com/")
-    assert exc.value.code == 403
+    assert exc.value.code == 503
 
 
 def test_allowed_domain_reaches_server(proxy):
