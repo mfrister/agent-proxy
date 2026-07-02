@@ -13,6 +13,10 @@ Config YAML format:
 
   management_port: 8082                  # management API port (default: 8082)
 
+  happy_eyeballs_delay: 0.25             # race IPv6/IPv4 upstream connects
+                                         # (RFC 8305); 0 disables. Works around
+                                         # mitmproxy issue #8088; needs restart.
+
   credentials:
     - host: api.example.com
       header: Authorization
@@ -55,12 +59,15 @@ Secrets file format (simple flat key/value map):
   OTHER_SECRET: "some-value"
 """
 
+import asyncio
 import collections
+import functools
 import json
 import logging
 import os
 import re
 import signal
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -204,6 +211,42 @@ def load_management_port(path: str) -> int:
     """Load management API port from config YAML."""
     data = load_config(path)
     return int(data.get("management_port", 8082))
+
+
+def load_happy_eyeballs_delay(path: str) -> float:
+    """Load the happy-eyeballs delay in seconds; 0 (or false) disables it."""
+    data = load_config(path)
+    return float(data.get("happy_eyeballs_delay", 0.25) or 0)
+
+
+def happy_eyeballs_supported(version: tuple = None) -> bool:
+    """asyncio's happy-eyeballs implementation (asyncio.staggered) crashes
+    under the eager task factory mitmproxy sets, on Pythons predating the
+    cpython#124309 rewrite (fixed in 3.12.8 / 3.13.1)."""
+    v = version or sys.version_info
+    return v[:3] >= (3, 12, 8) and v[:3] != (3, 13, 0)
+
+
+def enable_happy_eyeballs(delay: float) -> None:
+    """Race IPv6/IPv4 upstream connects (RFC 8305 happy eyeballs).
+
+    mitmproxy opens upstream connections with a bare asyncio.open_connection
+    (mitmproxy/proxy/server.py), which tries resolved addresses one at a
+    time: when a host publishes an AAAA record but its IPv6 path blackholes,
+    the connect stalls for the full OS timeout before IPv4 is ever tried.
+    Injecting happy_eyeballs_delay makes asyncio race the address families.
+    Remove once https://github.com/mitmproxy/mitmproxy/issues/8088 ships.
+    """
+    original = asyncio.open_connection
+
+    @functools.wraps(original)
+    def open_connection(host=None, port=None, **kwargs):
+        # Only meaningful for host-based connects, not pre-made sockets
+        if host is not None and kwargs.get("sock") is None:
+            kwargs.setdefault("happy_eyeballs_delay", delay)
+        return original(host, port, **kwargs)
+
+    asyncio.open_connection = open_connection
 
 
 # ── Addons ─────────────────────────────────────────────────────────────────────
@@ -515,6 +558,26 @@ state = ProxyState(
 )
 
 setup_sighup(state)
+
+# uv enforces requires-python (>=3.12.8,!=3.13.0); this guard covers runs
+# outside uv, where a broken interpreter would make every connect hang.
+_happy_eyeballs_delay = load_happy_eyeballs_delay(_config_path)
+if _happy_eyeballs_delay and not happy_eyeballs_supported():
+    print(json.dumps({
+        "event": "happy_eyeballs_unsupported",
+        "python": ".".join(map(str, sys.version_info[:3])),
+        "message": (
+            "this Python's asyncio happy-eyeballs crashes under mitmproxy's "
+            "eager task factory (fixed in 3.12.8/3.13.1); falling back to "
+            "sequential connects — IPv6-blackholed hosts will stall"
+        ),
+    }))
+elif _happy_eyeballs_delay:
+    enable_happy_eyeballs(_happy_eyeballs_delay)
+    print(json.dumps({
+        "event": "happy_eyeballs_enabled",
+        "delay_seconds": _happy_eyeballs_delay,
+    }))
 
 addons = [
     AllowlistAddon(state),

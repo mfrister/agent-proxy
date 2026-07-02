@@ -181,6 +181,87 @@ class TestLoadConfig:
         assert load_management_port(str(config)) == 8082
 
 
+# ── Happy eyeballs ─────────────────────────────────────────────────────────────
+
+class TestHappyEyeballs:
+    def test_load_delay_default(self, tmp_path):
+        from addon import load_happy_eyeballs_delay
+        config = tmp_path / "config.yaml"
+        config.write_text("allowed_hosts: []\n")
+        assert load_happy_eyeballs_delay(str(config)) == 0.25
+
+    def test_load_delay_custom(self, tmp_path):
+        from addon import load_happy_eyeballs_delay
+        config = tmp_path / "config.yaml"
+        config.write_text("happy_eyeballs_delay: 0.1\n")
+        assert load_happy_eyeballs_delay(str(config)) == 0.1
+
+    def test_load_delay_disabled(self, tmp_path):
+        from addon import load_happy_eyeballs_delay
+        config = tmp_path / "config.yaml"
+        for value in ("0", "false", "null"):
+            config.write_text(f"happy_eyeballs_delay: {value}\n")
+            assert load_happy_eyeballs_delay(str(config)) == 0
+
+    def test_supported_version_ranges(self):
+        from addon import happy_eyeballs_supported
+
+        assert not happy_eyeballs_supported((3, 12, 3))
+        assert not happy_eyeballs_supported((3, 13, 0))
+        assert happy_eyeballs_supported((3, 12, 8))
+        assert happy_eyeballs_supported((3, 13, 1))
+        assert happy_eyeballs_supported((3, 14, 0))
+
+    def test_current_interpreter_supported(self):
+        # requires-python guarantees this; a failure here means the venv
+        # interpreter predates the cpython#124309 fix
+        from addon import happy_eyeballs_supported
+
+        assert happy_eyeballs_supported()
+
+    @pytest.fixture
+    def recorded_open_connection(self):
+        """Replace asyncio.open_connection with a recorder, restore after."""
+        import asyncio
+
+        calls = []
+        original = asyncio.open_connection
+        asyncio.open_connection = (
+            lambda host=None, port=None, **kw: calls.append((host, port, kw))
+        )
+        yield calls
+        asyncio.open_connection = original
+
+    def test_patch_injects_delay(self, recorded_open_connection):
+        import asyncio
+        from addon import enable_happy_eyeballs
+
+        enable_happy_eyeballs(0.25)
+        asyncio.open_connection("example.com", 443, local_addr=None)
+        host, port, kwargs = recorded_open_connection[0]
+        assert (host, port) == ("example.com", 443)
+        assert kwargs["happy_eyeballs_delay"] == 0.25
+        assert kwargs["local_addr"] is None
+
+    def test_patch_keeps_explicit_delay(self, recorded_open_connection):
+        import asyncio
+        from addon import enable_happy_eyeballs
+
+        enable_happy_eyeballs(0.25)
+        asyncio.open_connection("example.com", 443, happy_eyeballs_delay=1.0)
+        _, _, kwargs = recorded_open_connection[0]
+        assert kwargs["happy_eyeballs_delay"] == 1.0
+
+    def test_patch_skips_sock_connects(self, recorded_open_connection):
+        import asyncio
+        from addon import enable_happy_eyeballs
+
+        enable_happy_eyeballs(0.25)
+        asyncio.open_connection(sock=object())
+        _, _, kwargs = recorded_open_connection[0]
+        assert "happy_eyeballs_delay" not in kwargs
+
+
 # ── AllowlistAddon ─────────────────────────────────────────────────────────────
 
 class TestAllowlistAddon:

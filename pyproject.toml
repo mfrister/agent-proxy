@@ -1,7 +1,10 @@
 [project]
 name = "agent-proxy"
 version = "0.1.0"
-requires-python = ">=3.12"
+# 3.12.8/3.13.1 fixed asyncio's happy-eyeballs impl under eager task
+# factories (cpython#124309), which addon.py's happy_eyeballs_delay
+# support relies on inside mitmproxy.
+requires-python = ">=3.12.8,!=3.13.0"
 dependencies = [
     "mitmproxy>=10",
     "flask>=3",
