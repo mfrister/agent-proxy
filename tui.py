@@ -145,6 +145,11 @@ class ProxyMonitor(App[None]):
         self.base_url = f"http://127.0.0.1:{mgmt_port}"
         # Raw denied rows (deduplicated, newest-first)
         self._denied_rows: list[dict] = []
+        # Guards against overlapping fetches (fetch timeout > poll interval)
+        self._refreshing = False
+        self._consecutive_failures = 0
+        # Ticks to skip before the next poll attempt (exponential backoff)
+        self._skip_ticks = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -173,7 +178,7 @@ class ProxyMonitor(App[None]):
 
         denied_table.focus()
 
-        self.set_interval(1, self._refresh_data)
+        self.set_interval(1, self._poll_tick)
         self.call_after_refresh(self._refresh_data)
 
     def _focused_pane(self) -> str:
@@ -183,7 +188,22 @@ class ProxyMonitor(App[None]):
             return "denied"
         return "allowed"
 
+    async def _poll_tick(self) -> None:
+        if self._skip_ticks > 0:
+            self._skip_ticks -= 1
+            return
+        await self._refresh_data()
+
     async def _refresh_data(self) -> None:
+        if self._refreshing:
+            return
+        self._refreshing = True
+        try:
+            await self._do_refresh()
+        finally:
+            self._refreshing = False
+
+    async def _do_refresh(self) -> None:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 denied_r, allow_r = await asyncio.gather(
@@ -193,8 +213,20 @@ class ProxyMonitor(App[None]):
             denied_data: list[dict] = denied_r.json()
             allowlist: dict = allow_r.json()
         except Exception as exc:
-            self.notify(f"Fetch error: {exc}", severity="error", timeout=4)
+            self._consecutive_failures += 1
+            self._skip_ticks = min(2 ** (self._consecutive_failures - 1), 30)
+            if self._consecutive_failures == 1:
+                self.notify(f"Fetch error: {exc}", severity="error", timeout=4)
+            self.query_one("#status-bar", Static).update(
+                f"  {self.base_url}  |  [red]disconnected[/red] "
+                f"({escape(str(exc) or exc.__class__.__name__)})  |  "
+                f"retrying in {self._skip_ticks}s"
+            )
             return
+
+        if self._consecutive_failures:
+            self.notify("Reconnected to proxy API")
+        self._consecutive_failures = 0
 
         # Deduplicate: keep the most recent entry per host, sort newest first
         seen: dict[str, dict] = {}
@@ -297,6 +329,7 @@ class ProxyMonitor(App[None]):
         bar.duration_idx = (bar.duration_idx + 1) % len(DURATIONS)
 
     async def action_refresh(self) -> None:
+        self._skip_ticks = 0
         await self._refresh_data()
 
     def _selected_denied_host(self) -> str | None:
