@@ -52,6 +52,18 @@ allowed_hosts:
 
 When `allow_response_cookies` is absent, all `Set-Cookie` headers from that host pass through unchanged. An empty list strips everything; a non-empty list is an allowlist.
 
+### Registry presets (restricted hosts)
+
+Read-only access to common package registries without fully allowlisting them:
+
+```yaml
+allowed_registries: [go, npm, docker, ghcr, pypi, crates]
+```
+
+Each preset pins exact hostnames and only permits GET/HEAD requests matching known, bounded URL patterns (package metadata, tarballs, manifests, blobs, pull-scoped auth tokens). Query strings and request headers are allowlisted; everything else is blocked with a 403 (a policy violation, unlike the 503 pending-approval flow) and shows up in the deny log tagged `policy_violation`. Custom hosts can use the same rule engine via `restricted_hosts` — see `config.default.yaml` for the schema.
+
+The threat model, restriction design, and known limitations are documented in [docs/registry-presets.md](docs/registry-presets.md).
+
 **`PROXY_CREDENTIALS`** — credential mappings (JSON array). Two modes are supported:
 
 **Swap mode** — the agent uses a placeholder value; the proxy replaces it with the real credential before forwarding. Requests with any other non-empty value are blocked (guards against prompt injection).
