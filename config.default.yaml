@@ -11,6 +11,15 @@
 
 # management_port: 8082   # port for the management API (default: 8082)
 
+# Delay in seconds before racing the next address family when connecting
+# upstream (RFC 8305 "happy eyeballs"). Works around mitmproxy trying resolved
+# addresses strictly sequentially, which stalls for the full OS connect
+# timeout on hosts whose AAAA record points at a blackholed IPv6 path
+# (https://github.com/mitmproxy/mitmproxy/issues/8088). Set to 0 to disable.
+# Requires a proxy restart to change; not reloaded on SIGHUP.
+#
+# happy_eyeballs_delay: 0.25
+
 allowed_hosts:
   - host: api.anthropic.com
   - host: platform.claude.com
