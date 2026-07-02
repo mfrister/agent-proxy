@@ -37,7 +37,7 @@ def make_state(**overrides):
     return ProxyState(**defaults)
 
 
-def make_flow(host, method="GET", path="/", headers=None):
+def make_flow(host, method="GET", path="/", headers=None, body=b""):
     """Return a mock HTTPFlow with the given request properties."""
     flow = MagicMock()
     flow.request.pretty_host = host
@@ -45,7 +45,9 @@ def make_flow(host, method="GET", path="/", headers=None):
     flow.request.method = method
     flow.request.path = path
     flow.request.headers = dict(headers or {})
+    flow.request.raw_content = body
     flow.response = None
+    flow.metadata = {}
     return flow
 
 
@@ -242,6 +244,216 @@ class TestAllowlistAddon:
             addon.request(make_flow(host))
         assert len(state.deny_log) == 3
 
+    def test_denial_entry_typed_pending_approval(self):
+        from addon import AllowlistAddon
+        state = make_state(allowlist=set())
+        AllowlistAddon(state).request(make_flow("evil.com"))
+        assert state.deny_log[0]["type"] == "pending_approval"
+
+
+# ── Registry policy (restricted hosts) ─────────────────────────────────────────
+
+def make_restricted(**spec_overrides):
+    """Compiled rules for a simple restricted test host."""
+    import registries
+    spec = {
+        "rules": [
+            {"methods": ["GET", "HEAD"], "path": "/pkg/[a-z0-9-]{1,64}",
+             "query": {"version": "[a-z0-9.]{1,32}"}},
+        ],
+    }
+    spec.update(spec_overrides)
+    return {"registry.example.com": registries.compile_host_rules(spec, source="testpreset")}
+
+
+class TestRegistryPolicy:
+    def test_matching_request_passes(self):
+        from addon import AllowlistAddon
+        addon = AllowlistAddon(make_state(allowlist=set(), restricted=make_restricted()))
+        flow = make_flow("registry.example.com", path="/pkg/foo")
+        addon.request(flow)
+        assert flow.response is None
+        assert flow.metadata["registry"] == "testpreset"
+
+    def test_allowed_query_param_passes(self):
+        from addon import AllowlistAddon
+        addon = AllowlistAddon(make_state(allowlist=set(), restricted=make_restricted()))
+        flow = make_flow("registry.example.com", path="/pkg/foo?version=1.2.3")
+        addon.request(flow)
+        assert flow.response is None
+
+    def test_violation_gets_403_without_retry_after(self, capsys):
+        from addon import AllowlistAddon
+        state = make_state(allowlist=set(), restricted=make_restricted())
+        addon = AllowlistAddon(state)
+        flow = make_flow("registry.example.com", method="POST", path="/pkg/foo")
+        addon.request(flow)
+        assert flow.response.status_code == 403
+        assert b"policy violation" in flow.response.content
+        assert "Retry-After" not in flow.response.headers
+        entry = state.deny_log[0]
+        assert entry["type"] == "policy_violation"
+        assert "POST" in entry["reason"]
+        event = json.loads(capsys.readouterr().out)
+        assert event["event"] == "registry_policy_violation"
+        assert event["policy"] == "testpreset"
+
+    def test_disallowed_query_param_blocked(self):
+        from addon import AllowlistAddon
+        addon = AllowlistAddon(make_state(allowlist=set(), restricted=make_restricted()))
+        flow = make_flow("registry.example.com", path="/pkg/foo?data=secret")
+        addon.request(flow)
+        assert flow.response.status_code == 403
+
+    def test_body_on_get_blocked(self):
+        from addon import AllowlistAddon
+        addon = AllowlistAddon(make_state(allowlist=set(), restricted=make_restricted()))
+        flow = make_flow("registry.example.com", path="/pkg/foo", body=b"exfil")
+        addon.request(flow)
+        assert flow.response.status_code == 403
+
+    def test_allowlist_beats_restricted(self):
+        from addon import AllowlistAddon
+        addon = AllowlistAddon(make_state(
+            allowlist={"registry.example.com"}, restricted=make_restricted()))
+        flow = make_flow("registry.example.com", method="POST", path="/anything")
+        addon.request(flow)
+        assert flow.response is None
+
+    def test_temp_allow_beats_restricted(self):
+        from addon import AllowlistAddon
+        addon = AllowlistAddon(make_state(
+            allowlist=set(),
+            temp_allows={"registry.example.com": time.time() + 60},
+            restricted=make_restricted(),
+        ))
+        flow = make_flow("registry.example.com", method="POST", path="/anything")
+        addon.request(flow)
+        assert flow.response is None
+
+    def test_unlisted_host_still_gets_503(self):
+        from addon import AllowlistAddon
+        addon = AllowlistAddon(make_state(allowlist=set(), restricted=make_restricted()))
+        flow = make_flow("other.com")
+        addon.request(flow)
+        assert flow.response.status_code == 503
+
+    def test_headers_scrubbed_names_logged_values_not(self, capsys):
+        from addon import AllowlistAddon
+        addon = AllowlistAddon(make_state(allowlist=set(), restricted=make_restricted()))
+        flow = make_flow("registry.example.com", path="/pkg/foo", headers={
+            "Accept": "*/*",
+            "X-Exfil": "top-secret-value",
+            "Cookie": "session=abc",
+        })
+        addon.request(flow)
+        assert flow.response is None
+        assert "X-Exfil" not in flow.request.headers
+        assert "Cookie" not in flow.request.headers
+        assert flow.request.headers["Accept"] == "*/*"
+        out = capsys.readouterr().out
+        event = json.loads(out)
+        assert event["event"] == "registry_headers_scrubbed"
+        assert "X-Exfil" in event["dropped"]
+        assert "top-secret-value" not in out
+
+    def test_overlong_header_clamped(self):
+        from addon import AllowlistAddon
+        addon = AllowlistAddon(make_state(allowlist=set(), restricted=make_restricted()))
+        flow = make_flow("registry.example.com", path="/pkg/foo",
+                         headers={"User-Agent": "u" * 600})
+        addon.request(flow)
+        assert flow.response is None
+        assert len(flow.request.headers["User-Agent"]) == 512
+
+    def test_declared_header_survives(self):
+        from addon import AllowlistAddon
+        addon = AllowlistAddon(make_state(
+            allowlist=set(),
+            restricted=make_restricted(request_headers=["authorization"]),
+        ))
+        flow = make_flow("registry.example.com", path="/pkg/foo",
+                         headers={"Authorization": "Bearer tok"})
+        addon.request(flow)
+        assert flow.request.headers["Authorization"] == "Bearer tok"
+
+
+# ── load_restricted_hosts ──────────────────────────────────────────────────────
+
+class TestLoadRestrictedHosts:
+    def test_preset_expansion(self, tmp_path):
+        from addon import load_restricted_hosts
+        config = tmp_path / "config.yaml"
+        config.write_text("allowed_registries: [go, npm]\n")
+        result = load_restricted_hosts(str(config))
+        assert result["proxy.golang.org"].source == "go"
+        assert result["sum.golang.org"].source == "go"
+        assert result["registry.npmjs.org"].source == "npm"
+
+    def test_unknown_preset_raises(self, tmp_path):
+        from addon import load_restricted_hosts
+        config = tmp_path / "config.yaml"
+        config.write_text("allowed_registries: [nonexistent]\n")
+        with pytest.raises(ValueError, match="nonexistent"):
+            load_restricted_hosts(str(config))
+
+    def test_custom_restricted_host(self, tmp_path):
+        from addon import load_restricted_hosts
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "restricted_hosts:\n"
+            "  - host: artifacts.example.com\n"
+            "    rules:\n"
+            "      - methods: [GET]\n"
+            "        path: \"/repo/[a-z]{1,10}\"\n"
+        )
+        result = load_restricted_hosts(str(config))
+        assert result["artifacts.example.com"].source == "config"
+
+    def test_custom_entry_replaces_preset(self, tmp_path):
+        from addon import load_restricted_hosts
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "allowed_registries: [npm]\n"
+            "restricted_hosts:\n"
+            "  - host: registry.npmjs.org\n"
+            "    rules:\n"
+            "      - methods: [GET]\n"
+            "        path: \"/only-this\"\n"
+        )
+        result = load_restricted_hosts(str(config))
+        assert result["registry.npmjs.org"].source == "config"
+        assert len(result["registry.npmjs.org"].rules) == 1
+
+    def test_overlap_with_allowlist_warns(self, tmp_path, capsys):
+        from addon import load_restricted_hosts
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "allowed_registries: [npm]\n"
+            "allowed_hosts:\n"
+            "  - host: registry.npmjs.org\n"
+        )
+        load_restricted_hosts(str(config))
+        event = json.loads(capsys.readouterr().out)
+        assert event["event"] == "config_warning"
+        assert "registry.npmjs.org" in event["message"]
+
+    def test_host_config_strips_cookies_for_restricted(self, tmp_path):
+        from addon import load_host_config
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "allowed_registries: [npm]\n"
+            "restricted_hosts:\n"
+            "  - host: artifacts.example.com\n"
+            "    rules:\n"
+            "      - methods: [GET]\n"
+            "        path: \"/x\"\n"
+            "    allow_response_cookies: [csrftoken]\n"
+        )
+        result = load_host_config(str(config))
+        assert result["registry.npmjs.org"].allow_response_cookies == []
+        assert result["artifacts.example.com"].allow_response_cookies == ["csrftoken"]
+
 
 # ── CredentialBrokerAddon ──────────────────────────────────────────────────────
 
@@ -360,6 +572,15 @@ class TestLoggingAddon:
         addon.request(flow)
         assert capsys.readouterr().out == ""
 
+    def test_registry_field_included_when_set(self, capsys):
+        from addon import LoggingAddon
+        addon = LoggingAddon(make_state())
+        flow = make_flow("proxy.golang.org", path="/golang.org/x/text/@latest")
+        flow.metadata["registry"] = "go"
+        addon.request(flow)
+        entry = json.loads(capsys.readouterr().out.strip())
+        assert entry["registry"] == "go"
+
 
 # ── SIGHUP reload ──────────────────────────────────────────────────────────────
 
@@ -411,6 +632,22 @@ class TestSighupReload:
 
         assert state.credentials[0]["real_value"] == "new-value"
 
+    def test_sighup_reloads_restricted(self, tmp_path):
+        from addon import setup_sighup
+
+        config = tmp_path / "config.yaml"
+        config.write_text("allowed_hosts: []\n")
+
+        state = make_state(allowlist=set(), allowlist_path=str(config))
+        setup_sighup(state)
+        assert state.restricted == {}
+
+        config.write_text("allowed_registries: [go]\n")
+        os.kill(os.getpid(), signal.SIGHUP)
+        time.sleep(0.05)
+
+        assert "proxy.golang.org" in state.restricted
+
 
 # ── Management API ─────────────────────────────────────────────────────────────
 
@@ -456,6 +693,12 @@ class TestManagementAPI:
         data = mgmt.get("/allowlist").get_json()
         assert "existing.com" in data["permanent"]
         assert data["temporary"] == {}
+        assert data["restricted"] == {}
+
+    def test_get_allowlist_restricted_grouped_by_source(self, mgmt):
+        mgmt._state.restricted = make_restricted()
+        data = mgmt.get("/allowlist").get_json()
+        assert data["restricted"] == {"testpreset": ["registry.example.com"]}
 
     def test_get_allowlist_active_temp_included(self, mgmt):
         state = mgmt._state

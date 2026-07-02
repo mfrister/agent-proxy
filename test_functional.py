@@ -135,6 +135,7 @@ def _proxy_context(tmp, handler_class, config_text):
         yield {
             "opener": agent_opener(f"http://127.0.0.1:{proxy_port}"),
             "server_url": f"http://127.0.0.1:{server_port}",
+            "management_url": f"http://127.0.0.1:{management_port}",
         }
     finally:
         proc.terminate()
@@ -172,6 +173,54 @@ def proxy_cookie(tmp_path_factory):
         "      - csrftoken\n",
     ) as ctx:
         yield ctx
+
+
+RESTRICTED_CONFIG = (
+    "restricted_hosts:\n"
+    "  - host: 127.0.0.1\n"
+    "    rules:\n"
+    "      - methods: [GET, HEAD]\n"
+    "        path: \"/pkg/[a-z0-9-]{1,64}\"\n"
+    "        query:\n"
+    "          version: \"[a-z0-9.]{1,32}\"\n"
+)
+
+
+@pytest.fixture(scope="module")
+def proxy_restricted(tmp_path_factory):
+    """Proxy where the echo host is restricted (rule-matched), not allowlisted."""
+    with _proxy_context(
+        tmp_path_factory.mktemp("functional_restricted"),
+        EchoHandler,
+        RESTRICTED_CONFIG,
+    ) as ctx:
+        yield ctx
+
+
+@pytest.fixture
+def proxy_restricted_fn(tmp_path):
+    """Function-scoped variant for tests that mutate proxy state (temp allows)."""
+    with _proxy_context(tmp_path, EchoHandler, RESTRICTED_CONFIG) as ctx:
+        yield ctx
+
+
+def mgmt_post(management_url: str, path: str, payload: dict):
+    """POST to the management API directly (bypassing the proxy), with retries
+    because the Flask thread may start slightly after the proxy port opens."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(
+        management_url + path,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    deadline = time.time() + 10
+    while True:
+        try:
+            return opener.open(req)
+        except (urllib.error.URLError, ConnectionError):
+            if time.time() > deadline:
+                raise
+            time.sleep(0.2)
 
 
 @pytest.fixture
@@ -242,3 +291,57 @@ def test_cookie_filtering_strips_others(proxy_cookie):
     cookie_names = [c.split("=")[0].strip() for c in cookies]
     assert "session" not in cookie_names
     assert "tracker" not in cookie_names
+
+
+# ── Restricted host (registry policy) tests ───────────────────────────────────
+
+def test_restricted_matching_request_passes(proxy_restricted):
+    resp = proxy_restricted["opener"].open(proxy_restricted["server_url"] + "/pkg/foo")
+    data = json.loads(resp.read())
+    assert data["path"] == "/pkg/foo"
+
+
+def test_restricted_scrubs_unknown_headers(proxy_restricted):
+    req = urllib.request.Request(
+        proxy_restricted["server_url"] + "/pkg/foo",
+        headers={"X-Exfil": "secret-data", "Accept": "application/json"},
+    )
+    data = json.loads(proxy_restricted["opener"].open(req).read())
+    assert "x-exfil" not in data["headers"]
+    assert data["headers"].get("accept") == "application/json"
+
+
+def test_restricted_post_blocked_with_403(proxy_restricted):
+    req = urllib.request.Request(
+        proxy_restricted["server_url"] + "/pkg/foo", data=b"payload")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        proxy_restricted["opener"].open(req)
+    assert exc.value.code == 403
+    assert b"policy violation" in exc.value.read()
+
+
+def test_restricted_disallowed_query_blocked(proxy_restricted):
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        proxy_restricted["opener"].open(
+            proxy_restricted["server_url"] + "/pkg/foo?data=secret")
+    assert exc.value.code == 403
+
+
+def test_restricted_disallowed_path_blocked(proxy_restricted):
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        proxy_restricted["opener"].open(
+            proxy_restricted["server_url"] + "/other/path")
+    assert exc.value.code == 403
+
+
+def test_temp_allow_lifts_restrictions(proxy_restricted_fn):
+    url = proxy_restricted_fn["server_url"] + "/pkg/foo?data=secret"
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        proxy_restricted_fn["opener"].open(url)
+    assert exc.value.code == 403
+
+    mgmt_post(proxy_restricted_fn["management_url"], "/allow/temp",
+              {"host": "127.0.0.1", "duration_seconds": 60})
+
+    resp = proxy_restricted_fn["opener"].open(url)
+    assert json.loads(resp.read())["path"] == "/pkg/foo?data=secret"

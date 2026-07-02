@@ -30,6 +30,25 @@ Config YAML format:
       allow_response_cookies:
         - csrftoken                      # only csrftoken passes through
 
+  allowed_registries: [go, npm, docker]  # read-only package-registry presets
+                                         # (see registries.PRESETS and
+                                         # docs/registry-presets.md)
+
+  restricted_hosts:                      # custom rule sets, same engine as presets
+    - host: artifacts.internal.example.com
+      rules:
+        - methods: [GET, HEAD]
+          path: "/repo/[a-z0-9-]{1,64}/[a-zA-Z0-9._-]{1,128}"
+          query:                         # omit `query` to forbid query strings
+            version: "[a-z0-9.]{1,32}"
+      request_headers: [authorization]   # extras beyond the base header allowlist
+
+  Precedence: allowed_hosts (unrestricted) > temporary allows (unrestricted)
+  > restricted rules (403 on violation) > pending approval (503).
+  Note: swap-mode credentials on a restricted host require the header to be
+  listed in that host's request_headers, or scrubbing removes it before the
+  broker sees it. Inject-mode credentials are unaffected (injected post-scrub).
+
 Secrets file format (simple flat key/value map):
 
   MY_API_KEY: "Bearer sk-real-key-here"
@@ -52,6 +71,8 @@ from flask import Flask, jsonify, request as flask_request
 from mitmproxy import http
 from mitmproxy.http import HTTPFlow
 
+import registries
+
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 
@@ -72,6 +93,7 @@ class ProxyState:
     deny_lock: threading.Lock
     host_config: dict         # host -> HostConfig
     management_port: int = 8082
+    restricted: dict = field(default_factory=dict)  # host -> registries.HostRules
 
 
 # ── Config loaders ─────────────────────────────────────────────────────────────
@@ -125,12 +147,50 @@ def load_host_config(path: str) -> dict:
     """Load per-host config (cookie rules) from config YAML."""
     data = load_config(path)
     result = {}
+    # Restricted hosts strip all response cookies by default: registries don't
+    # need them, and Set-Cookie is a session/tracking channel into the sandbox.
+    for name in data.get("allowed_registries") or []:
+        for host in registries.PRESETS.get(name, {}):
+            result[host] = HostConfig(allow_response_cookies=[])
+    for item in data.get("restricted_hosts") or []:
+        result[item["host"]] = HostConfig(
+            allow_response_cookies=item.get("allow_response_cookies", [])
+        )
     for item in data.get("allowed_hosts", []):
         if not isinstance(item, str):
             host = item["host"]
             result[host] = HostConfig(
                 allow_response_cookies=item.get("allow_response_cookies")
             )
+    return result
+
+
+def load_restricted_hosts(path: str) -> dict:
+    """
+    Load restricted-host rule sets: expand `allowed_registries` preset names,
+    then compile custom `restricted_hosts` entries. A custom entry for a host
+    that a preset also covers replaces the preset's rules for that host.
+    """
+    data = load_config(path)
+    result = {}
+    for name in data.get("allowed_registries") or []:
+        if name not in registries.PRESETS:
+            raise ValueError(
+                f"Unknown registry preset {name!r}; available: {sorted(registries.PRESETS)}"
+            )
+        result.update(registries.PRESETS[name])
+    for item in data.get("restricted_hosts") or []:
+        result[item["host"]] = registries.compile_host_rules(item, source="config")
+
+    allowed = {i if isinstance(i, str) else i["host"] for i in data.get("allowed_hosts", [])}
+    for host in sorted(set(result) & allowed):
+        print(json.dumps({
+            "event": "config_warning",
+            "message": (
+                f"host {host} is in both allowed_hosts and a restricted rule set; "
+                "allowed_hosts wins (unrestricted)"
+            ),
+        }))
     return result
 
 
@@ -179,6 +239,11 @@ class AllowlistAddon:
             if exp and time.time() < exp:
                 return
 
+        host_rules = s.restricted.get(host)
+        if host_rules is not None:
+            self._apply_registry_policy(flow, host_rules)
+            return
+
         flow.response = http.Response.make(
             503,
             f"Request to {host} is pending human approval. Retry the request after approval is granted.",
@@ -189,9 +254,63 @@ class AllowlistAddon:
             "host": host,
             "url": flow.request.pretty_url,
             "method": flow.request.method,
+            "type": "pending_approval",
         }
         with s.deny_lock:
             s.deny_log.append(entry)
+
+    def _apply_registry_policy(self, flow: HTTPFlow, host_rules):
+        host = flow.request.pretty_host
+        verdict = registries.evaluate(
+            host_rules,
+            method=flow.request.method,
+            path_with_query=flow.request.path,
+            headers=flow.request.headers,
+            has_body=bool(flow.request.raw_content),
+        )
+
+        if isinstance(verdict, registries.Violation):
+            flow.response = http.Response.make(
+                403,
+                f"Blocked by registry policy '{host_rules.source}': {verdict.reason}. "
+                "This is a policy violation, not a pending approval — it will not "
+                "be granted by waiting.",
+                {"Content-Type": "text/plain"},
+            )
+            entry = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "host": host,
+                # Attacker-influenced; truncate so the deny log stays bounded
+                "url": flow.request.pretty_url[:512],
+                "method": flow.request.method,
+                "type": "policy_violation",
+                "reason": verdict.reason,
+            }
+            with self.state.deny_lock:
+                self.state.deny_log.append(entry)
+            print(json.dumps({
+                "event": "registry_policy_violation",
+                "host": host,
+                "method": flow.request.method,
+                "path": flow.request.path[:512],
+                "reason": verdict.reason,
+                "policy": host_rules.source,
+            }))
+            return
+
+        for name in verdict.drop_headers:
+            del flow.request.headers[name]
+        for name, cap in verdict.clamp_headers:
+            flow.request.headers[name] = flow.request.headers[name][:cap]
+        if verdict.drop_headers or verdict.clamp_headers:
+            # Names only — scrubbed values may contain credentials
+            print(json.dumps({
+                "event": "registry_headers_scrubbed",
+                "host": host,
+                "dropped": sorted(verdict.drop_headers),
+                "clamped": sorted(name for name, _ in verdict.clamp_headers),
+            }))
+        flow.metadata["registry"] = host_rules.source
 
 
 class CredentialBrokerAddon:
@@ -286,13 +405,17 @@ class LoggingAddon:
         # Skip flows already denied upstream
         if flow.response is not None:
             return
-        print(json.dumps({
+        entry = {
             "event": "request",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "method": flow.request.method,
             "host": flow.request.pretty_host,
             "path": flow.request.path,
-        }))
+        }
+        registry = flow.metadata.get("registry")
+        if registry:
+            entry["registry"] = registry
+        print(json.dumps(entry))
 
 
 # ── Management API ─────────────────────────────────────────────────────────────
@@ -316,9 +439,13 @@ def create_app(state: ProxyState) -> Flask:
             active_temps = {
                 h: exp for h, exp in state.temp_allows.items() if now < exp
             }
+        restricted = {}
+        for host, rules in state.restricted.items():
+            restricted.setdefault(rules.source or "config", []).append(host)
         return jsonify({
             "permanent": sorted(state.allowlist),
             "temporary": active_temps,
+            "restricted": {k: sorted(v) for k, v in restricted.items()},
         })
 
     @app.post("/allow/temp")
@@ -347,6 +474,7 @@ def create_app(state: ProxyState) -> Flask:
                 yaml.safe_dump(data, f)
         state.allowlist = load_allowlist(state.allowlist_path)
         state.host_config = load_host_config(state.allowlist_path)
+        state.restricted = load_restricted_hosts(state.allowlist_path)
         return jsonify({"ok": True})
 
     return app
@@ -359,10 +487,12 @@ def setup_sighup(state: ProxyState):
         state.allowlist = load_allowlist(state.allowlist_path)
         state.host_config = load_host_config(state.allowlist_path)
         state.credentials = load_credentials(state.allowlist_path)
+        state.restricted = load_restricted_hosts(state.allowlist_path)
         print(json.dumps({
             "event": "sighup_reload",
             "host_count": len(state.allowlist),
             "credential_count": len(state.credentials),
+            "restricted_count": len(state.restricted),
         }))
     signal.signal(signal.SIGHUP, handler)
 
@@ -381,6 +511,7 @@ state = ProxyState(
     deny_lock=threading.Lock(),
     host_config=load_host_config(_config_path),
     management_port=load_management_port(_config_path),
+    restricted=load_restricted_hosts(_config_path),
 )
 
 setup_sighup(state)

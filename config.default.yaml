@@ -14,3 +14,25 @@
 allowed_hosts:
   - host: api.anthropic.com
   - host: platform.claude.com
+
+# Read-only package-registry presets (restricted hosts). Each preset allows the
+# GET/HEAD traffic its ecosystem needs — pinned hosts, anchored URL patterns,
+# query-param and request-header allowlists — while blocking everything else
+# with a 403. Threat model and per-preset details: docs/registry-presets.md
+# Available presets: go, npm, docker, ghcr, pypi, crates
+#
+# allowed_registries: [go, npm, docker, ghcr, pypi, crates]
+
+# Custom restricted hosts use the same rule engine. Patterns are matched with
+# fullmatch and must be bounded (no *, + or {n,}). Omitting `query` on a rule
+# forbids query strings entirely.
+#
+# restricted_hosts:
+#   - host: artifacts.internal.example.com
+#     rules:
+#       - methods: [GET, HEAD]
+#         path: "/repo/[a-z0-9-]{1,64}/[a-zA-Z0-9._-]{1,128}"
+#         query:
+#           version: "[a-z0-9.]{1,32}"
+#     request_headers: [authorization]   # extras beyond the base header allowlist
+#     allow_response_cookies: []         # default for restricted hosts: strip all
