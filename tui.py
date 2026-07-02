@@ -9,6 +9,8 @@ import time
 from datetime import datetime
 
 import httpx
+from rich.markup import escape
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -55,14 +57,19 @@ class DurationBar(Static):
 
 
 class UrlBar(Static):
-    """Shows the full URL of the selected denied entry."""
+    """Shows the full URL of the selected denied entry, plus the policy
+    violation reason when there is one."""
 
     url: reactive[str] = reactive("")
+    reason: reactive[str] = reactive("")
 
     def render(self) -> str:
-        if self.url:
-            return f"[dim]URL:[/dim] {self.url}"
-        return "[dim]URL: —[/dim]"
+        if not self.url:
+            return "[dim]URL: —[/dim]"
+        line = f"[dim]URL:[/dim] {escape(self.url)}"
+        if self.reason:
+            line += f"  [red]✗ {escape(self.reason)}[/red]"
+        return line
 
 
 class ProxyMonitor(App[None]):
@@ -159,7 +166,7 @@ class ProxyMonitor(App[None]):
         allowed_pane.border_title = "ALLOWED"
 
         denied_table = self.query_one("#denied-table", DataTable)
-        denied_table.add_columns("Host", "Method", "Time")
+        denied_table.add_columns("Host", "Type", "Method", "Time")
 
         allowed_table = self.query_one("#allowed-table", DataTable)
         allowed_table.add_columns("Host", "Expires")
@@ -212,8 +219,14 @@ class ProxyMonitor(App[None]):
         current_row = dt.cursor_row
         dt.clear()
         for entry in self._denied_rows:
+            # Entries without a type predate typed deny logging → pending
+            if entry.get("type") == "policy_violation":
+                type_cell = Text("violation", style="bold red")
+            else:
+                type_cell = Text("pending", style="yellow")
             dt.add_row(
                 entry.get("host", ""),
+                type_cell,
                 entry.get("method", ""),
                 _fmt_time(entry.get("timestamp", "")),
                 key=entry.get("host", ""),
@@ -228,18 +241,29 @@ class ProxyMonitor(App[None]):
             at.add_row(host, "permanent", key=f"p:{host}")
         for host, expires in sorted(allowlist.get("temporary", {}).items()):
             at.add_row(host, _fmt_expires(expires), key=f"t:{host}")
+        restricted = allowlist.get("restricted", {})
+        for source in sorted(restricted):
+            for host in sorted(restricted[source]):
+                at.add_row(
+                    Text(host, style="dim"),
+                    Text(f"restricted ({source})", style="dim"),
+                    key=f"r:{host}",
+                )
 
     def _update_url_bar(self) -> None:
         url_bar = self.query_one("#url-bar", UrlBar)
         if self._focused_pane() != "denied" or not self._denied_rows:
             url_bar.url = ""
+            url_bar.reason = ""
             return
         dt = self.query_one("#denied-table", DataTable)
         row_idx = dt.cursor_row
         if 0 <= row_idx < len(self._denied_rows):
             url_bar.url = self._denied_rows[row_idx].get("url", "")
+            url_bar.reason = self._denied_rows[row_idx].get("reason", "")
         else:
             url_bar.url = ""
+            url_bar.reason = ""
 
     def on_data_table_cursor_moved(self, event: DataTable.CursorMoved) -> None:
         if event.data_table.id == "denied-table":

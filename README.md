@@ -115,8 +115,8 @@ The port defaults to `$PROXY_MGMT_PORT` (or 8082 if unset).
 
 The UI polls every 5 seconds and shows two panels:
 
-- **DENIED** — recent blocked connections, deduplicated by host, newest first. The full URL of the highlighted row is shown below the panels.
-- **ALLOWED** — current allowlist: permanent hosts and temporary allows with live countdown.
+- **DENIED** — recent blocked connections, deduplicated by host, newest first. The **Type** column distinguishes `pending` (awaiting human approval, 503) from `violation` (registry policy violation, 403). The full URL of the highlighted row — plus the violation reason, if any — is shown below the panels.
+- **ALLOWED** — current allowlist: permanent hosts, temporary allows with live countdown, and restricted hosts with their preset name (dimmed). Temp- or perm-allowing a restricted host lifts its restrictions.
 
 Key bindings:
 
