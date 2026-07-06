@@ -1,5 +1,5 @@
 """
-Tests for the mitmproxy sandbox proxy addons.
+Tests for the mitmproxy sandbox proxy addons (addon.py).
 
 Run with:  pytest test_addon.py -v
 """
@@ -11,24 +11,12 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
-import yaml
 
 from config import Credential
+from conftest import make_restricted, make_state
 
 
 # ── Test helpers ───────────────────────────────────────────────────────────────
-
-def make_state(**overrides):
-    """Return a ProxyState with sensible defaults, merged with any overrides."""
-    from config import ProxyState
-
-    defaults = dict(
-        allowlist={"allowed.com"},
-        config_path="config.yaml",
-    )
-    defaults.update(overrides)
-    return ProxyState(**defaults)
-
 
 def make_flow(host, method="GET", path="/", headers=None, body=b""):
     """Return a mock HTTPFlow with the given request properties."""
@@ -53,211 +41,9 @@ CRED = Credential(
 )
 
 
-# ── Config.load ────────────────────────────────────────────────────────────────
-
-class TestConfigLoad:
-    def test_missing_file_empty_config_with_warning(self, tmp_path, capsys):
-        from config import Config
-        cfg = Config.load(str(tmp_path / "nonexistent.yaml"))
-        assert cfg.allowlist == set()
-        assert cfg.credentials == []
-        assert cfg.restricted == {}
-        assert cfg.management_port == 8082
-        event = json.loads(capsys.readouterr().out)
-        assert event["event"] == "config_warning"
-        assert "not found" in event["message"]
-
-    def test_basic_config_loaded(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "management_port: 9000\n"
-            "allowed_hosts:\n"
-            "  - host: example.com\n"
-        )
-        cfg = Config.load(str(config))
-        assert cfg.management_port == 9000
-        assert "example.com" in cfg.allowlist
-
-    def test_secrets_expanded(self, tmp_path):
-        from config import Config
-        secrets = tmp_path / "secrets.yaml"
-        secrets.write_text("MY_KEY: real-value\n")
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            f"secrets_file: {secrets}\n"
-            "credentials:\n"
-            "  - host: api.example.com\n"
-            "    header: Authorization\n"
-            "    fake_value: fake\n"
-            "    real_value: \"${MY_KEY}\"\n"
-        )
-        cfg = Config.load(str(config))
-        assert cfg.credentials[0].real_value == "real-value"
-
-    def test_missing_secret_key_raises(self, tmp_path):
-        from config import Config
-        secrets = tmp_path / "secrets.yaml"
-        secrets.write_text("OTHER_KEY: something\n")
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            f"secrets_file: {secrets}\n"
-            "credentials:\n"
-            "  - host: api.example.com\n"
-            "    header: Authorization\n"
-            "    real_value: \"${MISSING_KEY}\"\n"
-        )
-        with pytest.raises(KeyError, match="MISSING_KEY"):
-            Config.load(str(config))
-
-    def test_missing_secrets_file_raises(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "secrets_file: /nonexistent/secrets.yaml\n"
-            "allowed_hosts: []\n"
-        )
-        with pytest.raises(FileNotFoundError):
-            Config.load(str(config))
-
-    def test_no_secrets_file_plain_values_unchanged(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "credentials:\n"
-            "  - host: api.example.com\n"
-            "    header: Authorization\n"
-            "    real_value: plain-value\n"
-        )
-        cfg = Config.load(str(config))
-        assert cfg.credentials[0].real_value == "plain-value"
-
-    def test_multiple_secrets_expanded(self, tmp_path):
-        from config import Config
-        secrets = tmp_path / "secrets.yaml"
-        secrets.write_text("KEY_A: value-a\nKEY_B: value-b\n")
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            f"secrets_file: {secrets}\n"
-            "credentials:\n"
-            "  - host: a.com\n"
-            "    header: Authorization\n"
-            "    real_value: \"${KEY_A}\"\n"
-            "  - host: b.com\n"
-            "    header: Authorization\n"
-            "    real_value: \"${KEY_B}\"\n"
-        )
-        cfg = Config.load(str(config))
-        assert cfg.credentials[0].real_value == "value-a"
-        assert cfg.credentials[1].real_value == "value-b"
-
-    def test_credentials_from_config(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "credentials:\n"
-            "  - host: api.example.com\n"
-            "    header: Authorization\n"
-            "    fake_value: fake\n"
-            "    real_value: real\n"
-        )
-        cfg = Config.load(str(config))
-        assert cfg.credentials == [Credential(
-            host="api.example.com", header="Authorization",
-            fake_value="fake", real_value="real",
-        )]
-
-    def test_credentials_empty_when_absent(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts:\n  - host: example.com\n")
-        assert Config.load(str(config)).credentials == []
-
-    def test_credential_missing_key_raises(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "credentials:\n"
-            "  - host: api.example.com\n"
-            "    real_value: real\n"
-        )
-        with pytest.raises(ValueError, match="header"):
-            Config.load(str(config))
-
-    def test_management_port_from_config(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text("management_port: 9999\n")
-        assert Config.load(str(config)).management_port == 9999
-
-    def test_management_port_default(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts: []\n")
-        assert Config.load(str(config)).management_port == 8082
-
-    def test_null_sections_treated_as_empty(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "allowed_hosts:\n"
-            "restricted_hosts:\n"
-            "credentials:\n"
-            "allowed_registries:\n"
-        )
-        cfg = Config.load(str(config))
-        assert cfg.allowlist == set()
-        assert cfg.restricted == {}
-        assert cfg.credentials == []
-
-    def test_scalar_allowed_hosts_raises(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts: example.com\n")
-        with pytest.raises(ValueError, match="allowed_hosts"):
-            Config.load(str(config))
-
-    def test_allowed_hosts_entry_without_host_raises(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "allowed_hosts:\n"
-            "  - allow_response_cookies: []\n"
-        )
-        with pytest.raises(ValueError, match="allowed_hosts"):
-            Config.load(str(config))
-
-    def test_failed_reload_keeps_old_state(self, tmp_path):
-        config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts: not-a-list\n")
-        state = make_state(allowlist={"old.com"}, config_path=str(config))
-        with pytest.raises(ValueError):
-            state.reload()
-        assert state.allowlist == {"old.com"}
-
-
 # ── Happy eyeballs ─────────────────────────────────────────────────────────────
 
 class TestHappyEyeballs:
-    def test_load_delay_default(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts: []\n")
-        assert Config.load(str(config)).happy_eyeballs_delay == 0.25
-
-    def test_load_delay_custom(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text("happy_eyeballs_delay: 0.1\n")
-        assert Config.load(str(config)).happy_eyeballs_delay == 0.1
-
-    def test_load_delay_disabled(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        for value in ("0", "false", "null"):
-            config.write_text(f"happy_eyeballs_delay: {value}\n")
-            assert Config.load(str(config)).happy_eyeballs_delay == 0
-
     def test_supported_version_ranges(self):
         from addon import happy_eyeballs_supported
 
@@ -389,19 +175,6 @@ class TestAllowlistAddon:
 
 # ── Registry policy (restricted hosts) ─────────────────────────────────────────
 
-def make_restricted(**spec_overrides):
-    """Compiled rules for a simple restricted test host."""
-    import registries
-    spec = {
-        "rules": [
-            {"methods": ["GET", "HEAD"], "path": "/pkg/[a-z0-9-]{1,64}",
-             "query": {"version": "[a-z0-9.]{1,32}"}},
-        ],
-    }
-    spec.update(spec_overrides)
-    return {"registry.example.com": registries.compile_host_rules(spec, source="testpreset")}
-
-
 class TestRegistryPolicy:
     def test_matching_request_passes(self):
         from addon import AllowlistAddon
@@ -512,83 +285,6 @@ class TestRegistryPolicy:
                          headers={"Authorization": "Bearer tok"})
         addon.request(flow)
         assert flow.request.headers["Authorization"] == "Bearer tok"
-
-
-# ── Config.load: restricted hosts ──────────────────────────────────────────────
-
-class TestLoadRestrictedHosts:
-    def test_preset_expansion(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text("allowed_registries: [go, npm]\n")
-        result = Config.load(str(config)).restricted
-        assert result["proxy.golang.org"].source == "go"
-        assert result["sum.golang.org"].source == "go"
-        assert result["registry.npmjs.org"].source == "npm"
-
-    def test_unknown_preset_raises(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text("allowed_registries: [nonexistent]\n")
-        with pytest.raises(ValueError, match="nonexistent"):
-            Config.load(str(config))
-
-    def test_custom_restricted_host(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "restricted_hosts:\n"
-            "  - host: artifacts.example.com\n"
-            "    rules:\n"
-            "      - methods: [GET]\n"
-            "        path: \"/repo/[a-z]{1,10}\"\n"
-        )
-        result = Config.load(str(config)).restricted
-        assert result["artifacts.example.com"].source == "config"
-
-    def test_custom_entry_replaces_preset(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "allowed_registries: [npm]\n"
-            "restricted_hosts:\n"
-            "  - host: registry.npmjs.org\n"
-            "    rules:\n"
-            "      - methods: [GET]\n"
-            "        path: \"/only-this\"\n"
-        )
-        result = Config.load(str(config)).restricted
-        assert result["registry.npmjs.org"].source == "config"
-        assert len(result["registry.npmjs.org"].rules) == 1
-
-    def test_overlap_with_allowlist_warns(self, tmp_path, capsys):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "allowed_registries: [npm]\n"
-            "allowed_hosts:\n"
-            "  - host: registry.npmjs.org\n"
-        )
-        Config.load(str(config))
-        event = json.loads(capsys.readouterr().out)
-        assert event["event"] == "config_warning"
-        assert "registry.npmjs.org" in event["message"]
-
-    def test_host_config_strips_cookies_for_restricted(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text(
-            "allowed_registries: [npm]\n"
-            "restricted_hosts:\n"
-            "  - host: artifacts.example.com\n"
-            "    rules:\n"
-            "      - methods: [GET]\n"
-            "        path: \"/x\"\n"
-            "    allow_response_cookies: [csrftoken]\n"
-        )
-        result = Config.load(str(config)).host_config
-        assert result["registry.npmjs.org"].allow_response_cookies == []
-        assert result["artifacts.example.com"].allow_response_cookies == ["csrftoken"]
 
 
 # ── CredentialBrokerAddon ──────────────────────────────────────────────────────
@@ -783,111 +479,6 @@ class TestSighupReload:
         time.sleep(0.05)
 
         assert "proxy.golang.org" in state.restricted
-
-
-# ── Management API ─────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def mgmt(tmp_path):
-    """Flask test client wired to a fresh ProxyState with a temp config file."""
-    from management_api import create_app
-
-    config = tmp_path / "config.yaml"
-    config.write_text("allowed_hosts:\n  - host: existing.com\n")
-
-    state = make_state(
-        allowlist={"existing.com"},
-        config_path=str(config),
-    )
-    app = create_app(state)
-    app.config["TESTING"] = True
-    with app.test_client() as client:
-        client._state = state
-        yield client
-
-
-class TestManagementAPI:
-    def test_get_denied_empty(self, mgmt):
-        r = mgmt.get("/denied")
-        assert r.status_code == 200
-        assert r.get_json() == []
-
-    def test_get_denied_with_entries(self, mgmt):
-        state = mgmt._state
-        with state.deny_lock:
-            state.deny_log.append({
-                "timestamp": "2024-01-01T00:00:00+00:00",
-                "host": "evil.com",
-                "url": "http://evil.com/",
-                "method": "GET",
-            })
-        data = mgmt.get("/denied").get_json()
-        assert len(data) == 1
-        assert data[0]["host"] == "evil.com"
-
-    def test_get_allowlist_permanent(self, mgmt):
-        data = mgmt.get("/allowlist").get_json()
-        assert "existing.com" in data["permanent"]
-        assert data["temporary"] == {}
-        assert data["restricted"] == {}
-
-    def test_get_allowlist_restricted_grouped_by_source(self, mgmt):
-        mgmt._state.restricted = make_restricted()
-        data = mgmt.get("/allowlist").get_json()
-        assert data["restricted"] == {"testpreset": ["registry.example.com"]}
-
-    def test_get_allowlist_active_temp_included(self, mgmt):
-        state = mgmt._state
-        with state.temp_lock:
-            state.temp_allows["live.com"] = time.time() + 60
-            state.temp_allows["dead.com"] = time.time() - 1  # expired
-        data = mgmt.get("/allowlist").get_json()
-        assert "live.com" in data["temporary"]
-        assert "dead.com" not in data["temporary"]
-
-    def test_post_allow_temp(self, mgmt):
-        r = mgmt.post("/allow/temp", json={"host": "temp.com", "duration_seconds": 60})
-        assert r.get_json()["ok"] is True
-        state = mgmt._state
-        with state.temp_lock:
-            assert "temp.com" in state.temp_allows
-            assert state.temp_allows["temp.com"] > time.time()
-
-    def test_post_allow_permanent_updates_state(self, mgmt):
-        r = mgmt.post("/allow/permanent", json={"host": "new.com"})
-        assert r.get_json()["ok"] is True
-        assert "new.com" in mgmt._state.allowlist
-
-    def test_post_allow_permanent_writes_file(self, mgmt, tmp_path):
-        mgmt.post("/allow/permanent", json={"host": "written.com"})
-        config_path = mgmt._state.config_path
-        with open(config_path) as f:
-            data = yaml.safe_load(f)
-        host_names = [
-            h if isinstance(h, str) else h["host"]
-            for h in data["allowed_hosts"]
-        ]
-        assert "written.com" in host_names
-
-    def test_post_allow_permanent_idempotent(self, mgmt):
-        mgmt.post("/allow/permanent", json={"host": "existing.com"})
-        mgmt.post("/allow/permanent", json={"host": "existing.com"})
-        with open(mgmt._state.config_path) as f:
-            data = yaml.safe_load(f)
-        host_names = [
-            h if isinstance(h, str) else h["host"]
-            for h in data["allowed_hosts"]
-        ]
-        assert host_names.count("existing.com") == 1
-
-    def test_post_allow_permanent_writes_dict_format(self, mgmt):
-        mgmt.post("/allow/permanent", json={"host": "newdict.com"})
-        with open(mgmt._state.config_path) as f:
-            data = yaml.safe_load(f)
-        hosts = data["allowed_hosts"]
-        assert any(
-            (isinstance(h, dict) and h["host"] == "newdict.com") for h in hosts
-        )
 
 
 # ── Cookie allowlist (response side) ──────────────────────────────────────────
