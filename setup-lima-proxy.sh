@@ -94,6 +94,46 @@ EOF
   echo 'Proxy env written to /etc/profile.d/proxy.sh'
 "
 
+# ── Step 4: Write proxy guidance into ~/.claude/CLAUDE.md inside the VM ──────
+echo "--> Writing proxy guidance into ~/.claude/CLAUDE.md inside VM..."
+limactl shell "$VM_NAME" -- bash -c '
+  set -euo pipefail
+  CLAUDE_MD="${HOME}/.claude/CLAUDE.md"
+  MARKER="## Network / Proxy"
+
+  mkdir -p "${HOME}/.claude"
+  touch "$CLAUDE_MD"
+
+  if grep -qF "$MARKER" "$CLAUDE_MD"; then
+    echo "Proxy guidance already present in $CLAUDE_MD — skipping."
+    exit 0
+  fi
+
+  # Separate from any existing content with a blank line.
+  if [[ -s "$CLAUDE_MD" ]]; then
+    printf "\n" >> "$CLAUDE_MD"
+  fi
+
+  cat >> "$CLAUDE_MD" <<'"'"'EOF'"'"'
+## Network / Proxy
+
+This sandbox sits behind an HTTP(S) proxy that requires manual approval
+for each outbound HTTPS request. Expect intermittent 503s while approval
+is pending — this is normal, not a failure.
+
+- On a 503 (from WebFetch or from `curl`/`wget`/any HTTP client in shell
+  commands), retry automatically every 5-10 seconds for up to 5 minutes
+  before giving up and reporting the failure.
+- Don'"'"'t treat a single 503 as fatal — it usually just means the proxy
+  approval hasn'"'"'t come through yet.
+- When constructing shell commands that hit HTTPS endpoints, use the
+  system CA store (see below) rather than `-k`/`--insecure`, since the
+  proxy performs TLS interception.
+EOF
+
+  echo "Proxy guidance written to $CLAUDE_MD"
+'
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 cat <<EOF
 
