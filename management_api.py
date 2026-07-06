@@ -64,6 +64,10 @@ def create_app(state: ProxyState) -> Flask:
         hosts = data.get("allowed_hosts", [])
         host_names = [h if isinstance(h, str) else h["host"] for h in hosts]
         if host in host_names:
+            # Already permanent; drop any lingering temp entry so it doesn't
+            # keep showing as temporarily-allowed alongside the permanent one.
+            with state.temp_lock:
+                state.temp_allows.pop(host, None)
             return jsonify({"ok": True})
 
         new_data = {**data, "allowed_hosts": hosts + [{"host": host}]}
@@ -80,6 +84,9 @@ def create_app(state: ProxyState) -> Flask:
         with open(state.config_path, "w") as f:
             yaml.safe_dump(new_data, f)
         state.apply(config)
+        # Promotion to permanent supersedes any temporary grant for this host.
+        with state.temp_lock:
+            state.temp_allows.pop(host, None)
         return jsonify({"ok": True})
 
     return app
