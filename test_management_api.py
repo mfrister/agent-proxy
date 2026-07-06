@@ -113,3 +113,22 @@ class TestManagementAPI:
         assert any(
             (isinstance(h, dict) and h["host"] == "newdict.com") for h in hosts
         )
+
+    def test_post_allow_permanent_rejects_without_touching_disk_or_state(self, mgmt):
+        # An unrelated bad section (e.g. a malformed credential) must not let
+        # this endpoint write a new host to disk while failing to update the
+        # in-memory allowlist -- that would leave the two out of sync.
+        config_path = mgmt._state.config_path
+        with open(config_path) as f:
+            original = f.read()
+        bad = original + "credentials:\n  - host: api.example.com\n"
+        with open(config_path, "w") as f:
+            f.write(bad)
+
+        r = mgmt.post("/allow/permanent", json={"host": "new.com"})
+
+        assert r.status_code == 500
+        assert r.get_json()["ok"] is False
+        assert "new.com" not in mgmt._state.allowlist
+        with open(config_path) as f:
+            assert f.read() == bad

@@ -237,6 +237,20 @@ class TestLoadRestrictedHosts:
         with pytest.raises(ValueError, match="nonexistent"):
             Config.load(str(config))
 
+    def test_bare_string_restricted_host_raises(self, tmp_path):
+        from config import Config
+        config = tmp_path / "config.yaml"
+        config.write_text("restricted_hosts:\n  - artifacts.example.com\n")
+        with pytest.raises(ValueError, match="restricted_hosts\\[0\\]"):
+            Config.load(str(config))
+
+    def test_restricted_host_missing_rules_raises(self, tmp_path):
+        from config import Config
+        config = tmp_path / "config.yaml"
+        config.write_text("restricted_hosts:\n  - host: artifacts.example.com\n")
+        with pytest.raises(ValueError, match="'rules'"):
+            Config.load(str(config))
+
     def test_custom_restricted_host(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"

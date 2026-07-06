@@ -6,13 +6,14 @@ requests and grant temporary or permanent allowlist entries. Served in a
 background thread by ManagementApiAddon (see addon.py).
 """
 
+import json
 import logging
 import time
 
 import yaml
 from flask import Flask, jsonify, request as flask_request
 
-from config import ProxyState
+from config import Config, ProxyState
 
 
 def create_app(state: ProxyState) -> Flask:
@@ -62,12 +63,23 @@ def create_app(state: ProxyState) -> Flask:
             data = {}
         hosts = data.get("allowed_hosts", [])
         host_names = [h if isinstance(h, str) else h["host"] for h in hosts]
-        if host not in host_names:
-            hosts.append({"host": host})
-            data["allowed_hosts"] = hosts
-            with open(state.config_path, "w") as f:
-                yaml.safe_dump(data, f)
-        state.reload()
+        if host in host_names:
+            return jsonify({"ok": True})
+
+        new_data = {**data, "allowed_hosts": hosts + [{"host": host}]}
+        try:
+            # Validate against the full config (credentials, restricted_hosts,
+            # etc. all reload together) before writing anything to disk, so a
+            # pre-existing bad section elsewhere can't leave config.yaml and
+            # the running state out of sync.
+            config = Config.from_data(new_data)
+        except Exception as e:
+            print(json.dumps({"event": "config_error", "message": str(e)}))
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+        with open(state.config_path, "w") as f:
+            yaml.safe_dump(new_data, f)
+        state.apply(config)
         return jsonify({"ok": True})
 
     return app
