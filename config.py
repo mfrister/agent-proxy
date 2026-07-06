@@ -94,16 +94,23 @@ def _expand_secrets(obj, secrets: dict):
     return obj
 
 
-def _host_entries(data: dict, section: str) -> list:
-    """Validate a section as a list of str-or-dict entries, dicts having a "host" key."""
+def _host_entries(data: dict, section: str, *, require_rules: bool = False) -> list:
+    """Validate a section as a list of str-or-dict entries, dicts having a "host" key.
+
+    require_rules is set for restricted_hosts: unlike allowed_hosts, a bare
+    string isn't valid there (there's no rule set to compile), so it must be a
+    mapping with a "rules" list too.
+    """
     entries = data.get(section) or []
     if not isinstance(entries, list):
         raise ValueError(f"{section} must be a list, got {type(entries).__name__}")
     for i, item in enumerate(entries):
-        if isinstance(item, str):
+        if not require_rules and isinstance(item, str):
             continue
         if not isinstance(item, dict) or not isinstance(item.get("host"), str):
             raise ValueError(f"{section}[{i}] must be a string or a mapping with a 'host' key")
+        if require_rules and not isinstance(item.get("rules"), list):
+            raise ValueError(f"{section}[{i}] must be a mapping with a 'rules' list")
     return entries
 
 
@@ -111,9 +118,9 @@ def _host_entries(data: dict, section: str) -> list:
 class Config:
     """A complete, validated proxy configuration.
 
-    Built only by Config.load, which parses the YAML and secrets file exactly
-    once and raises on any invalid section — so a Config either exists fully
-    formed or not at all (no partial policy state).
+    Built only by Config.load or Config.from_data, which parse the config and
+    secrets file exactly once and raise on any invalid section — so a Config
+    either exists fully formed or not at all (no partial policy state).
     """
 
     allowlist: set[str]
@@ -134,7 +141,16 @@ class Config:
                 "message": f"config file not found: {path}; starting with empty config (deny-all)",
             }))
             data = {}
+        return cls.from_data(data)
 
+    @classmethod
+    def from_data(cls, data: dict) -> "Config":
+        """Validate an already-parsed config dict (no file I/O beyond secrets_file).
+
+        Lets a caller validate a prospective config (e.g. the management API
+        checking a rewritten config.yaml) before persisting it, instead of
+        writing first and finding out it doesn't load.
+        """
         secrets = {}
         secrets_path = data.get("secrets_file")
         if secrets_path:
@@ -143,7 +159,7 @@ class Config:
         data = _expand_secrets(data, secrets)
 
         allowed_hosts = _host_entries(data, "allowed_hosts")
-        restricted_hosts = _host_entries(data, "restricted_hosts")
+        restricted_hosts = _host_entries(data, "restricted_hosts", require_rules=True)
 
         allowlist = {i if isinstance(i, str) else i["host"] for i in allowed_hosts}
 
