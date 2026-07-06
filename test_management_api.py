@@ -83,6 +83,25 @@ class TestManagementAPI:
         assert r.get_json()["ok"] is True
         assert "new.com" in mgmt._state.allowlist
 
+    def test_post_allow_permanent_clears_temp_entry(self, mgmt):
+        state = mgmt._state
+        with state.temp_lock:
+            state.temp_allows["new.com"] = time.time() + 60
+        r = mgmt.post("/allow/permanent", json={"host": "new.com"})
+        assert r.get_json()["ok"] is True
+        assert "new.com" in state.allowlist
+        with state.temp_lock:
+            assert "new.com" not in state.temp_allows
+
+    def test_post_allow_permanent_clears_temp_when_already_permanent(self, mgmt):
+        state = mgmt._state
+        with state.temp_lock:
+            state.temp_allows["existing.com"] = time.time() + 60
+        r = mgmt.post("/allow/permanent", json={"host": "existing.com"})
+        assert r.get_json()["ok"] is True
+        with state.temp_lock:
+            assert "existing.com" not in state.temp_allows
+
     def test_post_allow_permanent_writes_file(self, mgmt, tmp_path):
         mgmt.post("/allow/permanent", json={"host": "written.com"})
         config_path = mgmt._state.config_path

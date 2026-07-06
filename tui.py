@@ -145,6 +145,10 @@ class ProxyMonitor(App[None]):
         self.base_url = f"http://127.0.0.1:{mgmt_port}"
         # Raw denied rows (deduplicated, newest-first)
         self._denied_rows: list[dict] = []
+        # Left-pane rows: denied entries followed by temp-allowed entries, each
+        # tagged with a "category" ("denied" or "temp"). Indexed 1:1 by the left
+        # table's cursor row for selection and the url-bar.
+        self._left_rows: list[dict] = []
         # Guards against overlapping fetches (fetch timeout > poll interval)
         self._refreshing = False
         self._consecutive_failures = 0
@@ -165,16 +169,16 @@ class ProxyMonitor(App[None]):
 
     def on_mount(self) -> None:
         denied_pane = self.query_one("#denied-pane", Vertical)
-        denied_pane.border_title = "DENIED"
+        denied_pane.border_title = "DENIED / TEMP-ALLOWED"
 
         allowed_pane = self.query_one("#allowed-pane", Vertical)
         allowed_pane.border_title = "ALLOWED"
 
         denied_table = self.query_one("#denied-table", DataTable)
-        denied_table.add_columns("Host", "Type", "Method", "Time")
+        denied_table.add_columns("Host", "Status", "Method", "Time")
 
         allowed_table = self.query_one("#allowed-table", DataTable)
-        allowed_table.add_columns("Host", "Expires")
+        allowed_table.add_columns("Host", "Status")
 
         denied_table.focus()
 
@@ -237,6 +241,14 @@ class ProxyMonitor(App[None]):
                 seen[host] = entry
         self._denied_rows = sorted(seen.values(), key=lambda e: e["timestamp"], reverse=True)
 
+        # Combined left pane: denied rows (newest-first) then temp-allowed rows.
+        temp = allowlist.get("temporary", {})
+        self._left_rows = [{**e, "category": "denied"} for e in self._denied_rows]
+        self._left_rows += [
+            {"category": "temp", "host": host, "expires": expires}
+            for host, expires in sorted(temp.items())
+        ]
+
         self._update_denied_table()
         self._update_allowed_table(allowlist)
         self._update_url_bar()
@@ -250,20 +262,27 @@ class ProxyMonitor(App[None]):
         dt = self.query_one("#denied-table", DataTable)
         current_row = dt.cursor_row
         dt.clear()
-        for entry in self._denied_rows:
-            # Entries without a type predate typed deny logging → pending
-            if entry.get("type") == "policy_violation":
-                type_cell = Text("violation", style="bold red")
+        for row in self._left_rows:
+            if row["category"] == "temp":
+                status_cell = Text("temp", style="green")
+                method = ""
+                time_cell = _fmt_expires(row["expires"])
             else:
-                type_cell = Text("pending", style="yellow")
+                # Entries without a type predate typed deny logging → pending
+                if row.get("type") == "policy_violation":
+                    status_cell = Text("violation", style="bold red")
+                else:
+                    status_cell = Text("pending", style="yellow")
+                method = row.get("method", "")
+                time_cell = _fmt_time(row.get("timestamp", ""))
             dt.add_row(
-                entry.get("host", ""),
-                type_cell,
-                entry.get("method", ""),
-                _fmt_time(entry.get("timestamp", "")),
-                key=entry.get("host", ""),
+                row.get("host", ""),
+                status_cell,
+                method,
+                time_cell,
+                key=f"{row['category']}:{row.get('host', '')}",
             )
-        if current_row < len(self._denied_rows):
+        if current_row < len(self._left_rows):
             dt.move_cursor(row=current_row)
 
     def _update_allowed_table(self, allowlist: dict) -> None:
@@ -271,8 +290,6 @@ class ProxyMonitor(App[None]):
         at.clear()
         for host in sorted(allowlist.get("permanent", [])):
             at.add_row(host, "permanent", key=f"p:{host}")
-        for host, expires in sorted(allowlist.get("temporary", {}).items()):
-            at.add_row(host, _fmt_expires(expires), key=f"t:{host}")
         restricted = allowlist.get("restricted", {})
         for source in sorted(restricted):
             for host in sorted(restricted[source]):
@@ -284,15 +301,17 @@ class ProxyMonitor(App[None]):
 
     def _update_url_bar(self) -> None:
         url_bar = self.query_one("#url-bar", UrlBar)
-        if self._focused_pane() != "denied" or not self._denied_rows:
+        if self._focused_pane() != "denied" or not self._left_rows:
             url_bar.url = ""
             url_bar.reason = ""
             return
         dt = self.query_one("#denied-table", DataTable)
         row_idx = dt.cursor_row
-        if 0 <= row_idx < len(self._denied_rows):
-            url_bar.url = self._denied_rows[row_idx].get("url", "")
-            url_bar.reason = self._denied_rows[row_idx].get("reason", "")
+        if 0 <= row_idx < len(self._left_rows):
+            row = self._left_rows[row_idx]
+            # Temp-allowed rows have no request URL/reason to show.
+            url_bar.url = "" if row["category"] == "temp" else row.get("url", "")
+            url_bar.reason = "" if row["category"] == "temp" else row.get("reason", "")
         else:
             url_bar.url = ""
             url_bar.reason = ""
@@ -332,17 +351,18 @@ class ProxyMonitor(App[None]):
         self._skip_ticks = 0
         await self._refresh_data()
 
-    def _selected_denied_host(self) -> str | None:
-        if self._focused_pane() != "denied" or not self._denied_rows:
+    def _selected_left_host(self) -> str | None:
+        """Host of the selected left-pane row (denied or temp-allowed)."""
+        if self._focused_pane() != "denied" or not self._left_rows:
             return None
         dt = self.query_one("#denied-table", DataTable)
         row_idx = dt.cursor_row
-        if 0 <= row_idx < len(self._denied_rows):
-            return self._denied_rows[row_idx].get("host")
+        if 0 <= row_idx < len(self._left_rows):
+            return self._left_rows[row_idx].get("host")
         return None
 
     async def action_temp_allow(self) -> None:
-        host = self._selected_denied_host()
+        host = self._selected_left_host()
         if not host:
             return
         bar = self.query_one("#dur-bar", DurationBar)
@@ -361,7 +381,7 @@ class ProxyMonitor(App[None]):
         await self._refresh_data()
 
     async def action_perm_allow(self) -> None:
-        host = self._selected_denied_host()
+        host = self._selected_left_host()
         if not host:
             return
         try:
