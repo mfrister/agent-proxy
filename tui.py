@@ -51,7 +51,7 @@ class DurationBar(Static):
             else:
                 parts.append(f"  {label}  ")
         dur_str = "".join(parts)
-        return f"Duration: {dur_str}   [dim]t[/dim]=temp  [dim]p[/dim]=perm  [dim]r[/dim]=refresh  [dim]q[/dim]=quit"
+        return f"Duration: {dur_str}   [dim]t[/dim]=temp  [dim]p[/dim]=perm  [dim]x[/dim]=remove  [dim]r[/dim]=refresh  [dim]q[/dim]=quit"
 
 
 class UrlBar(Static):
@@ -129,6 +129,8 @@ class ProxyMonitor(App[None]):
         Binding("d", "cycle_duration", "Cycle duration", show=False),
         Binding("t", "temp_allow", "Temp allow", show=False),
         Binding("p", "perm_allow", "Perm allow", show=False),
+        Binding("x", "remove_allow", "Remove allow", show=False),
+        Binding("delete", "remove_allow", "Remove allow", show=False),
         Binding("k", "move_up", "Up", show=False),
         Binding("j", "move_down", "Down", show=False),
     ]
@@ -138,6 +140,8 @@ class ProxyMonitor(App[None]):
         self.base_url = f"http://127.0.0.1:{mgmt_port}"
         # Raw denied rows (deduplicated, newest-first)
         self._denied_rows: list[dict] = []
+        # Allowed rows as (kind, host), kind "p"=permanent / "t"=temporary
+        self._allowed_rows: list[tuple[str, str]] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -223,11 +227,17 @@ class ProxyMonitor(App[None]):
 
     def _update_allowed_table(self, allowlist: dict) -> None:
         at = self.query_one("#allowed-table", DataTable)
+        current_row = at.cursor_row
         at.clear()
+        self._allowed_rows = []
         for host in sorted(allowlist.get("permanent", [])):
             at.add_row(host, "permanent", key=f"p:{host}")
+            self._allowed_rows.append(("p", host))
         for host, expires in sorted(allowlist.get("temporary", {}).items()):
             at.add_row(host, _fmt_expires(expires), key=f"t:{host}")
+            self._allowed_rows.append(("t", host))
+        if current_row < len(self._allowed_rows):
+            at.move_cursor(row=current_row)
 
     def _update_url_bar(self) -> None:
         url_bar = self.query_one("#url-bar", UrlBar)
@@ -283,6 +293,37 @@ class ProxyMonitor(App[None]):
         if 0 <= row_idx < len(self._denied_rows):
             return self._denied_rows[row_idx].get("host")
         return None
+
+    def _selected_allowed_host(self) -> tuple[str, str] | None:
+        """Return (kind, host) for the selected allowed row, or None."""
+        if getattr(self.focused, "id", None) != "allowed-table":
+            return None
+        at = self.query_one("#allowed-table", DataTable)
+        row_idx = at.cursor_row
+        if 0 <= row_idx < len(self._allowed_rows):
+            return self._allowed_rows[row_idx]
+        return None
+
+    async def action_remove_allow(self) -> None:
+        selected = self._selected_allowed_host()
+        if not selected:
+            return
+        kind, host = selected
+        endpoint = "temp" if kind == "t" else "permanent"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.request(
+                    "DELETE",
+                    f"{self.base_url}/allow/{endpoint}",
+                    json={"host": host},
+                )
+            r.raise_for_status()
+            label = "temporary" if kind == "t" else "permanent"
+            self.notify(f"Removed {label} allow for {host}")
+        except Exception as exc:
+            self.notify(f"Error: {exc}", severity="error", timeout=5)
+            return
+        await self._refresh_data()
 
     async def action_temp_allow(self) -> None:
         host = self._selected_denied_host()

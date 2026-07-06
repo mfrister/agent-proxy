@@ -304,6 +304,9 @@ def create_app(state: ProxyState) -> Flask:
     import flask.cli
     flask.cli.show_server_banner = lambda *_a, **_kw: None
 
+    # Serializes read-modify-write of the config file across permanent routes
+    config_lock = threading.Lock()
+
     @app.get("/denied")
     def get_denied():
         with state.deny_lock:
@@ -333,20 +336,57 @@ def create_app(state: ProxyState) -> Flask:
     @app.post("/allow/permanent")
     def permanent_allow():
         host = flask_request.get_json(force=True)["host"]
-        try:
-            with open(state.allowlist_path) as f:
-                data = yaml.safe_load(f) or {}
-        except FileNotFoundError:
-            data = {}
-        hosts = data.get("allowed_hosts", [])
-        host_names = [h if isinstance(h, str) else h["host"] for h in hosts]
-        if host not in host_names:
-            hosts.append({"host": host})
-            data["allowed_hosts"] = hosts
-            with open(state.allowlist_path, "w") as f:
-                yaml.safe_dump(data, f)
-        state.allowlist = load_allowlist(state.allowlist_path)
-        state.host_config = load_host_config(state.allowlist_path)
+        with config_lock:
+            try:
+                with open(state.allowlist_path) as f:
+                    data = yaml.safe_load(f) or {}
+            except FileNotFoundError:
+                data = {}
+            hosts = data.get("allowed_hosts", [])
+            host_names = [h if isinstance(h, str) else h["host"] for h in hosts]
+            if host not in host_names:
+                hosts.append({"host": host})
+                data["allowed_hosts"] = hosts
+                with open(state.allowlist_path, "w") as f:
+                    yaml.safe_dump(data, f)
+            state.allowlist = load_allowlist(state.allowlist_path)
+            state.host_config = load_host_config(state.allowlist_path)
+        return jsonify({"ok": True})
+
+    @app.delete("/allow/temp")
+    def remove_temp_allow():
+        host = flask_request.get_json(force=True)["host"]
+        with state.temp_lock:
+            state.temp_allows.pop(host, None)
+        print(json.dumps({"event": "allow_removed", "host": host, "mode": "temp"}))
+        return jsonify({"ok": True})
+
+    @app.delete("/allow/permanent")
+    def remove_permanent_allow():
+        """Remove a host from allowed_hosts in the config file.
+
+        Note: removing a dict-form entry drops its extra config (e.g.
+        allow_response_cookies); re-adding via POST recreates a bare entry.
+        """
+        host = flask_request.get_json(force=True)["host"]
+        with config_lock:
+            try:
+                with open(state.allowlist_path) as f:
+                    data = yaml.safe_load(f) or {}
+            except FileNotFoundError:
+                data = {}
+            hosts = data.get("allowed_hosts", [])
+            kept = [
+                h for h in hosts
+                if (h if isinstance(h, str) else h["host"]) != host
+            ]
+            if len(kept) != len(hosts):
+                data["allowed_hosts"] = kept
+                with open(state.allowlist_path, "w") as f:
+                    yaml.safe_dump(data, f)
+            state.allowlist = load_allowlist(state.allowlist_path)
+            state.host_config = load_host_config(state.allowlist_path)
+        print(json.dumps({"event": "allow_removed", "host": host, "mode": "permanent"}))
         return jsonify({"ok": True})
 
     return app

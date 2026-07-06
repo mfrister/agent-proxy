@@ -510,6 +510,74 @@ class TestManagementAPI:
             (isinstance(h, dict) and h["host"] == "newdict.com") for h in hosts
         )
 
+    def test_delete_allow_temp_removes_host(self, mgmt):
+        state = mgmt._state
+        with state.temp_lock:
+            state.temp_allows["temp.com"] = time.time() + 60
+        r = mgmt.delete("/allow/temp", json={"host": "temp.com"})
+        assert r.get_json()["ok"] is True
+        with state.temp_lock:
+            assert "temp.com" not in state.temp_allows
+        data = mgmt.get("/allowlist").get_json()
+        assert "temp.com" not in data["temporary"]
+
+    def test_delete_allow_temp_absent_is_ok(self, mgmt):
+        r = mgmt.delete("/allow/temp", json={"host": "never-allowed.com"})
+        assert r.status_code == 200
+        assert r.get_json()["ok"] is True
+
+    def test_delete_allow_permanent_updates_state_and_file(self, mgmt):
+        r = mgmt.delete("/allow/permanent", json={"host": "existing.com"})
+        assert r.get_json()["ok"] is True
+        assert "existing.com" not in mgmt._state.allowlist
+        with open(mgmt._state.allowlist_path) as f:
+            data = yaml.safe_load(f)
+        host_names = [
+            h if isinstance(h, str) else h["host"]
+            for h in data["allowed_hosts"]
+        ]
+        assert "existing.com" not in host_names
+
+    def test_delete_allow_permanent_preserves_other_entries(self, mgmt):
+        config_path = mgmt._state.allowlist_path
+        with open(config_path, "w") as f:
+            yaml.safe_dump({
+                "allowed_hosts": [
+                    "plain.com",
+                    {"host": "cookies.com", "allow_response_cookies": ["csrftoken"]},
+                    {"host": "existing.com"},
+                ],
+            }, f)
+        mgmt.delete("/allow/permanent", json={"host": "existing.com"})
+        with open(config_path) as f:
+            data = yaml.safe_load(f)
+        assert data["allowed_hosts"] == [
+            "plain.com",
+            {"host": "cookies.com", "allow_response_cookies": ["csrftoken"]},
+        ]
+        assert mgmt._state.allowlist == {"plain.com", "cookies.com"}
+        assert "existing.com" not in mgmt._state.host_config
+
+    def test_delete_allow_permanent_string_form_entry(self, mgmt):
+        config_path = mgmt._state.allowlist_path
+        with open(config_path, "w") as f:
+            yaml.safe_dump({"allowed_hosts": ["stringy.com", "other.com"]}, f)
+        mgmt.delete("/allow/permanent", json={"host": "stringy.com"})
+        with open(config_path) as f:
+            data = yaml.safe_load(f)
+        assert data["allowed_hosts"] == ["other.com"]
+        assert "stringy.com" not in mgmt._state.allowlist
+
+    def test_delete_allow_permanent_absent_idempotent(self, mgmt):
+        config_path = mgmt._state.allowlist_path
+        with open(config_path) as f:
+            before = f.read()
+        r = mgmt.delete("/allow/permanent", json={"host": "never-allowed.com"})
+        assert r.status_code == 200
+        assert r.get_json()["ok"] is True
+        with open(config_path) as f:
+            assert f.read() == before
+
 
 # ── Cookie allowlist (response side) ──────────────────────────────────────────
 
