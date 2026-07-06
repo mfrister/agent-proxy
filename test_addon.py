@@ -4,34 +4,27 @@ Tests for the mitmproxy sandbox proxy addons.
 Run with:  pytest test_addon.py -v
 """
 
-import collections
 import json
 import os
 import signal
-import threading
 import time
 from unittest.mock import MagicMock
 
 import pytest
 import yaml
 
+from config import Credential
+
 
 # ── Test helpers ───────────────────────────────────────────────────────────────
 
 def make_state(**overrides):
     """Return a ProxyState with sensible defaults, merged with any overrides."""
-    from addon import ProxyState
+    from config import ProxyState
 
     defaults = dict(
         allowlist={"allowed.com"},
-        allowlist_path="config.yaml",
-        credentials=[],
-        temp_allows={},
-        temp_lock=threading.Lock(),
-        deny_log=collections.deque(maxlen=1000),
-        deny_lock=threading.Lock(),
-        host_config={},
-        management_port=8082,
+        config_path="config.yaml",
     )
     defaults.update(overrides)
     return ProxyState(**defaults)
@@ -52,36 +45,42 @@ def make_flow(host, method="GET", path="/", headers=None, body=b""):
 
 
 # Credential fixture used across multiple test classes
-CRED = {
-    "host": "api.example.com",
-    "header": "Authorization",
-    "fake_value": "Bearer sk-fake",
-    "real_value": "Bearer sk-real",
-}
+CRED = Credential(
+    host="api.example.com",
+    header="Authorization",
+    fake_value="Bearer sk-fake",
+    real_value="Bearer sk-real",
+)
 
 
-# ── load_config ────────────────────────────────────────────────────────────────
+# ── Config.load ────────────────────────────────────────────────────────────────
 
-class TestLoadConfig:
-    def test_missing_file_returns_empty(self, tmp_path):
-        from addon import load_config
-        result = load_config(str(tmp_path / "nonexistent.yaml"))
-        assert result == {}
+class TestConfigLoad:
+    def test_missing_file_empty_config_with_warning(self, tmp_path, capsys):
+        from config import Config
+        cfg = Config.load(str(tmp_path / "nonexistent.yaml"))
+        assert cfg.allowlist == set()
+        assert cfg.credentials == []
+        assert cfg.restricted == {}
+        assert cfg.management_port == 8082
+        event = json.loads(capsys.readouterr().out)
+        assert event["event"] == "config_warning"
+        assert "not found" in event["message"]
 
     def test_basic_config_loaded(self, tmp_path):
-        from addon import load_config
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
             "management_port: 9000\n"
             "allowed_hosts:\n"
             "  - host: example.com\n"
         )
-        result = load_config(str(config))
-        assert result["management_port"] == 9000
-        assert result["allowed_hosts"][0]["host"] == "example.com"
+        cfg = Config.load(str(config))
+        assert cfg.management_port == 9000
+        assert "example.com" in cfg.allowlist
 
     def test_secrets_expanded(self, tmp_path):
-        from addon import load_config
+        from config import Config
         secrets = tmp_path / "secrets.yaml"
         secrets.write_text("MY_KEY: real-value\n")
         config = tmp_path / "config.yaml"
@@ -93,11 +92,11 @@ class TestLoadConfig:
             "    fake_value: fake\n"
             "    real_value: \"${MY_KEY}\"\n"
         )
-        result = load_config(str(config))
-        assert result["credentials"][0]["real_value"] == "real-value"
+        cfg = Config.load(str(config))
+        assert cfg.credentials[0].real_value == "real-value"
 
     def test_missing_secret_key_raises(self, tmp_path):
-        from addon import load_config
+        from config import Config
         secrets = tmp_path / "secrets.yaml"
         secrets.write_text("OTHER_KEY: something\n")
         config = tmp_path / "config.yaml"
@@ -105,34 +104,36 @@ class TestLoadConfig:
             f"secrets_file: {secrets}\n"
             "credentials:\n"
             "  - host: api.example.com\n"
+            "    header: Authorization\n"
             "    real_value: \"${MISSING_KEY}\"\n"
         )
         with pytest.raises(KeyError, match="MISSING_KEY"):
-            load_config(str(config))
+            Config.load(str(config))
 
     def test_missing_secrets_file_raises(self, tmp_path):
-        from addon import load_config
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
             "secrets_file: /nonexistent/secrets.yaml\n"
             "allowed_hosts: []\n"
         )
         with pytest.raises(FileNotFoundError):
-            load_config(str(config))
+            Config.load(str(config))
 
     def test_no_secrets_file_plain_values_unchanged(self, tmp_path):
-        from addon import load_config
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
             "credentials:\n"
             "  - host: api.example.com\n"
+            "    header: Authorization\n"
             "    real_value: plain-value\n"
         )
-        result = load_config(str(config))
-        assert result["credentials"][0]["real_value"] == "plain-value"
+        cfg = Config.load(str(config))
+        assert cfg.credentials[0].real_value == "plain-value"
 
     def test_multiple_secrets_expanded(self, tmp_path):
-        from addon import load_config
+        from config import Config
         secrets = tmp_path / "secrets.yaml"
         secrets.write_text("KEY_A: value-a\nKEY_B: value-b\n")
         config = tmp_path / "config.yaml"
@@ -140,16 +141,18 @@ class TestLoadConfig:
             f"secrets_file: {secrets}\n"
             "credentials:\n"
             "  - host: a.com\n"
+            "    header: Authorization\n"
             "    real_value: \"${KEY_A}\"\n"
             "  - host: b.com\n"
+            "    header: Authorization\n"
             "    real_value: \"${KEY_B}\"\n"
         )
-        result = load_config(str(config))
-        assert result["credentials"][0]["real_value"] == "value-a"
-        assert result["credentials"][1]["real_value"] == "value-b"
+        cfg = Config.load(str(config))
+        assert cfg.credentials[0].real_value == "value-a"
+        assert cfg.credentials[1].real_value == "value-b"
 
-    def test_load_credentials_from_config(self, tmp_path):
-        from addon import load_credentials
+    def test_credentials_from_config(self, tmp_path):
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
             "credentials:\n"
@@ -158,50 +161,102 @@ class TestLoadConfig:
             "    fake_value: fake\n"
             "    real_value: real\n"
         )
-        creds = load_credentials(str(config))
-        assert len(creds) == 1
-        assert creds[0]["real_value"] == "real"
+        cfg = Config.load(str(config))
+        assert cfg.credentials == [Credential(
+            host="api.example.com", header="Authorization",
+            fake_value="fake", real_value="real",
+        )]
 
-    def test_load_credentials_empty_when_absent(self, tmp_path):
-        from addon import load_credentials
+    def test_credentials_empty_when_absent(self, tmp_path):
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text("allowed_hosts:\n  - host: example.com\n")
-        assert load_credentials(str(config)) == []
+        assert Config.load(str(config)).credentials == []
 
-    def test_load_management_port_from_config(self, tmp_path):
-        from addon import load_management_port
+    def test_credential_missing_key_raises(self, tmp_path):
+        from config import Config
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "credentials:\n"
+            "  - host: api.example.com\n"
+            "    real_value: real\n"
+        )
+        with pytest.raises(ValueError, match="header"):
+            Config.load(str(config))
+
+    def test_management_port_from_config(self, tmp_path):
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text("management_port: 9999\n")
-        assert load_management_port(str(config)) == 9999
+        assert Config.load(str(config)).management_port == 9999
 
-    def test_load_management_port_default(self, tmp_path):
-        from addon import load_management_port
+    def test_management_port_default(self, tmp_path):
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text("allowed_hosts: []\n")
-        assert load_management_port(str(config)) == 8082
+        assert Config.load(str(config)).management_port == 8082
+
+    def test_null_sections_treated_as_empty(self, tmp_path):
+        from config import Config
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "allowed_hosts:\n"
+            "restricted_hosts:\n"
+            "credentials:\n"
+            "allowed_registries:\n"
+        )
+        cfg = Config.load(str(config))
+        assert cfg.allowlist == set()
+        assert cfg.restricted == {}
+        assert cfg.credentials == []
+
+    def test_scalar_allowed_hosts_raises(self, tmp_path):
+        from config import Config
+        config = tmp_path / "config.yaml"
+        config.write_text("allowed_hosts: example.com\n")
+        with pytest.raises(ValueError, match="allowed_hosts"):
+            Config.load(str(config))
+
+    def test_allowed_hosts_entry_without_host_raises(self, tmp_path):
+        from config import Config
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "allowed_hosts:\n"
+            "  - allow_response_cookies: []\n"
+        )
+        with pytest.raises(ValueError, match="allowed_hosts"):
+            Config.load(str(config))
+
+    def test_failed_reload_keeps_old_state(self, tmp_path):
+        config = tmp_path / "config.yaml"
+        config.write_text("allowed_hosts: not-a-list\n")
+        state = make_state(allowlist={"old.com"}, config_path=str(config))
+        with pytest.raises(ValueError):
+            state.reload()
+        assert state.allowlist == {"old.com"}
 
 
 # ── Happy eyeballs ─────────────────────────────────────────────────────────────
 
 class TestHappyEyeballs:
     def test_load_delay_default(self, tmp_path):
-        from addon import load_happy_eyeballs_delay
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text("allowed_hosts: []\n")
-        assert load_happy_eyeballs_delay(str(config)) == 0.25
+        assert Config.load(str(config)).happy_eyeballs_delay == 0.25
 
     def test_load_delay_custom(self, tmp_path):
-        from addon import load_happy_eyeballs_delay
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text("happy_eyeballs_delay: 0.1\n")
-        assert load_happy_eyeballs_delay(str(config)) == 0.1
+        assert Config.load(str(config)).happy_eyeballs_delay == 0.1
 
     def test_load_delay_disabled(self, tmp_path):
-        from addon import load_happy_eyeballs_delay
+        from config import Config
         config = tmp_path / "config.yaml"
         for value in ("0", "false", "null"):
             config.write_text(f"happy_eyeballs_delay: {value}\n")
-            assert load_happy_eyeballs_delay(str(config)) == 0
+            assert Config.load(str(config)).happy_eyeballs_delay == 0
 
     def test_supported_version_ranges(self):
         from addon import happy_eyeballs_supported
@@ -459,27 +514,27 @@ class TestRegistryPolicy:
         assert flow.request.headers["Authorization"] == "Bearer tok"
 
 
-# ── load_restricted_hosts ──────────────────────────────────────────────────────
+# ── Config.load: restricted hosts ──────────────────────────────────────────────
 
 class TestLoadRestrictedHosts:
     def test_preset_expansion(self, tmp_path):
-        from addon import load_restricted_hosts
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text("allowed_registries: [go, npm]\n")
-        result = load_restricted_hosts(str(config))
+        result = Config.load(str(config)).restricted
         assert result["proxy.golang.org"].source == "go"
         assert result["sum.golang.org"].source == "go"
         assert result["registry.npmjs.org"].source == "npm"
 
     def test_unknown_preset_raises(self, tmp_path):
-        from addon import load_restricted_hosts
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text("allowed_registries: [nonexistent]\n")
         with pytest.raises(ValueError, match="nonexistent"):
-            load_restricted_hosts(str(config))
+            Config.load(str(config))
 
     def test_custom_restricted_host(self, tmp_path):
-        from addon import load_restricted_hosts
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
             "restricted_hosts:\n"
@@ -488,11 +543,11 @@ class TestLoadRestrictedHosts:
             "      - methods: [GET]\n"
             "        path: \"/repo/[a-z]{1,10}\"\n"
         )
-        result = load_restricted_hosts(str(config))
+        result = Config.load(str(config)).restricted
         assert result["artifacts.example.com"].source == "config"
 
     def test_custom_entry_replaces_preset(self, tmp_path):
-        from addon import load_restricted_hosts
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
             "allowed_registries: [npm]\n"
@@ -502,25 +557,25 @@ class TestLoadRestrictedHosts:
             "      - methods: [GET]\n"
             "        path: \"/only-this\"\n"
         )
-        result = load_restricted_hosts(str(config))
+        result = Config.load(str(config)).restricted
         assert result["registry.npmjs.org"].source == "config"
         assert len(result["registry.npmjs.org"].rules) == 1
 
     def test_overlap_with_allowlist_warns(self, tmp_path, capsys):
-        from addon import load_restricted_hosts
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
             "allowed_registries: [npm]\n"
             "allowed_hosts:\n"
             "  - host: registry.npmjs.org\n"
         )
-        load_restricted_hosts(str(config))
+        Config.load(str(config))
         event = json.loads(capsys.readouterr().out)
         assert event["event"] == "config_warning"
         assert "registry.npmjs.org" in event["message"]
 
     def test_host_config_strips_cookies_for_restricted(self, tmp_path):
-        from addon import load_host_config
+        from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
             "allowed_registries: [npm]\n"
@@ -531,7 +586,7 @@ class TestLoadRestrictedHosts:
             "        path: \"/x\"\n"
             "    allow_response_cookies: [csrftoken]\n"
         )
-        result = load_host_config(str(config))
+        result = Config.load(str(config)).host_config
         assert result["registry.npmjs.org"].allow_response_cookies == []
         assert result["artifacts.example.com"].allow_response_cookies == ["csrftoken"]
 
@@ -597,7 +652,7 @@ class TestCredentialBrokerAddon:
 
     def test_inject_mode_sets_header_when_absent(self, capsys):
         from addon import CredentialBrokerAddon
-        inject_cred = {"host": "api.example.com", "header": "Cookie", "real_value": "session=abc123"}
+        inject_cred = Credential(host="api.example.com", header="Cookie", real_value="session=abc123")
         addon = CredentialBrokerAddon(make_state(credentials=[inject_cred]))
         flow = make_flow("api.example.com", headers={})
         addon.request(flow)
@@ -609,7 +664,7 @@ class TestCredentialBrokerAddon:
 
     def test_inject_mode_overwrites_existing_header(self, capsys):
         from addon import CredentialBrokerAddon
-        inject_cred = {"host": "api.example.com", "header": "Cookie", "real_value": "session=abc123"}
+        inject_cred = Credential(host="api.example.com", header="Cookie", real_value="session=abc123")
         addon = CredentialBrokerAddon(make_state(credentials=[inject_cred]))
         flow = make_flow("api.example.com", headers={"Cookie": "old=value"})
         addon.request(flow)
@@ -621,7 +676,7 @@ class TestCredentialBrokerAddon:
 
     def test_inject_mode_does_not_affect_other_hosts(self):
         from addon import CredentialBrokerAddon
-        inject_cred = {"host": "api.example.com", "header": "Cookie", "real_value": "session=abc123"}
+        inject_cred = Credential(host="api.example.com", header="Cookie", real_value="session=abc123")
         addon = CredentialBrokerAddon(make_state(credentials=[inject_cred]))
         flow = make_flow("other.com", headers={})
         addon.request(flow)
@@ -667,14 +722,14 @@ class TestLoggingAddon:
 
 class TestSighupReload:
     def test_sighup_reloads_allowlist(self, tmp_path):
-        from addon import load_allowlist, setup_sighup
+        from addon import setup_sighup
 
         config = tmp_path / "config.yaml"
         config.write_text("allowed_hosts:\n  - host: original.com\n")
 
         state = make_state(
             allowlist={"original.com"},
-            allowlist_path=str(config),
+            config_path=str(config),
         )
         setup_sighup(state)
 
@@ -697,8 +752,8 @@ class TestSighupReload:
         )
 
         state = make_state(
-            credentials=[{"host": "api.example.com", "header": "Authorization", "real_value": "old-value"}],
-            allowlist_path=str(config),
+            credentials=[Credential(host="api.example.com", header="Authorization", real_value="old-value")],
+            config_path=str(config),
         )
         setup_sighup(state)
 
@@ -711,7 +766,7 @@ class TestSighupReload:
         os.kill(os.getpid(), signal.SIGHUP)
         time.sleep(0.05)
 
-        assert state.credentials[0]["real_value"] == "new-value"
+        assert state.credentials[0].real_value == "new-value"
 
     def test_sighup_reloads_restricted(self, tmp_path):
         from addon import setup_sighup
@@ -719,7 +774,7 @@ class TestSighupReload:
         config = tmp_path / "config.yaml"
         config.write_text("allowed_hosts: []\n")
 
-        state = make_state(allowlist=set(), allowlist_path=str(config))
+        state = make_state(allowlist=set(), config_path=str(config))
         setup_sighup(state)
         assert state.restricted == {}
 
@@ -735,14 +790,14 @@ class TestSighupReload:
 @pytest.fixture
 def mgmt(tmp_path):
     """Flask test client wired to a fresh ProxyState with a temp config file."""
-    from addon import create_app
+    from management_api import create_app
 
     config = tmp_path / "config.yaml"
     config.write_text("allowed_hosts:\n  - host: existing.com\n")
 
     state = make_state(
         allowlist={"existing.com"},
-        allowlist_path=str(config),
+        config_path=str(config),
     )
     app = create_app(state)
     app.config["TESTING"] = True
@@ -805,7 +860,7 @@ class TestManagementAPI:
 
     def test_post_allow_permanent_writes_file(self, mgmt, tmp_path):
         mgmt.post("/allow/permanent", json={"host": "written.com"})
-        config_path = mgmt._state.allowlist_path
+        config_path = mgmt._state.config_path
         with open(config_path) as f:
             data = yaml.safe_load(f)
         host_names = [
@@ -817,7 +872,7 @@ class TestManagementAPI:
     def test_post_allow_permanent_idempotent(self, mgmt):
         mgmt.post("/allow/permanent", json={"host": "existing.com"})
         mgmt.post("/allow/permanent", json={"host": "existing.com"})
-        with open(mgmt._state.allowlist_path) as f:
+        with open(mgmt._state.config_path) as f:
             data = yaml.safe_load(f)
         host_names = [
             h if isinstance(h, str) else h["host"]
@@ -827,7 +882,7 @@ class TestManagementAPI:
 
     def test_post_allow_permanent_writes_dict_format(self, mgmt):
         mgmt.post("/allow/permanent", json={"host": "newdict.com"})
-        with open(mgmt._state.allowlist_path) as f:
+        with open(mgmt._state.config_path) as f:
             data = yaml.safe_load(f)
         hosts = data["allowed_hosts"]
         assert any(
@@ -869,41 +924,45 @@ def make_response_flow(host, set_cookie_headers=None):
 
 class TestCookieAllowlist:
     def test_host_absent_passes_all_cookies(self):
-        from addon import CredentialBrokerAddon
+        from addon import ResponseCookieFilterAddon
         state = make_state(host_config={})
-        addon = CredentialBrokerAddon(state)
+        addon = ResponseCookieFilterAddon(state)
         flow = make_response_flow("other.com", ["session=abc", "tracker=xyz"])
         addon.response(flow)
         assert flow.response._stored == ["session=abc", "tracker=xyz"]
 
     def test_host_config_none_restriction_passes_all(self):
-        from addon import CredentialBrokerAddon, HostConfig
+        from addon import ResponseCookieFilterAddon
+        from config import HostConfig
         state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=None)})
-        addon = CredentialBrokerAddon(state)
+        addon = ResponseCookieFilterAddon(state)
         flow = make_response_flow("example.com", ["session=abc", "tracker=xyz"])
         addon.response(flow)
         assert flow.response._stored == ["session=abc", "tracker=xyz"]
 
     def test_empty_allowlist_strips_all_cookies(self):
-        from addon import CredentialBrokerAddon, HostConfig
+        from addon import ResponseCookieFilterAddon
+        from config import HostConfig
         state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=[])})
-        addon = CredentialBrokerAddon(state)
+        addon = ResponseCookieFilterAddon(state)
         flow = make_response_flow("example.com", ["session=abc", "tracker=xyz"])
         addon.response(flow)
         assert flow.response._stored == []
 
     def test_allowlist_keeps_only_named_cookie(self):
-        from addon import CredentialBrokerAddon, HostConfig
+        from addon import ResponseCookieFilterAddon
+        from config import HostConfig
         state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=["csrftoken"])})
-        addon = CredentialBrokerAddon(state)
+        addon = ResponseCookieFilterAddon(state)
         flow = make_response_flow("example.com", ["csrftoken=abc123", "session=xyz"])
         addon.response(flow)
         assert flow.response._stored == ["csrftoken=abc123"]
 
     def test_multiple_set_cookie_headers_filtered(self):
-        from addon import CredentialBrokerAddon, HostConfig
+        from addon import ResponseCookieFilterAddon
+        from config import HostConfig
         state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=["csrftoken", "lang"])})
-        addon = CredentialBrokerAddon(state)
+        addon = ResponseCookieFilterAddon(state)
         flow = make_response_flow(
             "example.com",
             ["csrftoken=abc", "session=xyz", "lang=en", "tracker=1"],

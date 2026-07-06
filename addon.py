@@ -7,217 +7,28 @@ Run with UI:   mitmweb -s addon.py
 Environment variables:
   PROXY_CONFIG   path to config YAML (default: config.yaml)
 
-Config YAML format:
-
-  secrets_file: /path/to/secrets.yaml   # optional; separate file with secret values
-
-  management_port: 8082                  # management API port (default: 8082)
-
-  happy_eyeballs_delay: 0.25             # race IPv6/IPv4 upstream connects
-                                         # (RFC 8305); 0 disables. Works around
-                                         # mitmproxy issue #8088; needs restart.
-
-  credentials:
-    - host: api.example.com
-      header: Authorization
-      fake_value: "Bearer sk-fake"       # swap mode: agent sends fake, proxy swaps real
-      real_value: "${MY_API_KEY}"        # ${KEY} references a key in secrets_file
-    - host: internal.example.com
-      header: Cookie
-      real_value: "session=abc123"       # inject mode: omit fake_value
-
-  allowed_hosts:
-    - api.anthropic.com                  # plain string: all cookies pass through
-    - host: platform.claude.com
-      allow_response_cookies: []         # no cookies allowed (all stripped)
-    - host: internal.example.com
-      allow_response_cookies:
-        - csrftoken                      # only csrftoken passes through
-
-  allowed_registries: [go, npm, docker]  # read-only package-registry presets
-                                         # (see registries.PRESETS and
-                                         # docs/registry-presets.md)
-
-  restricted_hosts:                      # custom rule sets, same engine as presets
-    - host: artifacts.internal.example.com
-      rules:
-        - methods: [GET, HEAD]
-          path: "/repo/[a-z0-9-]{1,64}/[a-zA-Z0-9._-]{1,128}"
-          query:                         # omit `query` to forbid query strings
-            version: "[a-z0-9.]{1,32}"
-      request_headers: [authorization]   # extras beyond the base header allowlist
-
-  Precedence: allowed_hosts (unrestricted) > temporary allows (unrestricted)
-  > restricted rules (403 on violation) > pending approval (503).
-  Note: swap-mode credentials on a restricted host require the header to be
-  listed in that host's request_headers, or scrubbing removes it before the
-  broker sees it. Inject-mode credentials are unaffected (injected post-scrub).
-
-Secrets file format (simple flat key/value map):
-
-  MY_API_KEY: "Bearer sk-real-key-here"
-  OTHER_SECRET: "some-value"
+See config.py for the config and secrets file formats.
 """
 
 import asyncio
-import collections
 import functools
 import json
-import logging
 import os
-import re
 import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-import yaml
-from flask import Flask, jsonify, request as flask_request
 from mitmproxy import http
 from mitmproxy.http import HTTPFlow
 
 import registries
+from config import Config, ProxyState
+from management_api import create_app
 
 
-# ── Shared state ──────────────────────────────────────────────────────────────
-
-@dataclass
-class HostConfig:
-    allow_response_cookies: list[str] | None = None
-    # None means no restriction; a list (even empty) enables filtering
-
-
-@dataclass
-class ProxyState:
-    allowlist: set            # permanent allowed hosts
-    allowlist_path: str       # path to config YAML, used by SIGHUP reload
-    credentials: list         # [{host, header, fake_value, real_value}]
-    temp_allows: dict         # host -> expires_at (epoch seconds)
-    temp_lock: threading.Lock
-    deny_log: collections.deque  # maxlen=1000, entries: {timestamp,host,url,method}
-    deny_lock: threading.Lock
-    host_config: dict         # host -> HostConfig
-    management_port: int = 8082
-    restricted: dict = field(default_factory=dict)  # host -> registries.HostRules
-
-
-# ── Config loaders ─────────────────────────────────────────────────────────────
-
-def _expand_secrets(obj, secrets: dict):
-    """Recursively expand ${KEY} references in string values using the secrets map."""
-    if isinstance(obj, str):
-        def replace(m):
-            key = m.group(1)
-            if key not in secrets:
-                raise KeyError(f"Secret key not found in secrets_file: ${{{key}}}")
-            return str(secrets[key])
-        return re.sub(r'\$\{([^}]+)\}', replace, obj)
-    if isinstance(obj, dict):
-        return {k: _expand_secrets(v, secrets) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_expand_secrets(item, secrets) for item in obj]
-    return obj
-
-
-def load_config(path: str) -> dict:
-    """Load config YAML and expand any ${KEY} references from the secrets_file."""
-    try:
-        with open(path) as f:
-            data = yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        return {}
-
-    secrets = {}
-    secrets_path = data.get("secrets_file")
-    if secrets_path:
-        with open(secrets_path) as f:
-            secrets = yaml.safe_load(f) or {}
-
-    return _expand_secrets(data, secrets)
-
-
-def load_allowlist(path: str) -> set:
-    """Load allowed hosts from config YAML."""
-    data = load_config(path)
-    result = []
-    for item in data.get("allowed_hosts", []):
-        if isinstance(item, str):
-            result.append(item)
-        else:
-            result.append(item["host"])
-    return set(result)
-
-
-def load_host_config(path: str) -> dict:
-    """Load per-host config (cookie rules) from config YAML."""
-    data = load_config(path)
-    result = {}
-    # Restricted hosts strip all response cookies by default: registries don't
-    # need them, and Set-Cookie is a session/tracking channel into the sandbox.
-    for name in data.get("allowed_registries") or []:
-        for host in registries.PRESETS.get(name, {}):
-            result[host] = HostConfig(allow_response_cookies=[])
-    for item in data.get("restricted_hosts") or []:
-        result[item["host"]] = HostConfig(
-            allow_response_cookies=item.get("allow_response_cookies", [])
-        )
-    for item in data.get("allowed_hosts", []):
-        if not isinstance(item, str):
-            host = item["host"]
-            result[host] = HostConfig(
-                allow_response_cookies=item.get("allow_response_cookies")
-            )
-    return result
-
-
-def load_restricted_hosts(path: str) -> dict:
-    """
-    Load restricted-host rule sets: expand `allowed_registries` preset names,
-    then compile custom `restricted_hosts` entries. A custom entry for a host
-    that a preset also covers replaces the preset's rules for that host.
-    """
-    data = load_config(path)
-    result = {}
-    for name in data.get("allowed_registries") or []:
-        if name not in registries.PRESETS:
-            raise ValueError(
-                f"Unknown registry preset {name!r}; available: {sorted(registries.PRESETS)}"
-            )
-        result.update(registries.PRESETS[name])
-    for item in data.get("restricted_hosts") or []:
-        result[item["host"]] = registries.compile_host_rules(item, source="config")
-
-    allowed = {i if isinstance(i, str) else i["host"] for i in data.get("allowed_hosts", [])}
-    for host in sorted(set(result) & allowed):
-        print(json.dumps({
-            "event": "config_warning",
-            "message": (
-                f"host {host} is in both allowed_hosts and a restricted rule set; "
-                "allowed_hosts wins (unrestricted)"
-            ),
-        }))
-    return result
-
-
-def load_credentials(path: str) -> list:
-    """Load credential mappings from config YAML."""
-    data = load_config(path)
-    return data.get("credentials", [])
-
-
-def load_management_port(path: str) -> int:
-    """Load management API port from config YAML."""
-    data = load_config(path)
-    return int(data.get("management_port", 8082))
-
-
-def load_happy_eyeballs_delay(path: str) -> float:
-    """Load the happy-eyeballs delay in seconds; 0 (or false) disables it."""
-    data = load_config(path)
-    return float(data.get("happy_eyeballs_delay", 0.25) or 0)
-
+# ── Happy eyeballs ───────────────────────────────────────────────────────────────
 
 def happy_eyeballs_supported(version: tuple = None) -> bool:
     """asyncio's happy-eyeballs implementation (asyncio.staggered) crashes
@@ -255,20 +66,10 @@ class AllowlistAddon:
     """
     Checks every request against the permanent allowlist and active temporary
     allows. Denied requests receive a 503 response and are logged.
-    Also starts the management API when mitmproxy is running.
     """
 
     def __init__(self, state: ProxyState):
         self.state = state
-
-    def running(self):
-        """Start the management API in a background thread."""
-        threading.Thread(
-            target=lambda: create_app(self.state).run(
-                host="127.0.0.1", port=self.state.management_port, use_reloader=False
-            ),
-            daemon=True,
-        ).start()
 
     def request(self, flow: HTTPFlow):
         host = flow.request.pretty_host
@@ -381,45 +182,49 @@ class CredentialBrokerAddon:
 
         host = flow.request.pretty_host
         for cred in self.state.credentials:
-            if cred["host"] != host:
+            if cred.host != host:
                 continue
-            header = cred["header"]
-            real = cred["real_value"]
-            fake = cred.get("fake_value")
 
-            if fake is None:
+            if cred.fake_value is None:
                 # Inject mode: set the header unconditionally
-                flow.request.headers[header] = real
+                flow.request.headers[cred.header] = cred.real_value
                 print(json.dumps({
                     "event": "credential_injected",
                     "host": host,
-                    "header": header,
+                    "header": cred.header,
                     "mode": "inject",
                 }))
             else:
-                current = flow.request.headers.get(header, "")
-                if current == fake:
-                    flow.request.headers[header] = real
+                current = flow.request.headers.get(cred.header, "")
+                if current == cred.fake_value:
+                    flow.request.headers[cred.header] = cred.real_value
                     print(json.dumps({
                         "event": "credential_injected",
                         "host": host,
-                        "header": header,
+                        "header": cred.header,
                         "mode": "swap",
                     }))
                 elif current:
                     # Non-empty value that isn't the expected fake — block and alert
                     flow.response = http.Response.make(
                         403,
-                        f"Credential mismatch on {host}: unexpected value in {header}",
+                        f"Credential mismatch on {host}: unexpected value in {cred.header}",
                         {"Content-Type": "text/plain"},
                     )
                     # Log fake (confirms expected identity) but never real value
                     print(json.dumps({
                         "event": "credential_mismatch",
                         "host": host,
-                        "header": header,
-                        "expected_fake": fake,
+                        "header": cred.header,
+                        "expected_fake": cred.fake_value,
                     }))
+
+
+class ResponseCookieFilterAddon:
+    """Filters Set-Cookie response headers according to each host's config."""
+
+    def __init__(self, state: ProxyState):
+        self.state = state
 
     def response(self, flow: HTTPFlow):
         host = flow.request.pretty_host
@@ -442,7 +247,7 @@ class LoggingAddon:
     def __init__(self, state: ProxyState):
         self.state = state
         # Headers that carry credentials — excluded from logs
-        self._sensitive = {cred["header"].lower() for cred in state.credentials}
+        self._sensitive = {cred.header.lower() for cred in state.credentials}
 
     def request(self, flow: HTTPFlow):
         # Skip flows already denied upstream
@@ -461,76 +266,26 @@ class LoggingAddon:
         print(json.dumps(entry))
 
 
-# ── Management API ─────────────────────────────────────────────────────────────
+class ManagementApiAddon:
+    """Starts the management API in a background thread once mitmproxy is running."""
 
-def create_app(state: ProxyState) -> Flask:
-    app = Flask(__name__)
-    # Silence werkzeug request logs and Flask startup banner
-    logging.getLogger("werkzeug").setLevel(logging.ERROR)
-    import flask.cli
-    flask.cli.show_server_banner = lambda *_a, **_kw: None
+    def __init__(self, state: ProxyState):
+        self.state = state
 
-    @app.get("/denied")
-    def get_denied():
-        with state.deny_lock:
-            return jsonify(list(state.deny_log))
-
-    @app.get("/allowlist")
-    def get_allowlist_view():
-        now = time.time()
-        with state.temp_lock:
-            active_temps = {
-                h: exp for h, exp in state.temp_allows.items() if now < exp
-            }
-        restricted = {}
-        for host, rules in state.restricted.items():
-            restricted.setdefault(rules.source or "config", []).append(host)
-        return jsonify({
-            "permanent": sorted(state.allowlist),
-            "temporary": active_temps,
-            "restricted": {k: sorted(v) for k, v in restricted.items()},
-        })
-
-    @app.post("/allow/temp")
-    def temp_allow():
-        body = flask_request.get_json(force=True)
-        host = body["host"]
-        duration = float(body.get("duration_seconds", 300))
-        with state.temp_lock:
-            state.temp_allows[host] = time.time() + duration
-        return jsonify({"ok": True})
-
-    @app.post("/allow/permanent")
-    def permanent_allow():
-        host = flask_request.get_json(force=True)["host"]
-        try:
-            with open(state.allowlist_path) as f:
-                data = yaml.safe_load(f) or {}
-        except FileNotFoundError:
-            data = {}
-        hosts = data.get("allowed_hosts", [])
-        host_names = [h if isinstance(h, str) else h["host"] for h in hosts]
-        if host not in host_names:
-            hosts.append({"host": host})
-            data["allowed_hosts"] = hosts
-            with open(state.allowlist_path, "w") as f:
-                yaml.safe_dump(data, f)
-        state.allowlist = load_allowlist(state.allowlist_path)
-        state.host_config = load_host_config(state.allowlist_path)
-        state.restricted = load_restricted_hosts(state.allowlist_path)
-        return jsonify({"ok": True})
-
-    return app
+    def running(self):
+        threading.Thread(
+            target=lambda: create_app(self.state).run(
+                host="127.0.0.1", port=self.state.management_port, use_reloader=False
+            ),
+            daemon=True,
+        ).start()
 
 
 # ── SIGHUP reload ──────────────────────────────────────────────────────────────
 
 def setup_sighup(state: ProxyState):
     def handler(signum, frame):
-        state.allowlist = load_allowlist(state.allowlist_path)
-        state.host_config = load_host_config(state.allowlist_path)
-        state.credentials = load_credentials(state.allowlist_path)
-        state.restricted = load_restricted_hosts(state.allowlist_path)
+        state.reload()
         print(json.dumps({
             "event": "sighup_reload",
             "host_count": len(state.allowlist),
@@ -542,45 +297,48 @@ def setup_sighup(state: ProxyState):
 
 # ── mitmproxy entry point ──────────────────────────────────────────────────────
 
-_config_path = os.environ.get("PROXY_CONFIG", "config.yaml")
+class SandboxProxy:
+    """
+    Entry-point addon. Builds the proxy state from PROXY_CONFIG when mitmproxy
+    loads the script — importing this module has no side effects. A config
+    error raised here is logged by mitmproxy's script loader and terminates
+    mitmdump at startup (via its ErrorCheck addon).
+    """
 
-state = ProxyState(
-    allowlist=load_allowlist(_config_path),
-    allowlist_path=_config_path,
-    credentials=load_credentials(_config_path),
-    temp_allows={},
-    temp_lock=threading.Lock(),
-    deny_log=collections.deque(maxlen=1000),
-    deny_lock=threading.Lock(),
-    host_config=load_host_config(_config_path),
-    management_port=load_management_port(_config_path),
-    restricted=load_restricted_hosts(_config_path),
-)
+    def load(self, loader):
+        config_path = os.environ.get("PROXY_CONFIG", "config.yaml")
+        config = Config.load(config_path)
+        state = ProxyState(config_path=config_path, management_port=config.management_port)
+        state.apply(config)
+        setup_sighup(state)
+        self.state = state
+        self.addons = [
+            AllowlistAddon(state),
+            CredentialBrokerAddon(state),
+            ResponseCookieFilterAddon(state),
+            LoggingAddon(state),
+            ManagementApiAddon(state),
+        ]
 
-setup_sighup(state)
+        # uv enforces requires-python (>=3.12.8,!=3.13.0); this guard covers
+        # runs outside uv, where a broken interpreter would make every connect hang.
+        delay = config.happy_eyeballs_delay
+        if delay and not happy_eyeballs_supported():
+            print(json.dumps({
+                "event": "happy_eyeballs_unsupported",
+                "python": ".".join(map(str, sys.version_info[:3])),
+                "message": (
+                    "this Python's asyncio happy-eyeballs crashes under mitmproxy's "
+                    "eager task factory (fixed in 3.12.8/3.13.1); falling back to "
+                    "sequential connects — IPv6-blackholed hosts will stall"
+                ),
+            }))
+        elif delay:
+            enable_happy_eyeballs(delay)
+            print(json.dumps({
+                "event": "happy_eyeballs_enabled",
+                "delay_seconds": delay,
+            }))
 
-# uv enforces requires-python (>=3.12.8,!=3.13.0); this guard covers runs
-# outside uv, where a broken interpreter would make every connect hang.
-_happy_eyeballs_delay = load_happy_eyeballs_delay(_config_path)
-if _happy_eyeballs_delay and not happy_eyeballs_supported():
-    print(json.dumps({
-        "event": "happy_eyeballs_unsupported",
-        "python": ".".join(map(str, sys.version_info[:3])),
-        "message": (
-            "this Python's asyncio happy-eyeballs crashes under mitmproxy's "
-            "eager task factory (fixed in 3.12.8/3.13.1); falling back to "
-            "sequential connects — IPv6-blackholed hosts will stall"
-        ),
-    }))
-elif _happy_eyeballs_delay:
-    enable_happy_eyeballs(_happy_eyeballs_delay)
-    print(json.dumps({
-        "event": "happy_eyeballs_enabled",
-        "delay_seconds": _happy_eyeballs_delay,
-    }))
 
-addons = [
-    AllowlistAddon(state),
-    CredentialBrokerAddon(state),
-    LoggingAddon(state),
-]
+addons = [SandboxProxy()]
