@@ -61,12 +61,24 @@ limactl shell "$VM_NAME" -- bash -c '
 
   if command -v update-ca-certificates &>/dev/null && [[ -d /usr/local/share/ca-certificates ]]; then
     # Debian / Ubuntu / Alpine
-    sudo cp "$SRC" /usr/local/share/ca-certificates/mitmproxy-ca.crt
-    sudo update-ca-certificates
+    DEST=/usr/local/share/ca-certificates/mitmproxy-ca.crt
+    if [[ -f "$DEST" ]] && cmp -s "$SRC" "$DEST"; then
+      echo "CA cert already installed at $DEST — skipping."
+    else
+      sudo cp "$SRC" "$DEST"
+      sudo update-ca-certificates
+      echo "CA cert installed at $DEST."
+    fi
   elif command -v update-ca-trust &>/dev/null; then
     # RHEL / Fedora / CentOS
-    sudo cp "$SRC" /etc/pki/ca-trust/source/anchors/mitmproxy-ca.crt
-    sudo update-ca-trust extract
+    DEST=/etc/pki/ca-trust/source/anchors/mitmproxy-ca.crt
+    if [[ -f "$DEST" ]] && cmp -s "$SRC" "$DEST"; then
+      echo "CA cert already installed at $DEST — skipping."
+    else
+      sudo cp "$SRC" "$DEST"
+      sudo update-ca-trust extract
+      echo "CA cert installed at $DEST."
+    fi
   else
     echo "Warning: unknown distro — cert copied to /tmp/mitmproxy-ca.pem but not installed system-wide." >&2
     echo "Install it manually for your distro." >&2
@@ -74,13 +86,15 @@ limactl shell "$VM_NAME" -- bash -c '
   fi
 
   rm -f "$SRC"
-  echo "CA cert installed."
 '
 
 # ── Step 3: Configure system-wide proxy env ─────────────────────────────────
 echo "--> Writing /etc/profile.d/proxy.sh inside VM..."
 limactl shell "$VM_NAME" -- bash -c "
-  sudo tee /etc/profile.d/proxy.sh > /dev/null <<'EOF'
+  set -euo pipefail
+  DEST=/etc/profile.d/proxy.sh
+  TMP=\$(mktemp)
+  cat > \"\$TMP\" <<'EOF'
 # mitmproxy — set by setup-lima-proxy.sh
 export HTTP_PROXY=http://host.lima.internal:${PROXY_PORT}
 export HTTPS_PROXY=http://host.lima.internal:${PROXY_PORT}
@@ -90,8 +104,14 @@ export NO_PROXY=localhost,127.0.0.1,host.lima.internal
 export no_proxy=localhost,127.0.0.1,host.lima.internal
 export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/mitmproxy-ca.crt
 EOF
-  sudo chmod 644 /etc/profile.d/proxy.sh
-  echo 'Proxy env written to /etc/profile.d/proxy.sh'
+  if [[ -f \"\$DEST\" ]] && cmp -s \"\$TMP\" \"\$DEST\"; then
+    echo 'Proxy env already up to date at /etc/profile.d/proxy.sh — skipping.'
+  else
+    sudo cp \"\$TMP\" \"\$DEST\"
+    sudo chmod 644 \"\$DEST\"
+    echo 'Proxy env written to /etc/profile.d/proxy.sh'
+  fi
+  rm -f \"\$TMP\"
 "
 
 # ── Step 4: Write proxy guidance into ~/.claude/CLAUDE.md inside the VM ──────
