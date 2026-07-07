@@ -162,7 +162,7 @@ class TestConfigLoad:
             "allowed_hosts:\n"
             "restricted_hosts:\n"
             "credentials:\n"
-            "allowed_registries:\n"
+            "services:\n"
         )
         cfg = Config.load(str(config))
         assert cfg.allowlist == set()
@@ -224,7 +224,7 @@ class TestLoadRestrictedHosts:
     def test_preset_expansion(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
-        config.write_text("allowed_registries: [go, npm]\n")
+        config.write_text("services: [go, npm]\n")
         result = Config.load(str(config)).restricted
         assert result["proxy.golang.org"].source == "go"
         assert result["sum.golang.org"].source == "go"
@@ -233,8 +233,15 @@ class TestLoadRestrictedHosts:
     def test_unknown_preset_raises(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
-        config.write_text("allowed_registries: [nonexistent]\n")
+        config.write_text("services: [nonexistent]\n")
         with pytest.raises(ValueError, match="nonexistent"):
+            Config.load(str(config))
+
+    def test_old_allowed_registries_key_rejected(self, tmp_path):
+        from config import Config
+        config = tmp_path / "config.yaml"
+        config.write_text("allowed_registries: [go]\n")
+        with pytest.raises(ValueError, match="renamed to services"):
             Config.load(str(config))
 
     def test_bare_string_restricted_host_raises(self, tmp_path):
@@ -268,7 +275,7 @@ class TestLoadRestrictedHosts:
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
-            "allowed_registries: [npm]\n"
+            "services: [npm]\n"
             "restricted_hosts:\n"
             "  - host: registry.npmjs.org\n"
             "    rules:\n"
@@ -283,7 +290,7 @@ class TestLoadRestrictedHosts:
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
-            "allowed_registries: [npm]\n"
+            "services: [npm]\n"
             "allowed_hosts:\n"
             "  - host: registry.npmjs.org\n"
         )
@@ -296,7 +303,7 @@ class TestLoadRestrictedHosts:
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
-            "allowed_registries: [npm]\n"
+            "services: [npm]\n"
             "restricted_hosts:\n"
             "  - host: artifacts.example.com\n"
             "    rules:\n"

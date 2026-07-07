@@ -474,7 +474,7 @@ class TestSighupReload:
         setup_sighup(state)
         assert state.restricted == {}
 
-        config.write_text("allowed_registries: [go]\n")
+        config.write_text("services: [go]\n")
         os.kill(os.getpid(), signal.SIGHUP)
         time.sleep(0.05)
 

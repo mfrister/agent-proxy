@@ -10,7 +10,7 @@ users can define custom rule sets under `restricted_hosts` in config.yaml using
 the same schema.
 
 Threat model, restriction design, and known limitations are documented in
-docs/registry-presets.md.
+docs/service-presets.md.
 
 Pattern guardrails (enforced at compile time, for presets and user rules alike):
   - Patterns are matched with re.fullmatch, never search.
@@ -202,7 +202,7 @@ def evaluate(host_rules: HostRules, method: str, path_with_query: str,
 # ── Preset data ────────────────────────────────────────────────────────────────
 #
 # Patterns are deliberately grammar-based: bounded segment lengths and tight
-# character classes rather than entropy heuristics. See docs/registry-presets.md
+# character classes rather than entropy heuristics. See docs/service-presets.md
 # for the per-registry rationale and residual risks.
 
 def seg(chars: str, lo: int, hi: int) -> str:
