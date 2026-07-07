@@ -134,8 +134,11 @@ Key bindings:
 | `d` | Cycle through durations |
 | `t` | Temporarily allow the selected denied host |
 | `p` | Permanently allow the selected denied host |
+| `s` | Open the services view |
 | `r` | Force refresh |
 | `q` | Quit |
+
+The **services view** (`s`) manages service presets: `a` adds one (pick the service; for self-hosted services enter the host; for credential services the fake token is auto-generated and the real token is entered once, masked, and stored in `secrets_file` — it is never shown again), `o` rotates a real token in place, `x` removes a service along with its stored secret.
 
 ## Management API
 
@@ -147,6 +150,13 @@ Runs on `127.0.0.1:8082` (not proxied).
 | GET | `/denied` | — | Recent denied requests |
 | POST | `/allow/temp` | `{"host": "…", "duration_seconds": 60}` | Add TTL-based allow; `duration_seconds` defaults to 300 |
 | POST | `/allow/permanent` | `{"host": "…"}` | Append to current config file and reload |
+| GET | `/services/available` | — | Service preset catalog (name, needs_host, needs_token, header, fake prefix) |
+| GET | `/services` | — | Configured services, redacted (never real tokens) |
+| POST | `/services` | `{"service": "github", "host"?: "…", "real_value"?: "…"}` | Add a service: generates the fake token, stores the real one in `secrets_file`, writes a `${KEY}` ref to config.yaml |
+| PUT | `/services` | `{"service": "…", "host"?: "…", "real_value": "…"}` | Rotate the real token in place (the CLI keeps its fake) |
+| DELETE | `/services` | `{"service": "…", "host"?: "…"}` | Remove the service and its stored secret |
+
+Real credentials are write-only: accepted on POST/PUT `/services`, persisted to `secrets_file`, and never returned by any endpoint.
 
 Reload allowlist without restart: `kill -HUP <pid>`
 
