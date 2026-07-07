@@ -1,3 +1,33 @@
+# Service presets
+
+A service preset is one `services:` entry in config.yaml that grants a named
+service exactly the egress it needs. Two kinds ship:
+
+- **Registry presets** (`go`, `npm`, `docker`, `ghcr`, `pypi`, `crates`) —
+  read-only access to package registries as *restricted hosts*, enforced by
+  the rule engine in `registries.py`.
+- **Credential presets** (`github`, `gitlab`) — the service's host is
+  allowlisted and its API token is *brokered*: the CLI in the sandbox holds a
+  fake token, the proxy swaps in the real one.
+
+```yaml
+# config.yaml
+services:
+  - go
+  - npm
+  - service: github
+    fake_value: "ghp_0000000000000000000000000000000000fake"
+    real_value: "${GITHUB_TOKEN}"    # ${KEY} resolved from secrets_file
+  - service: gitlab
+    host: gitlab.example.com         # self-hosted: the entry supplies the host
+    fake_value: "glpat-00000000000000fake"
+    real_value: "${GITLAB_TOKEN}"
+```
+
+Presets are descriptors (`services.py`), expanded at config load into the
+proxy's existing primitives — the host allowlist, restricted-host rule sets,
+and credential broker entries. The two enforcement engines stay separate.
+
 # Registry presets: restricted read-only access to package registries
 
 Agents constantly need to download packages (Go modules, npm packages, container
@@ -7,11 +37,6 @@ presets add a third access tier between "fully allowed" and "denied" —
 **restricted hosts** — with curated per-registry rules that permit the read-only
 download traffic these ecosystems need while structurally closing the channels
 that could carry sandbox data out.
-
-```yaml
-# config.yaml
-allowed_registries: [go, npm, docker, ghcr, pypi, crates]
-```
 
 ## Threat model
 
@@ -164,6 +189,46 @@ time, and a literal `%` in a path pattern requires `allow_percent: true` on the
 rule. A rule's `query` may use the special key `"*"` to allow any parameter
 name (≤40 chars, `[A-Za-z0-9_.-]`) against one value pattern — intended for
 CDN-signed URLs.
+
+# Credential presets: brokered API tokens
+
+The credential broker (`CredentialBrokerAddon`) already ensured real secrets
+never enter the sandbox: the agent's CLI is configured with a fake token, and
+the proxy replaces it with the real one on the way out (swap mode). A request
+carrying any other non-empty value in the credential header is blocked with a
+403 and logged — an agent that was prompt-injected into using a stolen or
+invented token gets caught, not forwarded.
+
+Credential presets add the per-service knowledge, so one entry wires
+everything:
+
+| Preset | Host | Header the CLI sends | Fake-token shape |
+|---|---|---|---|
+| `github` | `api.github.com` (fixed) | `Authorization: token <t>` | `ghp_` + 36 chars |
+| `gitlab` | from the entry's `host:` (self-hosted) | `PRIVATE-TOKEN: <t>` | `glpat-` + 20 chars |
+
+The entry's `fake_value`/`real_value` are the bare tokens; the preset wraps
+them in the header format its CLI actually sends (`token …` for `gh`, no
+prefix for `glab`). The fake-token shape matters because CLIs validate token
+format locally before sending anything.
+
+The credential's host is allowlisted by default — that's what makes "add
+GitHub" a single step. Set `allow_host: false` to broker the token without
+granting the host (e.g. when the host is already covered by a restricted rule
+set). If a preset ever attaches a credential to a *restricted* host, the
+expansion automatically adds the credential header to that host's
+`request_headers`, so header scrubbing can't strip it before the broker runs.
+
+## Real tokens never leave the proxy side
+
+- Keep real values in `secrets_file` (outside the repo and the sandbox) and
+  reference them as `${GITHUB_TOKEN}`; config.yaml then contains no secret.
+- The management API never returns credential values — endpoints serialize
+  hostnames and rule sources only, and config rewrites round-trip the raw
+  `${KEY}` reference, never the expanded secret. A regression test
+  (`test_real_credential_never_appears_in_any_response`) pins this.
+- Logs record that a swap happened (`credential_injected`: host, header,
+  mode) — never the real value. A mismatch logs the *expected fake* only.
 
 ## Future hardening (not implemented)
 

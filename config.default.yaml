@@ -24,13 +24,28 @@ allowed_hosts:
   - host: api.anthropic.com
   - host: platform.claude.com
 
-# Read-only package-registry presets (restricted hosts). Each preset allows the
-# GET/HEAD traffic its ecosystem needs — pinned hosts, anchored URL patterns,
-# query-param and request-header allowlists — while blocking everything else
-# with a 403. Threat model and per-preset details: docs/registry-presets.md
-# Available presets: go, npm, docker, ghcr, pypi, crates
+# Service presets. Bare names enable read-only package-registry rule sets
+# (restricted hosts): each allows the GET/HEAD traffic its ecosystem needs —
+# pinned hosts, anchored URL patterns, query-param and request-header
+# allowlists — while blocking everything else with a 403.
+# Registry presets: go, npm, docker, ghcr, pypi, crates
 #
-# allowed_registries: [go, npm, docker, ghcr, pypi, crates]
+# Credential presets (github, gitlab) broker an API token: the CLI in the
+# sandbox is configured with the fake token and the proxy swaps in the real
+# one. Self-hosted services (gitlab) take the instance host in the entry.
+# Set allow_host: false to broker the token without allowlisting the host.
+# Threat model and per-preset details: docs/service-presets.md
+#
+# services:
+#   - go
+#   - npm
+#   - service: github
+#     fake_value: "ghp_0000000000000000000000000000000000fake"
+#     real_value: "${GITHUB_TOKEN}"
+#   - service: gitlab
+#     host: gitlab.example.com
+#     fake_value: "glpat-00000000000000fake"
+#     real_value: "${GITLAB_TOKEN}"
 
 # Custom restricted hosts use the same rule engine. Patterns are matched with
 # fullmatch and must be bounded (no *, + or {n,}). Omitting `query` on a rule

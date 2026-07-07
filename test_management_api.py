@@ -133,6 +133,46 @@ class TestManagementAPI:
             (isinstance(h, dict) and h["host"] == "newdict.com") for h in hosts
         )
 
+    def test_real_credential_never_appears_in_any_response(self, mgmt, tmp_path):
+        # The management API must never expose brokered real credentials, and
+        # /allow/permanent must round-trip the raw config (${KEY} references)
+        # rather than the secret-expanded form.
+        real_token = "REAL-SECRET-TOKEN-a3f9"
+        from config import Credential
+        state = mgmt._state
+        state.credentials = [Credential(
+            host="api.github.com", header="Authorization",
+            fake_value="token ghp_fake", real_value=f"token {real_token}",
+            preset="github",
+        )]
+
+        secrets = tmp_path / "secrets.yaml"
+        secrets.write_text(f"GITHUB_TOKEN: {real_token}\n")
+        with open(state.config_path, "w") as f:
+            f.write(
+                f"secrets_file: {secrets}\n"
+                "allowed_hosts:\n  - host: existing.com\n"
+                "services:\n"
+                "  - service: github\n"
+                "    fake_value: ghp_fake\n"
+                "    real_value: ${GITHUB_TOKEN}\n"
+            )
+
+        responses = [
+            mgmt.get("/denied"),
+            mgmt.get("/allowlist"),
+            mgmt.post("/allow/temp", json={"host": "temp.com"}),
+            mgmt.post("/allow/permanent", json={"host": "new.com"}),
+        ]
+        for r in responses:
+            assert real_token not in r.get_data(as_text=True)
+
+        # The rewritten config still references the secret, not its value.
+        with open(state.config_path) as f:
+            written = f.read()
+        assert real_token not in written
+        assert "${GITHUB_TOKEN}" in written
+
     def test_post_allow_permanent_rejects_without_touching_disk_or_state(self, mgmt):
         # An unrelated bad section (e.g. a malformed credential) must not let
         # this endpoint write a new host to disk while failing to update the
