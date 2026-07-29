@@ -14,10 +14,10 @@ uv sync
 
 ```bash
 # headless
-PROXY_CREDENTIALS='...' uv run mitmdump -s addon.py
+uv run mitmdump -s addon.py
 
 # with web UI
-PROXY_CREDENTIALS='...' uv run mitmweb -s addon.py
+uv run mitmweb -s addon.py
 ```
 
 Point the agent at the proxy and install the CA cert:
@@ -52,52 +52,58 @@ allowed_hosts:
 
 When `allow_response_cookies` is absent, all `Set-Cookie` headers from that host pass through unchanged. An empty list strips everything; a non-empty list is an allowlist.
 
-### Registry presets (restricted hosts)
+### Service presets
 
-Read-only access to common package registries without fully allowlisting them:
+One `services:` entry grants a named service exactly the egress it needs:
 
 ```yaml
-allowed_registries: [go, npm, docker, ghcr, pypi, crates]
+services:
+  - go                                # registry presets: read-only restricted access
+  - npm
+  - service: github                   # credential presets: allowlist the host and
+    fake_value: "ghp_…fake"           # broker the API token — the CLI holds the
+    real_value: "${GITHUB_TOKEN}"     # fake, the proxy swaps in the real one
+  - service: gitlab
+    host: gitlab.example.com          # self-hosted: the entry supplies the host
+    fake_value: "glpat-…fake"
+    real_value: "${GITLAB_TOKEN}"
 ```
 
-Each preset pins exact hostnames and only permits GET/HEAD requests matching known, bounded URL patterns (package metadata, tarballs, manifests, blobs, pull-scoped auth tokens). Query strings and request headers are allowlisted; everything else is blocked with a 403 (a policy violation, unlike the 503 pending-approval flow) and shows up in the deny log tagged `policy_violation`. Custom hosts can use the same rule engine via `restricted_hosts` — see `config.default.yaml` for the schema.
+**Registry presets** (`go`, `npm`, `docker`, `ghcr`, `pypi`, `crates`) pin exact hostnames and only permit GET/HEAD requests matching known, bounded URL patterns (package metadata, tarballs, manifests, blobs, pull-scoped auth tokens). Query strings and request headers are allowlisted; everything else is blocked with a 403 (a policy violation, unlike the 503 pending-approval flow) and shows up in the deny log tagged `policy_violation`. Custom hosts can use the same rule engine via `restricted_hosts` — see `config.default.yaml` for the schema.
 
-The threat model, restriction design, and known limitations are documented in [docs/registry-presets.md](docs/registry-presets.md).
+**Credential presets** (`github` for github.com, `gitlab` for self-hosted instances) know the header format the service's CLI sends (`Authorization: token …` for `gh`, `PRIVATE-TOKEN: …` for `glab`) and the fake-token shape it accepts. Keep real tokens in `secrets_file` and reference them as `${KEY}`; they never appear in config.yaml, management API responses, or logs. Set `allow_host: false` to broker the token without allowlisting the host.
 
-**`PROXY_CREDENTIALS`** — credential mappings (JSON array). Two modes are supported:
+The threat model, restriction design, and known limitations are documented in [docs/service-presets.md](docs/service-presets.md).
+
+### Custom credentials
+
+For services without a preset, `credentials:` entries in config.yaml configure the broker directly. Two modes are supported:
 
 **Swap mode** — the agent uses a placeholder value; the proxy replaces it with the real credential before forwarding. Requests with any other non-empty value are blocked (guards against prompt injection).
 
-```json
-[
-  {
-    "host": "api.openai.com",
-    "header": "Authorization",
-    "fake_value": "Bearer sk-fake",
-    "real_value": "Bearer sk-real"
-  }
-]
+```yaml
+credentials:
+  - host: api.openai.com
+    header: Authorization
+    fake_value: "Bearer sk-fake"
+    real_value: "${OPENAI_API_KEY}"
 ```
 
 **Inject mode** — the proxy unconditionally sets the header, regardless of what the agent sent. Useful for cookies or other credentials the agent should never handle itself. Omit `fake_value`:
 
-```json
-[
-  {
-    "host": "internal.example.com",
-    "header": "Cookie",
-    "real_value": "session=abc123"
-  }
-]
+```yaml
+credentials:
+  - host: internal.example.com
+    header: Cookie
+    real_value: "session=abc123"
 ```
 
 **Environment variables:**
 
 | Variable | Default | Description |
 |---|---|---|
-| `PROXY_CONFIG` | `config.yaml` | Path to allowlist YAML (see `config.default.yaml` for example) |
-| `PROXY_CREDENTIALS` | `[]` | JSON credential mappings |
-| `PROXY_MGMT_PORT` | `8082` | Management API port |
+| `PROXY_CONFIG` | `config.yaml` | Path to config YAML (see `config.default.yaml` for example) |
+| `PROXY_MGMT_PORT` | `8082` | Management API port the TUI connects to |
 
 ## Terminal UI
 
@@ -128,8 +134,11 @@ Key bindings:
 | `d` | Cycle through durations |
 | `t` | Temporarily allow the selected denied host |
 | `p` | Permanently allow the selected denied host |
+| `s` | Open the services view |
 | `r` | Force refresh |
 | `q` | Quit |
+
+The **services view** (`s`) manages service presets: `a` adds one (pick the service; for self-hosted services enter the host; for credential services the fake token is auto-generated and the real token is entered once, masked, and stored in `secrets_file` — it is never shown again), `o` rotates a real token in place, `x` removes a service along with its stored secret.
 
 ## Management API
 
@@ -141,6 +150,13 @@ Runs on `127.0.0.1:8082` (not proxied).
 | GET | `/denied` | — | Recent denied requests |
 | POST | `/allow/temp` | `{"host": "…", "duration_seconds": 60}` | Add TTL-based allow; `duration_seconds` defaults to 300 |
 | POST | `/allow/permanent` | `{"host": "…"}` | Append to current config file and reload |
+| GET | `/services/available` | — | Service preset catalog (name, needs_host, needs_token, header, fake prefix) |
+| GET | `/services` | — | Configured services, redacted (never real tokens) |
+| POST | `/services` | `{"service": "github", "host"?: "…", "real_value"?: "…"}` | Add a service: generates the fake token, stores the real one in `secrets_file`, writes a `${KEY}` ref to config.yaml |
+| PUT | `/services` | `{"service": "…", "host"?: "…", "real_value": "…"}` | Rotate the real token in place (the CLI keeps its fake) |
+| DELETE | `/services` | `{"service": "…", "host"?: "…"}` | Remove the service and its stored secret |
+
+Real credentials are write-only: accepted on POST/PUT `/services`, persisted to `secrets_file`, and never returned by any endpoint.
 
 Reload allowlist without restart: `kill -HUP <pid>`
 

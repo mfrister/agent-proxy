@@ -11,15 +11,6 @@ Config YAML format:
                                          # (RFC 8305); 0 disables. Works around
                                          # mitmproxy issue #8088; needs restart.
 
-  credentials:
-    - host: api.example.com
-      header: Authorization
-      fake_value: "Bearer sk-fake"       # swap mode: agent sends fake, proxy swaps real
-      real_value: "${MY_API_KEY}"        # ${KEY} references a key in secrets_file
-    - host: internal.example.com
-      header: Cookie
-      real_value: "session=abc123"       # inject mode: omit fake_value
-
   allowed_hosts:
     - api.anthropic.com                  # plain string: all cookies pass through
     - host: platform.claude.com
@@ -28,9 +19,26 @@ Config YAML format:
       allow_response_cookies:
         - csrftoken                      # only csrftoken passes through
 
-  allowed_registries: [go, npm, docker]  # read-only package-registry presets
-                                         # (see registries.PRESETS and
-                                         # docs/registry-presets.md)
+  services:                              # service presets (see services.SERVICE_PRESETS
+    - npm                                # and docs/service-presets.md). Bare string:
+    - go                                 # read-only package-registry rule sets.
+    - service: github                    # credential presets broker an API token:
+      fake_value: "ghp_fake…"            # the CLI sends the fake, the proxy swaps
+      real_value: "${GITHUB_TOKEN}"      # in the real one. ${KEY} -> secrets_file.
+    - service: gitlab                    # self-hosted services take the host in
+      host: gitlab.example.com           # the entry
+      fake_value: "glpat-fake…"
+      real_value: "${GITLAB_TOKEN}"
+      # allow_host: false                # broker the token but don't allowlist the host
+
+  credentials:                           # custom credentials (escape hatch)
+    - host: api.example.com
+      header: Authorization
+      fake_value: "Bearer sk-fake"       # swap mode: agent sends fake, proxy swaps real
+      real_value: "${MY_API_KEY}"        # ${KEY} references a key in secrets_file
+    - host: internal.example.com
+      header: Cookie
+      real_value: "session=abc123"       # inject mode: omit fake_value
 
   restricted_hosts:                      # custom rule sets, same engine as presets
     - host: artifacts.internal.example.com
@@ -46,6 +54,8 @@ Config YAML format:
   Note: swap-mode credentials on a restricted host require the header to be
   listed in that host's request_headers, or scrubbing removes it before the
   broker sees it. Inject-mode credentials are unaffected (injected post-scrub).
+  Service presets wire this automatically; hand-written `credentials` entries
+  on `restricted_hosts` must list the header themselves.
 
 Secrets file format (simple flat key/value map):
 
@@ -54,6 +64,7 @@ Secrets file format (simple flat key/value map):
 """
 
 import collections
+import dataclasses
 import json
 import re
 import threading
@@ -62,6 +73,7 @@ from dataclasses import dataclass, field
 import yaml
 
 import registries
+import services as services_module
 
 
 @dataclass
@@ -76,6 +88,8 @@ class Credential:
     header: str
     real_value: str
     fake_value: str | None = None  # None means inject mode
+    preset: str | None = None      # service preset that produced this entry
+                                   # (informational, like HostRules.source)
 
 
 def _expand_secrets(obj, secrets: dict):
@@ -158,6 +172,12 @@ class Config:
                 secrets = yaml.safe_load(f) or {}
         data = _expand_secrets(data, secrets)
 
+        if "allowed_registries" in data:
+            raise ValueError(
+                "allowed_registries was renamed to services; "
+                "move the preset names there (e.g. services: [go, npm])"
+            )
+
         allowed_hosts = _host_entries(data, "allowed_hosts")
         restricted_hosts = _host_entries(data, "restricted_hosts", require_rules=True)
 
@@ -177,16 +197,82 @@ class Config:
                 fake_value=entry.get("fake_value"),
             ))
 
-        # Restricted-host rule sets: expand `allowed_registries` preset names,
-        # then compile custom `restricted_hosts` entries. A custom entry for a
-        # host that a preset also covers replaces the preset's rules for that host.
+        # Service presets: each `services` entry expands into the existing
+        # primitives — full-allow hosts, restricted rule sets, and brokered
+        # credentials. Restricted hosts strip all response cookies by default:
+        # registries don't need them, and Set-Cookie is a session/tracking
+        # channel into the sandbox.
         restricted = {}
-        for name in data.get("allowed_registries") or []:
-            if name not in registries.PRESETS:
+        host_config = {}
+        for i, entry in enumerate(data.get("services") or []):
+            if isinstance(entry, str):
+                entry = {"service": entry}
+            if not isinstance(entry, dict) or not isinstance(entry.get("service"), str):
                 raise ValueError(
-                    f"Unknown registry preset {name!r}; available: {sorted(registries.PRESETS)}"
+                    f"services[{i}] must be a string or a mapping with a 'service' key"
                 )
-            restricted.update(registries.PRESETS[name])
+            name = entry["service"]
+            preset = services_module.SERVICE_PRESETS.get(name)
+            if preset is None:
+                raise ValueError(
+                    f"Unknown service preset {name!r}; "
+                    f"available: {sorted(services_module.SERVICE_PRESETS)}"
+                )
+
+            hosts = dict(preset.hosts)
+            if preset.param_host:
+                if not isinstance(entry.get("host"), str):
+                    raise ValueError(f"services[{i}] ({name}) requires a 'host'")
+                hosts[entry["host"]] = None
+            elif "host" in entry:
+                raise ValueError(f"services[{i}] ({name}) does not take a 'host'")
+
+            spec = preset.credential
+            cred_host = None
+            if spec is None:
+                extra = [k for k in ("real_value", "fake_value") if k in entry]
+                if extra:
+                    raise ValueError(
+                        f"services[{i}] ({name}) takes no credential; "
+                        f"unexpected key(s): {', '.join(extra)}"
+                    )
+            else:
+                cred_host = spec.on_host or entry["host"]
+                missing = [k for k in ("real_value", "fake_value") if not entry.get(k)]
+                if missing:
+                    raise ValueError(
+                        f"services[{i}] ({name}) missing required key(s): "
+                        f"{', '.join(missing)}"
+                    )
+                credentials.append(Credential(
+                    host=cred_host,
+                    header=spec.header,
+                    real_value=spec.wrap(entry["real_value"]),
+                    fake_value=spec.wrap(entry["fake_value"]),
+                    preset=name,
+                ))
+
+            allow_cred_host = bool(entry.get("allow_host", True))
+            for host, rules in hosts.items():
+                if rules is not None:
+                    restricted[host] = rules
+                    host_config[host] = HostConfig(allow_response_cookies=[])
+                elif host != cred_host or allow_cred_host:
+                    allowlist.add(host)
+
+            # A swap-mode credential on a restricted host only works if its
+            # header survives that host's header scrubbing; wire it in so
+            # combined presets are correct by construction.
+            if spec is not None and cred_host in restricted:
+                rules = restricted[cred_host]
+                restricted[cred_host] = dataclasses.replace(
+                    rules,
+                    request_headers=rules.request_headers | {spec.header.lower()},
+                )
+
+        # Custom `restricted_hosts` entries compile with the same engine; one
+        # naming a host a service preset also covers replaces the preset's
+        # rules for that host.
         for item in restricted_hosts:
             restricted[item["host"]] = registries.compile_host_rules(item, source="config")
 
@@ -199,13 +285,8 @@ class Config:
                 ),
             }))
 
-        # Per-host cookie rules. Restricted hosts strip all response cookies by
-        # default: registries don't need them, and Set-Cookie is a
-        # session/tracking channel into the sandbox.
-        host_config = {}
-        for name in data.get("allowed_registries") or []:
-            for host in registries.PRESETS.get(name, {}):
-                host_config[host] = HostConfig(allow_response_cookies=[])
+        # Per-host cookie rules for custom entries (service presets set theirs
+        # above; later sections override earlier ones for the same host).
         for item in restricted_hosts:
             host_config[item["host"]] = HostConfig(
                 allow_response_cookies=item.get("allow_response_cookies", [])
