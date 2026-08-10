@@ -114,7 +114,40 @@ EOF
   rm -f \"\$TMP\"
 "
 
-# ── Step 4: Write proxy guidance into ~/.claude/CLAUDE.md inside the VM ──────
+# ── Step 4: Configure system-service proxy env via systemd drop-in ──────────
+# /etc/profile.d is only sourced for login/interactive shells; systemd services
+# (notably the Docker daemon) do not read it. A DefaultEnvironment drop-in on the
+# systemd manager makes every system service inherit the proxy in one place.
+echo "--> Writing /etc/systemd/system.conf.d/proxy.conf inside VM..."
+limactl shell "$VM_NAME" -- bash -c "
+  set -euo pipefail
+  DEST=/etc/systemd/system.conf.d/proxy.conf
+  TMP=\$(mktemp)
+  cat > \"\$TMP\" <<'EOF'
+# mitmproxy — set by setup-lima-proxy.sh
+[Manager]
+DefaultEnvironment=\"HTTP_PROXY=http://host.lima.internal:${PROXY_PORT}\" \"HTTPS_PROXY=http://host.lima.internal:${PROXY_PORT}\" \"http_proxy=http://host.lima.internal:${PROXY_PORT}\" \"https_proxy=http://host.lima.internal:${PROXY_PORT}\" \"NO_PROXY=localhost,127.0.0.1,host.lima.internal\" \"no_proxy=localhost,127.0.0.1,host.lima.internal\"
+EOF
+  if [[ -f \"\$DEST\" ]] && cmp -s \"\$TMP\" \"\$DEST\"; then
+    echo 'systemd proxy env already up to date at /etc/systemd/system.conf.d/proxy.conf — skipping.'
+    rm -f \"\$TMP\"
+  else
+    sudo mkdir -p /etc/systemd/system.conf.d
+    sudo cp \"\$TMP\" \"\$DEST\"
+    sudo chmod 644 \"\$DEST\"
+    rm -f \"\$TMP\"
+    echo 'systemd proxy env written to /etc/systemd/system.conf.d/proxy.conf; reloading systemd manager...'
+    sudo systemctl daemon-reexec
+    # Restart the daemon only if running, so it picks up the new env now.
+    # (A stopped/absent docker inherits the env on its next start.)
+    if systemctl is-active --quiet docker; then
+      echo 'Restarting docker to pick up proxy env...'
+      sudo systemctl restart docker
+    fi
+  fi
+"
+
+# ── Step 5: Write proxy guidance into ~/.claude/CLAUDE.md inside the VM ──────
 echo "--> Writing proxy guidance into ~/.claude/CLAUDE.md inside VM..."
 limactl shell "$VM_NAME" -- bash -c '
   set -euo pipefail
@@ -172,7 +205,12 @@ To verify inside the VM (open a new shell so /etc/profile.d is sourced):
   openssl s_client -connect api.anthropic.com:443 2>&1 | grep "Verify return code"
   # Expected: Verify return code: 0 (ok)
 
-Note: /etc/profile.d/proxy.sh is sourced for login/interactive shells.
-For systemd services or non-login processes, set the env vars in the unit file or
-/etc/environment instead.
+  # Confirm system services (e.g. the Docker daemon) inherited the proxy env
+  tr '\0' '\n' < /proc/\$(pgrep -x dockerd)/environ | grep -i proxy
+
+Note: proxy env is configured in two complementary places —
+  /etc/profile.d/proxy.sh            login/interactive shells
+  /etc/systemd/system.conf.d/proxy.conf  all systemd services (incl. dockerd), via DefaultEnvironment
+'systemctl show-environment' does not reflect DefaultEnvironment; check a running
+service's own environ (as above) to confirm.
 EOF
