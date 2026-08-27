@@ -159,7 +159,15 @@ GL_SEG = r"[A-Za-z0-9._-]{1,100}"          # one namespace/project path segment
 GL_IID = r"\d{1,10}"                       # issue/MR internal id
 GL_SHA = r"[0-9a-fA-F]{4,40}"
 GL_REF = r"[A-Za-z0-9._/-]{1,250}"
-GL_PATH = r"[A-Za-z0-9._/%-]{0,512}"       # repository file path; may arrive percent-encoded
+GL_PATH = rf"(?:{GL_SEG}(?:(?:/|%2[fF]){GL_SEG}){{0,20}})?"
+# repository file path: segments joined by a literal '/' or an explicitly
+# spelled-out encoded separator ('%2f'/'%2F'), never a free '%' character
+# class. A free '%' would let a segment carry an arbitrary percent-encoding
+# (including an overlong/invalid UTF-8 encoding of '.' such as %C0%AE) past
+# evaluate()'s literal-substring '%2e' traversal check -- the encoded
+# separator has to be an explicit alternative, not a consequence of '%'
+# being a free character, mirroring the npm preset's
+# `/@{NPM_NAME}%2[fF]{NPM_NAME}` rule in registries.py.
 GL_STATE = r"opened|closed|merged|all"
 GL_PER_PAGE = r"[1-9][0-9]{0,2}"
 GL_PAGE = r"[1-9][0-9]{0,3}"
