@@ -433,6 +433,39 @@ class Config:
             host = item["host"]
             if "rules" in item:
                 hosts[host] = registries.compile_host_rules(item, source="config")
+                # A hand-written entry for a host a credentialed service
+                # preset also touches replaces that preset's compiled rules
+                # entirely -- including the request_headers merge above that
+                # keeps the credential header alive through AllowlistAddon's
+                # scrubbing. Left alone, CredentialBrokerAddon (which runs
+                # after AllowlistAddon) never sees the header to swap, and
+                # the request goes upstream unauthenticated -- silently, since
+                # that looks like a normal 200, not a policy_violation or a
+                # pending approval. Re-wire it the same way, but only for
+                # service-preset-generated credentials: a hand-written
+                # `credentials:` entry on a restricted `hosts:` entry is
+                # documented (module docstring) to need its header listed by
+                # the operator, so it's deliberately not covered here.
+                preset_headers = {
+                    c.header.lower() for c in credentials
+                    if c.host == host and c.preset is not None
+                }
+                if preset_headers:
+                    hosts[host] = dataclasses.replace(
+                        hosts[host],
+                        request_headers=hosts[host].request_headers | preset_headers,
+                    )
+                    print(json.dumps({
+                        "event": "hosts_entry_rewires_credential_header",
+                        "host": host,
+                        "headers": sorted(preset_headers),
+                        "message": (
+                            f"{host}: hand-written hosts: entry replaced a "
+                            f"credentialed service preset's rules; re-added "
+                            f"{sorted(preset_headers)} to request_headers so "
+                            f"the credential still reaches upstream"
+                        ),
+                    }))
                 host_config[host] = HostConfig(
                     allow_response_cookies=item.get("allow_response_cookies", [])
                 )
