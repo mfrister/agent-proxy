@@ -20,7 +20,7 @@ class TestCatalog:
             preset = services.SERVICE_PRESETS[name]
             assert preset.hosts == hosts
             assert preset.credential is None
-            assert preset.param_host is False
+            assert preset.host_param is None
 
     def test_github_preset(self):
         preset = services.SERVICE_PRESETS["github"]
@@ -31,7 +31,9 @@ class TestCatalog:
 
     def test_gitlab_preset(self):
         preset = services.SERVICE_PRESETS["gitlab"]
-        assert preset.param_host is True
+        assert preset.host_param is not None
+        assert preset.host_param.name == "host"
+        assert preset.host_param.required is True
         assert preset.hosts == {}
         assert preset.credential.header == "PRIVATE-TOKEN"
         assert preset.credential.on_host is None

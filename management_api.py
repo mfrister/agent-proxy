@@ -189,7 +189,7 @@ def create_app(state: ProxyState) -> Flask:
             preset = services_module.SERVICE_PRESETS[name]
             item = {
                 "name": name,
-                "needs_host": preset.param_host,
+                "needs_host": preset.host_param is not None,
                 "needs_token": preset.credential is not None,
                 "hosts": sorted(preset.hosts),
             }
@@ -212,7 +212,7 @@ def create_app(state: ProxyState) -> Flask:
         preset = services_module.SERVICE_PRESETS.get(name)
         if preset is None:
             return jsonify({"ok": False, "error": f"unknown service {name!r}"}), 400
-        if host and not preset.param_host:
+        if host and not preset.host_param:
             return jsonify({"ok": False, "error": f"{name} does not take a host"}), 400
 
         data = _read_config()
@@ -225,7 +225,7 @@ def create_app(state: ProxyState) -> Flask:
             new_entry = name
         else:
             spec = preset.credential
-            if preset.param_host and not host:
+            if preset.host_param and not host:
                 return jsonify({"ok": False, "error": f"{name} requires a host"}), 400
             if not body.get("real_value"):
                 return jsonify({"ok": False, "error": "real_value is required"}), 400
