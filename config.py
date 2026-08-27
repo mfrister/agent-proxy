@@ -80,6 +80,14 @@ class HostConfig:
     # None means no restriction; a list (even empty) enables filtering
 
 
+# Structural keys on a `services:` entry that are never a preset-declared
+# ScopeFlag -- anything else on the entry must be one, so a typo'd flag name
+# (e.g. "wrtie: true") is a hard error instead of a silently-ignored no-op.
+_SERVICE_ENTRY_KEYS = frozenset({
+    "service", "host", "scope", "unrestricted", "real_value", "fake_value", "allow_host",
+})
+
+
 @dataclass(frozen=True)
 class Credential:
     host: str
@@ -221,11 +229,22 @@ class Config:
                     f"available: {sorted(services_module.SERVICE_PRESETS)}"
                 )
 
-            preset_hosts = dict(preset.hosts)
+            # host_param generalizes the old bare `param_host: bool` -- the
+            # entry supplies the key host_param names (currently always
+            # "host") and it's checked against host_param.pattern like any
+            # other ScopeParam value.
+            resolved_host = None
             if preset.host_param:
-                if not isinstance(entry.get("host"), str):
-                    raise ValueError(f"services[{i}] ({name}) requires a 'host'")
-                preset_hosts[entry["host"]] = None
+                hp = preset.host_param
+                raw_host = entry.get(hp.name)
+                if not isinstance(raw_host, str):
+                    raise ValueError(f"services[{i}] ({name}) requires a {hp.name!r}")
+                if not re.fullmatch(hp.pattern, raw_host):
+                    raise ValueError(
+                        f"services[{i}] ({name}): {hp.name!r} {raw_host!r} "
+                        f"does not match the required pattern"
+                    )
+                resolved_host = raw_host
             elif "host" in entry:
                 raise ValueError(f"services[{i}] ({name}) does not take a 'host'")
 
@@ -239,7 +258,7 @@ class Config:
                         f"unexpected key(s): {', '.join(extra)}"
                     )
             else:
-                cred_host = spec.on_host or entry["host"]
+                cred_host = spec.on_host or resolved_host
                 missing = [k for k in ("real_value", "fake_value") if not entry.get(k)]
                 if missing:
                     raise ValueError(
@@ -254,7 +273,82 @@ class Config:
                     preset=name,
                 ))
 
+            # Any entry key beyond the fixed structural ones must be a
+            # preset-declared ScopeFlag -- catches a typo'd flag (e.g.
+            # "wrtie: true") that would otherwise silently leave a service
+            # more (or less) open than the operator intended.
+            known_flags = {f.name: f for f in preset.scope_flags}
+            unknown_flags = sorted(
+                k for k in entry if k not in _SERVICE_ENTRY_KEYS and k not in known_flags
+            )
+            if unknown_flags:
+                raise ValueError(
+                    f"services[{i}] ({name}): unknown key(s) {', '.join(unknown_flags)}; "
+                    f"available flags: {sorted(known_flags)}"
+                )
+            flags = {f.name: True for f in preset.scope_flags if entry.get(f.name)}
+            for f in preset.scope_flags:
+                if flags.get(f.name) and f.unscoped:
+                    print(json.dumps({
+                        "event": "service_flag_unscoped",
+                        "service": name,
+                        "flag": f.name,
+                        "message": f"{name}: {f.name} defeats scoping ({f.description})",
+                    }))
+
+            # preset.hosts carries only static, always-on hosts (package
+            # registries; empty for github/gitlab). A preset that declares
+            # scope_params must additionally be scoped or explicitly opted
+            # out -- this is the control that closes blanket GitHub/GitLab
+            # access: no scope and no opt-out is a hard error, not a warning,
+            # because a log line among many is too easy to miss here.
+            preset_hosts = dict(preset.hosts)
+            if preset.scope_params:
+                has_scope = "scope" in entry
+                unrestricted = bool(entry.get("unrestricted", False))
+                if has_scope and unrestricted:
+                    raise ValueError(
+                        f"services[{i}] ({name}): 'scope' and 'unrestricted: true' "
+                        f"are mutually exclusive"
+                    )
+                if not has_scope and not unrestricted:
+                    raise ValueError(
+                        f"services[{i}] ({name}) must be scoped: set 'scope:' "
+                        f"(available params: {sorted(p.name for p in preset.scope_params)}) "
+                        f"or 'unrestricted: true' to explicitly opt out of scoping"
+                    )
+                if unrestricted:
+                    # The explicit, logged opt-out -- every host this entry
+                    # could otherwise touch (static preset.hosts, plus the
+                    # resolved host_param/credential host) is granted
+                    # blanket access instead of a compiled rule set.
+                    unrestricted_hosts = set(preset.hosts) | {
+                        h for h in (resolved_host, cred_host) if h is not None
+                    }
+                    for h in unrestricted_hosts:
+                        preset_hosts[h] = None
+                        print(json.dumps({
+                            "event": "service_unrestricted",
+                            "service": name,
+                            "host": h,
+                            "message": f"{name}: unrestricted access granted to {h}",
+                        }))
+                else:
+                    escaped = preset.build_scope(entry.get("scope"))
+                    spec_by_host = preset.scope_template(escaped, flags, resolved_host)
+                    for host, rule_spec in spec_by_host.items():
+                        preset_hosts[host] = registries.compile_host_rules(rule_spec, source=name)
+            elif resolved_host is not None:
+                preset_hosts[resolved_host] = None
+
             allow_cred_host = bool(entry.get("allow_host", True))
+            # Later `services` entries can overwrite an earlier one's host
+            # here (last write wins), unlike the old separate allowlist/
+            # restricted split where "unrestricted once added" always won.
+            # Harmless today -- no two shipped presets share a host, and
+            # scoping is equal-or-more-restrictive than the old default --
+            # but a future preset pair sharing a host would make entry order
+            # significant; order such entries deliberately.
             for host, rules in preset_hosts.items():
                 if rules is not None:
                     hosts[host] = rules
@@ -264,7 +358,9 @@ class Config:
 
             # A swap-mode credential on a restricted host only works if its
             # header survives that host's header scrubbing; wire it in so
-            # combined presets are correct by construction.
+            # combined presets are correct by construction. This now really
+            # fires for scoped github/gitlab entries, since their hosts are
+            # compiled HostRules instead of always None.
             cred_rules = hosts.get(cred_host)
             if spec is not None and isinstance(cred_rules, registries.HostRules):
                 hosts[cred_host] = dataclasses.replace(

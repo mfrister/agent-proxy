@@ -24,7 +24,9 @@ class TestCatalog:
 
     def test_github_preset(self):
         preset = services.SERVICE_PRESETS["github"]
-        assert preset.hosts == {"api.github.com": None}
+        # No static `hosts` entry: api.github.com is only reachable through
+        # scope_template (scoped) or the explicit `unrestricted: true` opt-out.
+        assert preset.hosts == {}
         assert preset.credential.header == "Authorization"
         assert preset.credential.on_host == "api.github.com"
         assert preset.credential.wrap("ghp_x") == "token ghp_x"
@@ -51,8 +53,12 @@ class TestCatalog:
 
 class TestExpansion:
     def test_github_credential_and_allowlist(self):
+        # Credential wiring, exercised via the explicit unrestricted opt-out
+        # -- the scoped path (the actual security property) has its own
+        # TestScopedServiceExpansion tests below.
         cfg = Config.from_data({"services": [
-            {"service": "github", "fake_value": "ghp_fake", "real_value": "ghp_real"},
+            {"service": "github", "fake_value": "ghp_fake", "real_value": "ghp_real",
+             "unrestricted": True},
         ]})
         assert cfg.credentials == [Credential(
             host="api.github.com", header="Authorization",
@@ -65,7 +71,8 @@ class TestExpansion:
     def test_gitlab_with_host(self):
         cfg = Config.from_data({"services": [
             {"service": "gitlab", "host": "gitlab.example.com",
-             "fake_value": "glpat-fake", "real_value": "glpat-real"},
+             "fake_value": "glpat-fake", "real_value": "glpat-real",
+             "unrestricted": True},
         ]})
         assert cfg.credentials == [Credential(
             host="gitlab.example.com", header="PRIVATE-TOKEN",
@@ -85,7 +92,7 @@ class TestExpansion:
     def test_allow_host_false_brokers_without_allowlisting(self):
         cfg = Config.from_data({"services": [
             {"service": "github", "fake_value": "ghp_fake",
-             "real_value": "ghp_real", "allow_host": False},
+             "real_value": "ghp_real", "allow_host": False, "unrestricted": True},
         ]})
         assert cfg.credentials[0].host == "api.github.com"
         assert "api.github.com" not in cfg.hosts
@@ -134,7 +141,7 @@ class TestExpansion:
             "secrets_file": str(secrets),
             "services": [
                 {"service": "github", "fake_value": "ghp_fake",
-                 "real_value": "${GITHUB_TOKEN}"},
+                 "real_value": "${GITHUB_TOKEN}", "unrestricted": True},
             ],
         })
         assert cfg.credentials[0].real_value == "token ghp_real"

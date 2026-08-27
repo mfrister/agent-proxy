@@ -198,6 +198,7 @@ class TestManagementAPI:
                 "  - service: github\n"
                 "    fake_value: ghp_fake\n"
                 "    real_value: ${GITHUB_TOKEN}\n"
+                "    unrestricted: true\n"
             )
 
         responses = [
@@ -258,8 +259,14 @@ class TestServicesEndpoints:
             assert yaml.safe_load(f)["services"] == ["npm"]
 
     def test_post_credential_service_writes_secret_and_ref(self, mgmt_secrets):
+        # unrestricted: true exercises the credential-write/rotate plumbing
+        # this test targets; the scoped path has its own coverage in
+        # test_config.py (this is the "management API" surface, not a
+        # second copy of the scoping security property).
         real = "REAL-SECRET-TOKEN-a3f9"
-        r = mgmt_secrets.post("/services", json={"service": "github", "real_value": real})
+        r = mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": real, "unrestricted": True,
+        })
         body = r.get_json()
         assert body["ok"] is True
 
@@ -296,6 +303,7 @@ class TestServicesEndpoints:
         assert r.status_code == 400
         r = mgmt_secrets.post("/services", json={
             "service": "gitlab", "host": "gitlab.example.com", "real_value": "x",
+            "unrestricted": True,
         })
         assert r.get_json()["ok"] is True
         assert mgmt_secrets._state.credentials[0].host == "gitlab.example.com"
@@ -337,7 +345,9 @@ class TestServicesEndpoints:
             assert f.read() == bad
 
     def test_put_rotates_secret_in_place(self, mgmt_secrets):
-        mgmt_secrets.post("/services", json={"service": "github", "real_value": "old"})
+        mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "old", "unrestricted": True,
+        })
         old_fake = mgmt_secrets._state.credentials[0].fake_value
 
         r = mgmt_secrets.put("/services", json={"service": "github", "real_value": "new"})
@@ -353,7 +363,9 @@ class TestServicesEndpoints:
         assert r.status_code == 404
 
     def test_delete_removes_entry_and_secret(self, mgmt_secrets):
-        mgmt_secrets.post("/services", json={"service": "github", "real_value": "tok"})
+        mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok", "unrestricted": True,
+        })
         r = mgmt_secrets.delete("/services", json={"service": "github"})
         assert r.get_json()["ok"] is True
         assert mgmt_secrets._state.credentials == []
@@ -364,7 +376,9 @@ class TestServicesEndpoints:
             assert yaml.safe_load(f)["services"] == []
 
     def test_delete_keeps_secret_still_referenced_elsewhere(self, mgmt_secrets):
-        mgmt_secrets.post("/services", json={"service": "github", "real_value": "tok"})
+        mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok", "unrestricted": True,
+        })
         # A hand-written credential referencing the same key must survive.
         config_path = mgmt_secrets._state.config_path
         with open(config_path) as f:
@@ -387,9 +401,11 @@ class TestServicesEndpoints:
     def test_secret_keys_deduped_per_host(self, mgmt_secrets):
         mgmt_secrets.post("/services", json={
             "service": "gitlab", "host": "a.example.com", "real_value": "ta",
+            "unrestricted": True,
         })
         mgmt_secrets.post("/services", json={
             "service": "gitlab", "host": "b.example.com", "real_value": "tb",
+            "unrestricted": True,
         })
         with open(mgmt_secrets._secrets_path) as f:
             secrets = yaml.safe_load(f)
