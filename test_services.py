@@ -409,3 +409,68 @@ class TestScopedGitLabRules:
         assert "private-token" in rules_write.request_headers
         assert "content-type" in rules_write.request_headers
         assert "content-type" not in rules_no_write.request_headers
+
+
+# ── GitLab path percent-encoding hardening ────────────────────────────────────
+#
+# GL_PATH used to be a character class with a free '%' member, so any %XX
+# sequence (not just the %2[fF] encoded separator GitLab's API actually
+# needs) rode through as an ordinary path character. GL_PATH now spells the
+# encoded separator out as an explicit `%2[fF]` alternative instead, so a
+# free-floating '%' can no longer smuggle an overlong/invalid UTF-8 encoding
+# of '.' (e.g. %C0%AE) past evaluate()'s literal '%2e' traversal check.
+
+class TestGitLabPercentEncodingHardening:
+    def test_overlong_utf8_dot_in_file_path_denied(self):
+        scope = {"projects": ["team/backend"]}
+        path = "/api/v4/projects/team%2Fbackend/repository/files/dir%C0%AEfile.py?ref=main"
+        result = _gitlab_eval(scope, {}, "GET", path)
+        assert isinstance(result, registries.Violation)
+
+    def test_bare_ordinary_percent_encoding_denied(self):
+        # %41 is a perfectly ordinary encoding of 'A' -- this proves '%' is
+        # no longer a free character in the path class, not merely that
+        # malformed encodings are caught.
+        scope = {"projects": ["team/backend"]}
+        path = "/api/v4/projects/team%2Fbackend/repository/files/%41.py?ref=main"
+        result = _gitlab_eval(scope, {}, "GET", path)
+        assert isinstance(result, registries.Violation)
+
+    def test_encoded_separator_case_variants_still_allowed(self):
+        scope = {"projects": ["team/backend"]}
+        lower = _gitlab_eval(scope, {}, "GET", "/api/v4/projects/team%2fbackend")
+        upper = _gitlab_eval(scope, {}, "GET", "/api/v4/projects/team%2Fbackend")
+        assert isinstance(lower, registries.Allowed)
+        assert isinstance(upper, registries.Allowed)
+
+    def test_nested_subgroup_project_path_still_allowed(self):
+        scope = {"projects": ["team/sub/backend"]}
+        result = _gitlab_eval(scope, {}, "GET", "/api/v4/projects/team%2Fsub%2Fbackend")
+        assert isinstance(result, registries.Allowed)
+
+    def test_group_scoped_path_still_allowed(self):
+        scope = {"groups": ["team/sandbox"]}
+        result = _gitlab_eval(scope, {}, "GET", "/api/v4/projects/team%2Fsandbox%2Fproj")
+        assert isinstance(result, registries.Allowed)
+
+    def test_deepest_legal_nesting_still_allowed(self):
+        # ScopeParam("projects", ...){1,10}) allows up to 11 segments total.
+        segs = [f"seg{i}" for i in range(11)]
+        scope = {"projects": ["/".join(segs)]}
+        path = "/api/v4/projects/" + "%2F".join(segs)
+        result = _gitlab_eval(scope, {}, "GET", path)
+        assert isinstance(result, registries.Allowed)
+
+    def test_boundary_prefix_injection_still_denied(self):
+        scope = {"groups": ["team/sandbox"]}
+        result = _gitlab_eval(
+            scope, {}, "GET", "/api/v4/projects/team%2Fsandbox-evil%2Fproj"
+        )
+        assert isinstance(result, registries.Violation)
+
+    def test_over_deep_path_still_denied(self):
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(
+            scope, {}, "GET", "/api/v4/projects/team%2Fbackend%2Fextra"
+        )
+        assert isinstance(result, registries.Violation)
