@@ -110,7 +110,10 @@ class AllowlistAddon:
             method=flow.request.method,
             path_with_query=flow.request.path,
             headers=flow.request.headers,
-            has_body=bool(flow.request.raw_content),
+            # raw_content is the buffered body mitmproxy actually forwards;
+            # the client-supplied Content-Length header can lie.
+            body_len=len(flow.request.raw_content or b""),
+            content_type=flow.request.headers.get("content-type"),
         )
 
         if isinstance(verdict, registries.Violation):
