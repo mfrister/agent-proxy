@@ -36,18 +36,43 @@ def free_port() -> int:
 
 
 class EchoHandler(BaseHTTPRequestHandler):
-    """Returns request path + headers as JSON so tests can inspect both."""
+    """Returns request path + headers (+ body, if any) as JSON so tests can
+    inspect what actually reached the upstream server.
 
-    def do_GET(self):
+    `received` records every request that reaches this handler, across every
+    fixture that uses it (the class is shared). Tests that need to prove a
+    denied request never reached upstream diff its length across the action
+    instead of asserting an absolute value, since other tests share it.
+    """
+
+    received = []
+
+    def _echo(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw_body = self.rfile.read(length) if length else b""
+        EchoHandler.received.append({"method": self.command, "path": self.path})
         body = json.dumps({
             "path": self.path,
             "headers": {k.lower(): v for k, v in self.headers.items()},
+            "body": raw_body.decode("utf-8", "replace"),
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_GET(self):
+        self._echo()
+
+    def do_POST(self):
+        self._echo()
+
+    def do_PUT(self):
+        self._echo()
+
+    def do_PATCH(self):
+        self._echo()
 
     def log_message(self, *args):
         pass
@@ -223,6 +248,21 @@ def mgmt_post(management_url: str, path: str, payload: dict):
             time.sleep(0.2)
 
 
+def mgmt_get(management_url: str, path: str):
+    """GET from the management API directly (bypassing the proxy), with the
+    same retry-until-up behaviour as mgmt_post."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(management_url + path)
+    deadline = time.time() + 10
+    while True:
+        try:
+            return opener.open(req)
+        except (urllib.error.URLError, ConnectionError):
+            if time.time() > deadline:
+                raise
+            time.sleep(0.2)
+
+
 @pytest.fixture
 def proxy_secrets(tmp_path):
     """Proxy fixture that loads real_value from a secrets_file."""
@@ -239,6 +279,91 @@ def proxy_secrets(tmp_path):
         '    real_value: "${REAL_API_KEY}"\n'
     )
     with _proxy_context(tmp_path, EchoHandler, config_text) as ctx:
+        yield ctx
+
+
+# ── Scoped service preset (github/gitlab) fixtures ──────────────────────────────
+#
+# The `github`/`gitlab` presets used to grant blanket host access; they now
+# compile an operator's `scope:` into registries.HostRules, same as any other
+# restricted host. These fixtures prove that compiled rule set is what the
+# running proxy actually enforces -- including credential brokering, which
+# depends on AllowlistAddon (header scrubbing) and CredentialBrokerAddon
+# (the swap) agreeing on which header survives.
+#
+# `gitlab` takes its host from the entry (self-hosted), so it can point at
+# our local echo server and prove both the deny and the pass paths. `github`
+# is hardcoded to api.github.com, which this sandbox cannot and should not
+# dial out to -- its fixture is used only for assertions that must be denied
+# before any upstream connection is attempted.
+
+GITLAB_SCOPE_CONFIG = (
+    "services:\n"
+    "  - service: gitlab\n"
+    "    host: 127.0.0.1\n"
+    "    scope:\n"
+    "      projects: [acme/webapp]\n"
+    "    write: true\n"
+    "    real_value: real-glpat-secret\n"
+    "    fake_value: glpat-fake-token\n"
+)
+
+GITLAB_SCOPE_READONLY_CONFIG = (
+    "services:\n"
+    "  - service: gitlab\n"
+    "    host: 127.0.0.1\n"
+    "    scope:\n"
+    "      projects: [acme/webapp]\n"
+    "    real_value: real-glpat-secret\n"
+    "    fake_value: glpat-fake-token\n"
+)
+
+GITHUB_SCOPE_CONFIG = (
+    "services:\n"
+    "  - service: github\n"
+    "    scope:\n"
+    "      repos: [acme/webapp]\n"
+    "    real_value: real-ghp-secret\n"
+    "    fake_value: ghp_fake0000000000000000000000000000\n"
+)
+
+
+@pytest.fixture(scope="module")
+def proxy_gitlab_scoped(tmp_path_factory):
+    """Real mitmdump enforcing a scoped `gitlab` service preset, `write: true`."""
+    with _proxy_context(
+        tmp_path_factory.mktemp("functional_gitlab_scoped"),
+        EchoHandler,
+        GITLAB_SCOPE_CONFIG,
+    ) as ctx:
+        yield ctx
+
+
+@pytest.fixture(scope="module")
+def proxy_gitlab_scoped_readonly(tmp_path_factory):
+    """Same scope as proxy_gitlab_scoped, without `write:` -- proves the flag
+    actually gates the write rules rather than them being on by default."""
+    with _proxy_context(
+        tmp_path_factory.mktemp("functional_gitlab_readonly"),
+        EchoHandler,
+        GITLAB_SCOPE_READONLY_CONFIG,
+    ) as ctx:
+        yield ctx
+
+
+@pytest.fixture(scope="module")
+def proxy_github_scoped(tmp_path_factory):
+    """Real mitmdump enforcing a scoped `github` service preset (no `graphql:`).
+
+    api.github.com is unreachable (and shouldn't be dialed) from this
+    sandbox, so this fixture only backs assertions that are denied before any
+    upstream connection would be attempted.
+    """
+    with _proxy_context(
+        tmp_path_factory.mktemp("functional_github_scoped"),
+        EchoHandler,
+        GITHUB_SCOPE_CONFIG,
+    ) as ctx:
         yield ctx
 
 
@@ -345,3 +470,103 @@ def test_temp_allow_lifts_restrictions(proxy_restricted_fn):
 
     resp = proxy_restricted_fn["opener"].open(url)
     assert json.loads(resp.read())["path"] == "/pkg/foo?data=secret"
+
+
+# ── Scoped service preset tests (real mitmdump enforcing github/gitlab scoping) ─
+#
+# The service preset compiles an operator's scope into the same registries
+# rule engine exercised above; these confirm that compiled result is what a
+# real mitmdump process enforces, for the specific shapes the scoping feature
+# introduced: an in-scope repo/project path, an out-of-scope one, a
+# write-gated POST with a body, and the always-deny-by-default `/graphql`.
+
+def test_scoped_in_scope_path_passes(proxy_gitlab_scoped):
+    resp = proxy_gitlab_scoped["opener"].open(
+        proxy_gitlab_scoped["server_url"] + "/api/v4/projects/acme%2Fwebapp/issues")
+    data = json.loads(resp.read())
+    assert data["path"] == "/api/v4/projects/acme%2Fwebapp/issues"
+
+
+def test_scoped_out_of_scope_path_403(proxy_gitlab_scoped):
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        proxy_gitlab_scoped["opener"].open(
+            proxy_gitlab_scoped["server_url"] + "/api/v4/projects/other%2Fproject/issues")
+    assert exc.value.code == 403
+    assert b"policy violation" in exc.value.read()
+
+    denied = json.loads(mgmt_get(proxy_gitlab_scoped["management_url"], "/denied").read())
+    assert denied[-1]["type"] == "policy_violation"
+
+
+def test_scoped_write_post_passes(proxy_gitlab_scoped):
+    req = urllib.request.Request(
+        proxy_gitlab_scoped["server_url"] + "/api/v4/projects/acme%2Fwebapp/issues",
+        data=b'{"title": "bug"}',
+        headers={"Content-Type": "application/json"},
+    )
+    data = json.loads(proxy_gitlab_scoped["opener"].open(req).read())
+    assert data["body"] == '{"title": "bug"}'
+
+
+def test_scoped_write_post_without_write_flag_403(proxy_gitlab_scoped_readonly):
+    req = urllib.request.Request(
+        proxy_gitlab_scoped_readonly["server_url"] + "/api/v4/projects/acme%2Fwebapp/issues",
+        data=b'{"title": "bug"}',
+        headers={"Content-Type": "application/json"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        proxy_gitlab_scoped_readonly["opener"].open(req)
+    assert exc.value.code == 403
+    assert b"policy violation" in exc.value.read()
+
+
+def test_scoped_graphql_blocked_without_flag(proxy_github_scoped):
+    req = urllib.request.Request(
+        "http://api.github.com/graphql",
+        data=b'{"query": "{ viewer { login } }"}',
+        headers={"Content-Type": "application/json"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        proxy_github_scoped["opener"].open(req)
+    assert exc.value.code == 403
+    assert b"policy violation" in exc.value.read()
+
+
+# ── Credential brokering under scoping (the subtle failure mode) ───────────────
+#
+# AllowlistAddon scrubs request headers not on a host's request_headers
+# *before* CredentialBrokerAddon runs. If a scoped rule set's
+# scope_template forgot to list its own credential header there (e.g.
+# `private-token` for gitlab, `authorization` for github), the swap would
+# never fire and every request would go upstream silently unauthenticated --
+# a unit test stubbing either addon in isolation cannot catch that. These
+# run both addons for real, back to back, through a real mitmdump.
+
+def test_scoped_credential_reaches_upstream_on_in_scope_request(proxy_gitlab_scoped):
+    """The fake token the client sends is swapped for the real one, and the
+    real one is what the upstream server actually receives."""
+    req = urllib.request.Request(
+        proxy_gitlab_scoped["server_url"] + "/api/v4/projects/acme%2Fwebapp/issues",
+        headers={"PRIVATE-TOKEN": "glpat-fake-token"},
+    )
+    data = json.loads(proxy_gitlab_scoped["opener"].open(req).read())
+    assert data["headers"].get("private-token") == "real-glpat-secret"
+
+
+def test_scoped_credential_never_reaches_upstream_on_denied_request(proxy_gitlab_scoped):
+    """A request denied by policy must be stopped before CredentialBrokerAddon
+    ever runs -- the real token must never reach upstream. EchoHandler.received
+    is shared with other tests/fixtures, so this asserts on the delta across
+    just this request rather than an absolute count."""
+    before = len(EchoHandler.received)
+    req = urllib.request.Request(
+        proxy_gitlab_scoped["server_url"] + "/api/v4/projects/other%2Fproject/issues",
+        headers={"PRIVATE-TOKEN": "glpat-fake-token"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        proxy_gitlab_scoped["opener"].open(req)
+    assert exc.value.code == 403
+    # The upstream echo server never saw this request at all -- the real
+    # token (which only CredentialBrokerAddon, downstream of the deny, knows)
+    # had no channel to leak through.
+    assert len(EchoHandler.received) == before
