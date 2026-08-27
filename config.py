@@ -98,20 +98,48 @@ class Credential:
                                    # (informational, like HostRules.source)
 
 
-def _expand_secrets(obj, secrets: dict):
-    """Recursively expand ${KEY} references in string values using the secrets map."""
-    if isinstance(obj, str):
-        def replace(m):
-            key = m.group(1)
-            if key not in secrets:
-                raise KeyError(f"Secret key not found in secrets_file: ${{{key}}}")
-            return str(secrets[key])
-        return re.sub(r'\$\{([^}]+)\}', replace, obj)
-    if isinstance(obj, dict):
-        return {k: _expand_secrets(v, secrets) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_expand_secrets(item, secrets) for item in obj]
-    return obj
+def _expand_secret_string(value: str, secrets: dict) -> str:
+    """Expand ${KEY} references in a single string value using the secrets map."""
+    def replace(m):
+        key = m.group(1)
+        if key not in secrets:
+            raise KeyError(f"Secret key not found in secrets_file: ${{{key}}}")
+        return str(secrets[key])
+    return re.sub(r'\$\{([^}]+)\}', replace, value)
+
+
+def _expand_secret_fields(data: dict, secrets: dict) -> dict:
+    """Expand ${KEY} references, but only in the fields documented to carry
+    them: `real_value`/`fake_value` on `credentials[]` and `services[]`
+    entries (see the module docstring and docs/service-presets.md -- these
+    are the only documented uses of ${KEY}).
+
+    Deliberately *not* a recursive whole-document expansion: every other
+    field (host, scope values, ...) is validated against a pattern after
+    this step, and a validation failure echoes the offending value back in
+    its ValueError message. Expanding those fields too would let a
+    `${KEY}` placed somewhere other than real_value/fake_value (e.g.
+    `services[].host` or a `scope:` value) turn a routine pattern-mismatch
+    error into a verbatim secret leak, in an HTTP response body (the
+    management API surfaces ValueError text to the operator) or on stdout
+    (Config.load's startup/SIGHUP path). Restricting expansion to the two
+    fields that actually need it closes that channel at the root, rather
+    than trying to scrub secrets out of error messages after the fact.
+    """
+    def expand_entry(entry):
+        if not isinstance(entry, dict):
+            return entry
+        new_entry = dict(entry)
+        for key in ("real_value", "fake_value"):
+            if isinstance(new_entry.get(key), str):
+                new_entry[key] = _expand_secret_string(new_entry[key], secrets)
+        return new_entry
+
+    new_data = dict(data)
+    for section in ("credentials", "services"):
+        if isinstance(new_data.get(section), list):
+            new_data[section] = [expand_entry(e) for e in new_data[section]]
+    return new_data
 
 
 def _host_entries(data: dict, section: str = "hosts") -> list:
@@ -173,7 +201,7 @@ class Config:
         if secrets_path:
             with open(secrets_path) as f:
                 secrets = yaml.safe_load(f) or {}
-        data = _expand_secrets(data, secrets)
+        data = _expand_secret_fields(data, secrets)
 
         if "allowed_registries" in data:
             raise ValueError(

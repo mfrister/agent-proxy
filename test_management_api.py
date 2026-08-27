@@ -215,8 +215,21 @@ class TestManagementAPI:
             preset="github",
         )]
 
+        # A second secret shaped so it fails the gitlab `host` pattern
+        # (a slash isn't a legal hostname character) and one that fails the
+        # github `scope.repos` pattern (an "owner/repo" value with no '/') --
+        # both exercise Finding 1's channel: ${KEY} used somewhere other
+        # than real_value/fake_value, expanded before the pattern check that
+        # then rejects it, echoing the secret into the ValueError.
+        bad_host_secret = "AKIA-other-secret/with-a-slash"
+        bad_scope_secret = "AKIA-yet-another-secret-no-slash"
+
         secrets = tmp_path / "secrets.yaml"
-        secrets.write_text(f"GITHUB_TOKEN: {real_token}\n")
+        secrets.write_text(
+            f"GITHUB_TOKEN: {real_token}\n"
+            f"BAD_HOST_SECRET: {bad_host_secret}\n"
+            f"BAD_SCOPE_SECRET: {bad_scope_secret}\n"
+        )
         with open(state.config_path, "w") as f:
             f.write(
                 f"secrets_file: {secrets}\n"
@@ -233,9 +246,23 @@ class TestManagementAPI:
             mgmt.get("/allowlist"),
             mgmt.post("/allow/temp", json={"host": "temp.com"}),
             mgmt.post("/allow/permanent", json={"host": "new.com"}),
+            # Finding 1/4: these used to fail config validation with a
+            # ValueError carrying the expanded secret verbatim, surfaced
+            # straight into the HTTP error response.
+            mgmt.post("/services", json={
+                "service": "gitlab", "host": "${BAD_HOST_SECRET}",
+                "unrestricted": True, "real_value": "tok",
+            }),
+            mgmt.post("/services", json={
+                "service": "github", "real_value": "tok",
+                "scope": {"repos": ["${BAD_SCOPE_SECRET}"]},
+            }),
         ]
         for r in responses:
-            assert real_token not in r.get_data(as_text=True)
+            body = r.get_data(as_text=True)
+            assert real_token not in body
+            assert bad_host_secret not in body
+            assert bad_scope_secret not in body
 
         # The rewritten config still references the secret, not its value.
         with open(state.config_path) as f:

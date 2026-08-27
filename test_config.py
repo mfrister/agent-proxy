@@ -111,6 +111,31 @@ class TestConfigLoad:
         assert cfg.credentials[0].real_value == "value-a"
         assert cfg.credentials[1].real_value == "value-b"
 
+    def test_secret_in_host_field_not_expanded_and_not_leaked(self, tmp_path):
+        # Finding 4: ${KEY} expansion used to run over the *entire* config
+        # dict before validation, so a secret placed somewhere other than
+        # real_value/fake_value (here: a gitlab service's `host`) would be
+        # substituted in, then echoed back verbatim in the ValueError raised
+        # when host_param.pattern rejects it (a '/' isn't a legal hostname
+        # character). Expansion is now scoped to real_value/fake_value only,
+        # so the ${KEY} reference reaches validation unexpanded and the
+        # secret never appears in the error message.
+        from config import Config
+        secrets = tmp_path / "secrets.yaml"
+        secrets.write_text("AWS_SECRET_KEY: AKIA_super_secret_value/withslash\n")
+        with pytest.raises(ValueError) as exc_info:
+            Config.from_data({
+                "secrets_file": str(secrets),
+                "services": [
+                    {"service": "gitlab", "host": "${AWS_SECRET_KEY}",
+                     "unrestricted": True, "fake_value": "glpat-fake",
+                     "real_value": "glpat-real"},
+                ],
+            })
+        message = str(exc_info.value)
+        assert "AKIA_super_secret_value" not in message
+        assert "${AWS_SECRET_KEY}" in message
+
     def test_credentials_from_config(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
@@ -465,6 +490,32 @@ class TestScopedServiceExpansion:
         )
         assert isinstance(literal, registries.Allowed)
         assert isinstance(wildcarded, registries.Violation)
+
+    def test_secret_in_scope_value_not_expanded_and_not_leaked(self, tmp_path):
+        # Finding 1: a ${KEY} reference placed in a `scope:` value (instead
+        # of real_value/fake_value, its only documented use) used to be
+        # expanded to the real secret by the old whole-document
+        # _expand_secrets before the scope pattern check ran, so the
+        # resulting "does not match the required pattern" ValueError carried
+        # the secret verbatim -- and management_api.py returns ValueError
+        # text straight to the HTTP caller. Expansion is now scoped to
+        # real_value/fake_value only, so the raw, unexpanded ${KEY} text
+        # reaches build_scope's pattern check and the secret never appears
+        # in the error.
+        from config import Config
+        secrets = tmp_path / "secrets.yaml"
+        secrets.write_text("AWS_SECRET_KEY: AKIA-super-secret-other-service-key\n")
+        with pytest.raises(ValueError) as exc_info:
+            Config.from_data({
+                "secrets_file": str(secrets),
+                "services": [
+                    {"service": "github", "scope": {"repos": ["${AWS_SECRET_KEY}"]},
+                     **GITHUB_CRED},
+                ],
+            })
+        message = str(exc_info.value)
+        assert "AKIA-super-secret-other-service-key" not in message
+        assert "${AWS_SECRET_KEY}" in message
 
     def test_hosts_entry_restricts_host_preset_left_unrestricted(self):
         # The reverse (and security-relevant) direction of
