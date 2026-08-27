@@ -222,7 +222,7 @@ class Config:
                 )
 
             preset_hosts = dict(preset.hosts)
-            if preset.param_host:
+            if preset.host_param:
                 if not isinstance(entry.get("host"), str):
                     raise ValueError(f"services[{i}] ({name}) requires a 'host'")
                 preset_hosts[entry["host"]] = None
