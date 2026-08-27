@@ -8,6 +8,7 @@ import json
 
 import pytest
 
+import registries
 from config import Credential
 from conftest import make_state
 
@@ -326,3 +327,164 @@ class TestLoadHosts:
         result = Config.load(str(config)).host_config
         assert result["registry.npmjs.org"].allow_response_cookies == []
         assert result["artifacts.example.com"].allow_response_cookies == ["csrftoken"]
+
+
+# ── Scoped service expansion (github/gitlab: scope, unrestricted, flags) ───────
+#
+# This is the security property step 5 exists to close: a scopable service
+# preset (scope_params non-empty) must be scoped or explicitly opted out, and
+# the compiled rules must actually restrict the rule engine, not just the
+# ServicePreset descriptor (that's test_services.py's job).
+
+GITHUB_CRED = {"fake_value": "ghp_fake", "real_value": "ghp_real"}
+
+
+class TestScopedServiceExpansion:
+    def test_scoped_entry_compiles_host_rules(self):
+        from config import Config
+        cfg = Config.from_data({"services": [
+            {"service": "github", "scope": {"repos": ["myorg/myrepo"]}, **GITHUB_CRED},
+        ]})
+        rules = cfg.hosts["api.github.com"]
+        assert isinstance(rules, registries.HostRules)
+        assert rules.source == "github"
+
+    def test_missing_scope_and_no_opt_out_raises(self):
+        from config import Config
+        with pytest.raises(ValueError, match=r"github.*repos.*orgs|github.*orgs.*repos"):
+            Config.from_data({"services": [
+                {"service": "github", **GITHUB_CRED},
+            ]})
+
+    def test_scope_and_unrestricted_together_raises(self):
+        from config import Config
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            Config.from_data({"services": [
+                {"service": "github", "scope": {"repos": ["myorg/myrepo"]},
+                 "unrestricted": True, **GITHUB_CRED},
+            ]})
+
+    def test_unrestricted_true_logs_and_grants(self, capsys):
+        from config import Config
+        cfg = Config.from_data({"services": [
+            {"service": "github", "unrestricted": True, **GITHUB_CRED},
+        ]})
+        assert cfg.hosts["api.github.com"] is None
+        events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        [event] = [e for e in events if e["event"] == "service_unrestricted"]
+        assert event["service"] == "github"
+        assert event["host"] == "api.github.com"
+
+    def test_unknown_flag_key_raises(self):
+        from config import Config
+        with pytest.raises(ValueError, match="wrtie"):
+            Config.from_data({"services": [
+                {"service": "github", "scope": {"repos": ["myorg/myrepo"]},
+                 "wrtie": True, **GITHUB_CRED},
+            ]})
+
+    def test_unscoped_flag_emits_warning(self, capsys):
+        from config import Config
+        Config.from_data({"services": [
+            {"service": "github", "scope": {"repos": ["myorg/myrepo"]},
+             "graphql": True, **GITHUB_CRED},
+        ]})
+        events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        [event] = [e for e in events if e["event"] == "service_flag_unscoped"]
+        assert event["service"] == "github"
+        assert event["flag"] == "graphql"
+
+    def test_declared_scoped_flag_does_not_warn(self, capsys):
+        # "write" is a declared flag but not unscoped=True -- no warning.
+        from config import Config
+        Config.from_data({"services": [
+            {"service": "github", "scope": {"repos": ["myorg/myrepo"]},
+             "write": True, **GITHUB_CRED},
+        ]})
+        events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        assert not [e for e in events if e["event"] == "service_flag_unscoped"]
+
+    def test_malformed_host_raises(self):
+        # host_param.pattern is enforced now that the host flows into a
+        # compiled HostRules key and the credential-broker host, not just
+        # stashed unvalidated in an isinstance(str) check.
+        from config import Config
+        for bad_host in ("gitlab.example.com/evil", "gitlab example.com",
+                          "gitlab.example.com\nX-Injected: 1"):
+            with pytest.raises(ValueError, match="gitlab"):
+                Config.from_data({"services": [
+                    {"service": "gitlab", "host": bad_host,
+                     "scope": {"projects": ["team/backend"]},
+                     "fake_value": "glpat-fake", "real_value": "glpat-real"},
+                ]})
+
+    def test_scoped_github_allows_in_scope_denies_out_of_scope(self):
+        from config import Config
+        cfg = Config.from_data({"services": [
+            {"service": "github", "scope": {"repos": ["myorg/myrepo"]}, **GITHUB_CRED},
+        ]})
+        rules = cfg.hosts["api.github.com"]
+        allowed = registries.evaluate(
+            rules, method="GET", path_with_query="/repos/myorg/myrepo",
+            headers={}, body_len=0,
+        )
+        denied = registries.evaluate(
+            rules, method="GET", path_with_query="/repos/otherorg/x",
+            headers={}, body_len=0,
+        )
+        assert isinstance(allowed, registries.Allowed)
+        assert isinstance(denied, registries.Violation)
+
+    def test_credential_header_survives_scoping(self):
+        # Without this, AllowlistAddon's header scrubbing strips Authorization
+        # before CredentialBrokerAddon ever sees the request -- a silent 401,
+        # not a policy_violation, so it's easy to miss in testing.
+        from config import Config
+        cfg = Config.from_data({"services": [
+            {"service": "github", "scope": {"repos": ["myorg/myrepo"]}, **GITHUB_CRED},
+        ]})
+        assert "authorization" in cfg.hosts["api.github.com"].request_headers
+
+    def test_scope_round_trips_regex_metacharacters_literally(self):
+        # '.' in a repo name is a legal GH_REPO character and a regex
+        # metacharacter; Config.from_data's full path (YAML -> build_scope ->
+        # scope_template -> compile_host_rules) must still treat it as
+        # literal, not just literal_alternation in isolation.
+        from config import Config
+        cfg = Config.from_data({"services": [
+            {"service": "github", "scope": {"repos": ["myorg/a.b"]}, **GITHUB_CRED},
+        ]})
+        rules = cfg.hosts["api.github.com"]
+        literal = registries.evaluate(
+            rules, method="GET", path_with_query="/repos/myorg/a.b",
+            headers={}, body_len=0,
+        )
+        wildcarded = registries.evaluate(
+            rules, method="GET", path_with_query="/repos/myorg/axb",
+            headers={}, body_len=0,
+        )
+        assert isinstance(literal, registries.Allowed)
+        assert isinstance(wildcarded, registries.Violation)
+
+    def test_hosts_entry_restricts_host_preset_left_unrestricted(self):
+        # The reverse (and security-relevant) direction of
+        # test_hosts_entry_overrides_preset_with_no_warning: a hand-written
+        # `hosts:` entry with `rules:` claws back a host a service preset
+        # left unrestricted. This is the plan's documented raw-rules escape
+        # hatch, and it did not actually work before 4ab01ae (old addon.py
+        # checked `allowlist` before `restricted`, so an unrestricted host
+        # could never be reclaimed).
+        from config import Config
+        cfg = Config.from_data({
+            "services": [
+                {"service": "github", "unrestricted": True, **GITHUB_CRED},
+            ],
+            "hosts": [
+                {"host": "api.github.com", "rules": [
+                    {"methods": ["GET"], "path": "/repos/myorg/myrepo"},
+                ]},
+            ],
+        })
+        rules = cfg.hosts["api.github.com"]
+        assert isinstance(rules, registries.HostRules)
+        assert rules.source == "config"
