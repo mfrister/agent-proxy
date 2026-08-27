@@ -18,9 +18,8 @@ class TestConfigLoad:
     def test_missing_file_empty_config_with_warning(self, tmp_path, capsys):
         from config import Config
         cfg = Config.load(str(tmp_path / "nonexistent.yaml"))
-        assert cfg.allowlist == set()
+        assert cfg.hosts == {}
         assert cfg.credentials == []
-        assert cfg.restricted == {}
         assert cfg.management_port == 8082
         event = json.loads(capsys.readouterr().out)
         assert event["event"] == "config_warning"
@@ -31,12 +30,13 @@ class TestConfigLoad:
         config = tmp_path / "config.yaml"
         config.write_text(
             "management_port: 9000\n"
-            "allowed_hosts:\n"
+            "hosts:\n"
             "  - host: example.com\n"
         )
         cfg = Config.load(str(config))
         assert cfg.management_port == 9000
-        assert "example.com" in cfg.allowlist
+        assert "example.com" in cfg.hosts
+        assert cfg.hosts["example.com"] is None
 
     def test_secrets_expanded(self, tmp_path):
         from config import Config
@@ -74,7 +74,7 @@ class TestConfigLoad:
         config = tmp_path / "config.yaml"
         config.write_text(
             "secrets_file: /nonexistent/secrets.yaml\n"
-            "allowed_hosts: []\n"
+            "hosts: []\n"
         )
         with pytest.raises(FileNotFoundError):
             Config.load(str(config))
@@ -129,7 +129,7 @@ class TestConfigLoad:
     def test_credentials_empty_when_absent(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts:\n  - host: example.com\n")
+        config.write_text("hosts:\n  - host: example.com\n")
         assert Config.load(str(config)).credentials == []
 
     def test_credential_missing_key_raises(self, tmp_path):
@@ -152,47 +152,63 @@ class TestConfigLoad:
     def test_management_port_default(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts: []\n")
+        config.write_text("hosts: []\n")
         assert Config.load(str(config)).management_port == 8082
 
     def test_null_sections_treated_as_empty(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
-            "allowed_hosts:\n"
-            "restricted_hosts:\n"
+            "hosts:\n"
             "credentials:\n"
             "services:\n"
         )
         cfg = Config.load(str(config))
-        assert cfg.allowlist == set()
-        assert cfg.restricted == {}
+        assert cfg.hosts == {}
         assert cfg.credentials == []
 
-    def test_scalar_allowed_hosts_raises(self, tmp_path):
+    def test_scalar_hosts_raises(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts: example.com\n")
-        with pytest.raises(ValueError, match="allowed_hosts"):
+        config.write_text("hosts: example.com\n")
+        with pytest.raises(ValueError, match="hosts"):
             Config.load(str(config))
 
-    def test_allowed_hosts_entry_without_host_raises(self, tmp_path):
+    def test_hosts_entry_without_host_raises(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
-            "allowed_hosts:\n"
+            "hosts:\n"
             "  - allow_response_cookies: []\n"
         )
-        with pytest.raises(ValueError, match="allowed_hosts"):
+        with pytest.raises(ValueError, match="hosts"):
+            Config.load(str(config))
+
+    def test_old_allowed_hosts_key_rejected(self, tmp_path):
+        from config import Config
+        config = tmp_path / "config.yaml"
+        config.write_text("allowed_hosts:\n  - example.com\n")
+        with pytest.raises(ValueError, match="merged into hosts"):
+            Config.load(str(config))
+
+    def test_old_restricted_hosts_key_rejected(self, tmp_path):
+        from config import Config
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "restricted_hosts:\n"
+            "  - host: artifacts.example.com\n"
+            "    rules: []\n"
+        )
+        with pytest.raises(ValueError, match="merged into hosts"):
             Config.load(str(config))
 
     def test_failed_reload_keeps_old_state(self, tmp_path):
         config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts: not-a-list\n")
-        state = make_state(allowlist={"old.com"}, config_path=str(config))
+        config.write_text("hosts: not-a-list\n")
+        state = make_state(hosts={"old.com": None}, config_path=str(config))
         with pytest.raises(ValueError):
             state.reload()
-        assert state.allowlist == {"old.com"}
+        assert state.hosts == {"old.com": None}
 
 
 # ── Happy eyeballs delay (config loading) ───────────────────────────────────────
@@ -201,7 +217,7 @@ class TestHappyEyeballsDelay:
     def test_load_delay_default(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts: []\n")
+        config.write_text("hosts: []\n")
         assert Config.load(str(config)).happy_eyeballs_delay == 0.25
 
     def test_load_delay_custom(self, tmp_path):
@@ -218,14 +234,14 @@ class TestHappyEyeballsDelay:
             assert Config.load(str(config)).happy_eyeballs_delay == 0
 
 
-# ── Config.load: restricted hosts ──────────────────────────────────────────────
+# ── Config.load: hosts (unrestricted + restricted) ─────────────────────────────
 
-class TestLoadRestrictedHosts:
+class TestLoadHosts:
     def test_preset_expansion(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text("services: [go, npm]\n")
-        result = Config.load(str(config)).restricted
+        result = Config.load(str(config)).hosts
         assert result["proxy.golang.org"].source == "go"
         assert result["sum.golang.org"].source == "go"
         assert result["registry.npmjs.org"].source == "npm"
@@ -244,31 +260,24 @@ class TestLoadRestrictedHosts:
         with pytest.raises(ValueError, match="renamed to services"):
             Config.load(str(config))
 
-    def test_bare_string_restricted_host_raises(self, tmp_path):
+    def test_host_without_rules_is_unrestricted(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
-        config.write_text("restricted_hosts:\n  - artifacts.example.com\n")
-        with pytest.raises(ValueError, match="restricted_hosts\\[0\\]"):
-            Config.load(str(config))
-
-    def test_restricted_host_missing_rules_raises(self, tmp_path):
-        from config import Config
-        config = tmp_path / "config.yaml"
-        config.write_text("restricted_hosts:\n  - host: artifacts.example.com\n")
-        with pytest.raises(ValueError, match="'rules'"):
-            Config.load(str(config))
+        config.write_text("hosts:\n  - host: artifacts.example.com\n")
+        result = Config.load(str(config)).hosts
+        assert result["artifacts.example.com"] is None
 
     def test_custom_restricted_host(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
-            "restricted_hosts:\n"
+            "hosts:\n"
             "  - host: artifacts.example.com\n"
             "    rules:\n"
             "      - methods: [GET]\n"
             "        path: \"/repo/[a-z]{1,10}\"\n"
         )
-        result = Config.load(str(config)).restricted
+        result = Config.load(str(config)).hosts
         assert result["artifacts.example.com"].source == "config"
 
     def test_custom_entry_replaces_preset(self, tmp_path):
@@ -276,35 +285,38 @@ class TestLoadRestrictedHosts:
         config = tmp_path / "config.yaml"
         config.write_text(
             "services: [npm]\n"
-            "restricted_hosts:\n"
+            "hosts:\n"
             "  - host: registry.npmjs.org\n"
             "    rules:\n"
             "      - methods: [GET]\n"
             "        path: \"/only-this\"\n"
         )
-        result = Config.load(str(config)).restricted
+        result = Config.load(str(config)).hosts
         assert result["registry.npmjs.org"].source == "config"
         assert len(result["registry.npmjs.org"].rules) == 1
 
-    def test_overlap_with_allowlist_warns(self, tmp_path, capsys):
+    def test_hosts_entry_overrides_preset_with_no_warning(self, tmp_path, capsys):
+        # A hand-written `hosts:` entry for a host a service preset also
+        # restricts replaces the preset's rules entirely (unrestricted, here)
+        # -- and since one dict entry per host makes the old both-sections
+        # overlap state unconstructible, no config_warning is emitted either.
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
             "services: [npm]\n"
-            "allowed_hosts:\n"
-            "  - host: registry.npmjs.org\n"
+            "hosts:\n"
+            "  - registry.npmjs.org\n"
         )
-        Config.load(str(config))
-        event = json.loads(capsys.readouterr().out)
-        assert event["event"] == "config_warning"
-        assert "registry.npmjs.org" in event["message"]
+        cfg = Config.load(str(config))
+        assert cfg.hosts["registry.npmjs.org"] is None
+        assert capsys.readouterr().out == ""
 
     def test_host_config_strips_cookies_for_restricted(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
             "services: [npm]\n"
-            "restricted_hosts:\n"
+            "hosts:\n"
             "  - host: artifacts.example.com\n"
             "    rules:\n"
             "      - methods: [GET]\n"

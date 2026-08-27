@@ -57,8 +57,8 @@ class TestExpansion:
             fake_value="token ghp_fake", real_value="token ghp_real",
             preset="github",
         )]
-        assert "api.github.com" in cfg.allowlist
-        assert cfg.restricted == {}
+        assert "api.github.com" in cfg.hosts
+        assert cfg.hosts["api.github.com"] is None
 
     def test_gitlab_with_host(self):
         cfg = Config.from_data({"services": [
@@ -70,13 +70,14 @@ class TestExpansion:
             fake_value="glpat-fake", real_value="glpat-real",
             preset="gitlab",
         )]
-        assert "gitlab.example.com" in cfg.allowlist
+        assert "gitlab.example.com" in cfg.hosts
+        assert cfg.hosts["gitlab.example.com"] is None
 
     def test_registry_service_bare_string(self):
         cfg = Config.from_data({"services": ["npm"]})
-        assert cfg.restricted["registry.npmjs.org"].source == "npm"
+        assert cfg.hosts["registry.npmjs.org"].source == "npm"
         assert cfg.credentials == []
-        assert cfg.allowlist == set()
+        assert not any(v is None for v in cfg.hosts.values())
         assert cfg.host_config["registry.npmjs.org"].allow_response_cookies == []
 
     def test_allow_host_false_brokers_without_allowlisting(self):
@@ -85,7 +86,7 @@ class TestExpansion:
              "real_value": "ghp_real", "allow_host": False},
         ]})
         assert cfg.credentials[0].host == "api.github.com"
-        assert "api.github.com" not in cfg.allowlist
+        assert "api.github.com" not in cfg.hosts
 
     def test_gitlab_without_host_raises(self):
         with pytest.raises(ValueError, match="requires a 'host'"):
@@ -152,7 +153,7 @@ class TestExpansion:
             cfg = Config.from_data({"services": [
                 {"service": "npm-auth", "fake_value": "f", "real_value": "r"},
             ]})
-        rules = cfg.restricted["registry.npmjs.org"]
+        rules = cfg.hosts["registry.npmjs.org"]
         assert "authorization" in rules.request_headers
         # The catalog's own npm preset is untouched (frozen dataclass replaced,
         # not mutated).

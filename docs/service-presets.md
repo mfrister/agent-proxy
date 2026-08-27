@@ -25,8 +25,9 @@ services:
 ```
 
 Presets are descriptors (`services.py`), expanded at config load into the
-proxy's existing primitives — the host allowlist, restricted-host rule sets,
-and credential broker entries. The two enforcement engines stay separate.
+proxy's existing primitives — the unified `hosts:` policy (unrestricted or
+rule-restricted) and credential broker entries. The two enforcement engines
+stay separate.
 
 # Registry presets: restricted read-only access to package registries
 
@@ -106,10 +107,11 @@ content, and compromise of a registry itself.
 
 Request evaluation order in the proxy:
 
-1. Host in `allowed_hosts` → unrestricted pass (the operator's explicit broader
-   grant, and the escape hatch when a preset pattern is too tight). A host that
-   appears in both `allowed_hosts` and a restricted rule set triggers a
-   `config_warning` log event at load time.
+1. Host has an unrestricted `hosts:` entry (no `rules:`) → unrestricted pass
+   (the operator's explicit broader grant, and the escape hatch when a preset
+   pattern is too tight). One entry per host in `hosts:` means a host can't
+   be both unrestricted and restricted at once — there's nothing to warn
+   about, since the overlapping state can't be constructed.
 2. Host has an active temporary allow (TUI/management API) → unrestricted pass.
    Temp-allowing a restricted host deliberately lifts all its restrictions —
    the operator action you want when a pattern blocks a legitimate workflow.
@@ -125,7 +127,7 @@ Allowed registry requests are logged with a `registry: <preset>` field.
 
 Response side: restricted hosts strip all `Set-Cookie` headers by default
 (registries don't need cookies; they are a session/tracking channel into the
-sandbox). Custom `restricted_hosts` entries can override this with
+sandbox). A custom `hosts:` entry with `rules:` can override this with
 `allow_response_cookies`.
 
 ### Base request-header allowlist
@@ -165,15 +167,16 @@ audit trail for policy changes.
   (injection happens after scrubbing).
 - If a preset pattern turns out too tight for a legitimate workflow, the
   violation shows up in the TUI; temp-allowing the host is the immediate
-  escape hatch, and a custom `restricted_hosts` entry (which replaces the
-  preset's rules for that host) is the durable fix.
+  escape hatch, and a custom `hosts:` entry (which replaces the preset's
+  rules for that host) is the durable fix.
 
 ## Custom restricted hosts
 
-The same engine is available for your own hosts:
+The same engine is available for your own hosts, as a `hosts:` entry with a
+`rules:` list:
 
 ```yaml
-restricted_hosts:
+hosts:
   - host: artifacts.internal.example.com
     rules:
       - methods: [GET, HEAD]
