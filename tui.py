@@ -255,6 +255,7 @@ class ServicesScreen(Screen):
         Binding("escape,q", "back", "Back"),
         Binding("a", "add_service", "Add"),
         Binding("o", "rotate_token", "Rotate token"),
+        Binding("e", "edit_scope", "Edit scope"),
         Binding("x", "remove_service", "Remove"),
         Binding("r", "refresh", "Refresh", show=False),
         Binding("k", "cursor_up", "Up", show=False),
@@ -265,14 +266,18 @@ class ServicesScreen(Screen):
         super().__init__()
         self.base_url = base_url
         self._rows: list[dict] = []
+        # name -> /services/available catalog item; loaded once (presets are
+        # static for the lifetime of the process) and used to render the
+        # Scope column and drive the add/edit prompts.
+        self._catalog: dict[str, dict] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical(id="services-pane"):
             yield DataTable(id="services-table", cursor_type="row", zebra_stripes=True)
         yield Static(
-            "[dim]a[/dim]=add  [dim]o[/dim]=rotate token  [dim]x[/dim]=remove  "
-            "[dim]r[/dim]=refresh  [dim]esc[/dim]=back",
+            "[dim]a[/dim]=add  [dim]o[/dim]=rotate token  [dim]e[/dim]=edit scope  "
+            "[dim]x[/dim]=remove  [dim]r[/dim]=refresh  [dim]esc[/dim]=back",
             id="services-hint",
         )
         yield Footer()
@@ -281,11 +286,48 @@ class ServicesScreen(Screen):
         pane = self.query_one("#services-pane", Vertical)
         pane.border_title = "SERVICES"
         table = self.query_one("#services-table", DataTable)
-        table.add_columns("Service", "Host", "Kind", "Header", "Fake token")
+        table.add_columns("Service", "Host", "Kind", "Header", "Fake token", "Scope")
         table.focus()
         self.run_worker(self._refresh())
 
+    def _scope_cell(self, row: dict) -> Text | str:
+        """Render a row's Scope column: named scope + flags, with any
+        `unscoped` flag highlighted so the blanket-access choice stays
+        visible in the table, not just at the moment it was made."""
+        if row.get("unrestricted"):
+            return Text("UNRESTRICTED", style="bold red")
+        preset = self._catalog.get(row["service"], {})
+        scope_params = preset.get("scope_params") or []
+        scope_flags = preset.get("scope_flags") or []
+        if not scope_params:
+            return ""
+
+        text = Text()
+        scope = row.get("scope") or {}
+        for param in scope_params:
+            values = scope.get(param["name"])
+            if not values:
+                continue
+            if isinstance(values, list):
+                values = ",".join(values)
+            if text.plain:
+                text.append("  ")
+            text.append(f"{param['name']}={values}")
+        for flag in scope_flags:
+            if not row.get(flag["name"]):
+                continue
+            if text.plain:
+                text.append("  ")
+            text.append(flag["name"], style="bold red" if flag["unscoped"] else None)
+        return text if text.plain else Text("—", style="dim")
+
     async def _refresh(self) -> None:
+        if not self._catalog:
+            try:
+                catalog = await _api_request(self.base_url, "GET", "/services/available")
+                self._catalog = {item["name"]: item for item in catalog}
+            except Exception:
+                pass  # table still renders; Scope column just loses highlighting
         try:
             self._rows = await _api_request(self.base_url, "GET", "/services")
         except Exception as exc:
@@ -301,6 +343,7 @@ class ServicesScreen(Screen):
                 row["kind"],
                 row.get("header", ""),
                 row.get("fake_value", ""),
+                self._scope_cell(row),
                 key=f"{row['service']}:{row.get('host', '')}",
             )
         if current_row < len(self._rows):
@@ -330,6 +373,60 @@ class ServicesScreen(Screen):
     async def action_refresh(self) -> None:
         await self._refresh()
 
+    async def _prompt_scope(self, name: str, scope_params: list[dict]) -> dict:
+        """One TextPromptScreen per scope param; comma-separated for list
+        params. A blank answer skips that param (no key in the result)."""
+        scope: dict = {}
+        for param in scope_params:
+            prompt = f"{name} scope: {param['name']}"
+            if param["list"]:
+                prompt += " (comma-separated)"
+            raw = await self.app.push_screen_wait(TextPromptScreen(f"{prompt}:"))
+            if not raw:
+                continue
+            if param["list"]:
+                values = [v.strip() for v in raw.split(",") if v.strip()]
+                if values:
+                    scope[param["name"]] = values
+            else:
+                scope[param["name"]] = raw.strip()
+        return scope
+
+    async def _prompt_scope_or_unrestricted(self, name: str, scope_params: list[dict]) -> dict | None:
+        """Prompt every scope param; if the operator leaves all of them
+        blank, spell out the consequence in plain language before granting
+        blanket access. Returns {"scope": {...}} or {"unrestricted": True},
+        or None if the operator declined unrestricted access (caller should
+        abort -- this is the one place that blanket-access decision is made
+        by a human, so there is no silent fallback).
+        """
+        scope = await self._prompt_scope(name, scope_params)
+        if scope:
+            return {"scope": scope}
+        confirmed = await self.app.push_screen_wait(ConfirmScreen(
+            f"No scope given for {name}.\n\n"
+            f"[bold red]Without a scope, {name} will be able to reach "
+            f"EVERYTHING the token can reach[/bold red] -- every repo, org, "
+            "or project it's valid for, not just the ones you name here.\n\n"
+            f"Grant {name} unrestricted access anyway?"
+        ))
+        return {"unrestricted": True} if confirmed else None
+
+    async def _prompt_flags(self, name: str, scope_flags: list[dict]) -> dict:
+        """One ConfirmScreen per declared flag. Always records True/False
+        explicitly (not just True on yes) so an edit can turn a flag back
+        off, not only on."""
+        flags: dict = {}
+        for flag in scope_flags:
+            question = f"Enable {flag['name']} for {name}?\n\n{flag['description']}"
+            if flag["unscoped"]:
+                question += (
+                    "\n\n[bold red]This defeats scoping[/bold red] -- it lets "
+                    f"{name} reach beyond the scope named above."
+                )
+            flags[flag["name"]] = await self.app.push_screen_wait(ConfirmScreen(question))
+        return flags
+
     @work
     async def action_add_service(self) -> None:
         try:
@@ -341,7 +438,7 @@ class ServicesScreen(Screen):
         if item is None:
             return
         body = {"service": item["name"]}
-        if item["needs_host"]:
+        if item["host_param"]:
             host = await self.app.push_screen_wait(TextPromptScreen(
                 f"Host for {item['name']} (e.g. gitlab.example.com):"
             ))
@@ -357,6 +454,14 @@ class ServicesScreen(Screen):
             if not token:
                 return
             body["real_value"] = token
+        if item["scope_params"]:
+            scoping = await self._prompt_scope_or_unrestricted(item["name"], item["scope_params"])
+            if scoping is None:
+                self.notify(f"Add cancelled — {item['name']} needs a scope", severity="warning")
+                return
+            body.update(scoping)
+        if item["scope_flags"]:
+            body.update(await self._prompt_flags(item["name"], item["scope_flags"]))
         try:
             result = await _api_request(self.base_url, "POST", "/services", body)
         except Exception as exc:
@@ -371,6 +476,32 @@ class ServicesScreen(Screen):
             )
         else:
             self.notify(f"Added {item['name']}")
+        await self._refresh()
+
+    @work
+    async def action_edit_scope(self) -> None:
+        row = self._selected()
+        if row is None:
+            return
+        preset = self._catalog.get(row["service"])
+        if not preset or not preset["scope_params"]:
+            self.notify(f"{row['service']} has no scope to edit", severity="warning")
+            return
+        scoping = await self._prompt_scope_or_unrestricted(row["service"], preset["scope_params"])
+        if scoping is None:
+            self.notify("Scope edit cancelled — no scope given", severity="warning")
+            return
+        body = {**self._identity(row), **scoping}
+        if preset["scope_flags"]:
+            body.update(await self._prompt_flags(row["service"], preset["scope_flags"]))
+        try:
+            # Extended PUT /services: scope/flags only, never real_value --
+            # editing scope must not touch the brokered token.
+            await _api_request(self.base_url, "PUT", "/services", body)
+        except Exception as exc:
+            self.notify(f"Error: {exc}", severity="error", timeout=8)
+            return
+        self.notify(f"Updated scope for {row['service']}")
         await self._refresh()
 
     @work
