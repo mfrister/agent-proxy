@@ -45,19 +45,51 @@ hosts:
 # allowlists — while blocking everything else with a 403.
 # Registry presets: go, npm, docker, ghcr, pypi, crates
 #
-# Credential presets (github, gitlab) broker an API token: the CLI in the
-# sandbox is configured with the fake token and the proxy swaps in the real
-# one. Self-hosted services (gitlab) take the instance host in the entry.
-# Set allow_host: false to broker the token without allowlisting the host.
+# github/gitlab are scoped API presets, not blanket-access credential
+# presets: the entry must name the repos/orgs (github) or projects/groups
+# (gitlab) an agent may reach under `scope:`, which compiles into the same
+# restricted-host rule engine the registry presets use -- everything else on
+# api.github.com (or the gitlab instance) 403s. `write: true` opts in to
+# issue/PR/comment writes (github) or issue/MR/note writes (gitlab); write
+# bodies are size- and content-type-bounded, never inspected, so repo
+# scoping bounds *which* repos are reachable, not what gets written into
+# them. `graphql: true` (github only) opens unscoped `POST /graphql` --
+# GraphQL can address a repo through opaque global IDs that no path pattern
+# can constrain, so scoping it soundly means using a fine-grained PAT, not
+# this flag. `unrestricted: true` is the explicit, logged opt-out from
+# scoping entirely (blanket host access, like the old default) -- a scopable
+# service requires exactly one of `scope:` or `unrestricted: true`; setting
+# neither is a config-load error, not a warning. Self-hosted services
+# (gitlab) also take the instance host in the entry.
+#
+# Whichever way it's scoped, the API token is still brokered the same as
+# any credential preset: the CLI in the sandbox holds the fake token, the
+# proxy swaps in the real one -- but the token itself should *also* be
+# scoped (a GitHub fine-grained PAT limited to the same repos, or a GitLab
+# project access token): these proxy rules stop a broader token from being
+# *used* beyond this list, they can't stop it from being *valid* beyond it.
 # Threat model and per-preset details: docs/service-presets.md
 #
 # services:
 #   - go
 #   - npm
 #   - service: github
+#     scope:
+#       repos: [myorg/myrepo, myorg/other]   # exact owner/repo
+#       orgs: [myorg-sandbox]                # every repo under this org
+#     write: true                            # allow issue/PR/comment writes
+#     # graphql: true                        # allow POST /graphql -- UNSCOPED, see above
 #     fake_value: "ghp_0000000000000000000000000000000000fake"
 #     real_value: "${GITHUB_TOKEN}"
 #   - service: gitlab
 #     host: gitlab.example.com
+#     scope:
+#       projects: [team/backend]             # exact namespace/…/project
+#       groups: [team/sandbox]               # every project directly under this group
+#     write: true                            # allow issue/MR/note writes
 #     fake_value: "glpat-00000000000000fake"
 #     real_value: "${GITLAB_TOKEN}"
+#   # - service: github                      # the explicit, logged opt-out from scoping
+#   #   unrestricted: true                   # -- blanket api.github.com access, no rule engine
+#   #   fake_value: "ghp_0000000000000000000000000000000000fake"
+#   #   real_value: "${GITHUB_TOKEN}"
