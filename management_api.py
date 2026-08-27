@@ -91,11 +91,15 @@ def create_app(state: ProxyState) -> Flask:
             active_temps = {
                 h: exp for h, exp in state.temp_allows.items() if now < exp
             }
+        permanent = []
         restricted = {}
-        for host, rules in state.restricted.items():
-            restricted.setdefault(rules.source or "config", []).append(host)
+        for host, rules in state.hosts.items():
+            if rules is None:
+                permanent.append(host)
+            else:
+                restricted.setdefault(rules.source or "config", []).append(host)
         return jsonify({
-            "permanent": sorted(state.allowlist),
+            "permanent": sorted(permanent),
             "temporary": active_temps,
             "restricted": {k: sorted(v) for k, v in restricted.items()},
         })
@@ -117,18 +121,26 @@ def create_app(state: ProxyState) -> Flask:
                 data = yaml.safe_load(f) or {}
         except FileNotFoundError:
             data = {}
-        hosts = data.get("allowed_hosts", [])
-        host_names = [h if isinstance(h, str) else h["host"] for h in hosts]
-        if host in host_names:
-            # Already permanent; drop any lingering temp entry so it doesn't
+        hosts = data.get("hosts", [])
+
+        def entry_host(item):
+            return item if isinstance(item, str) else item.get("host")
+
+        existing = next((item for item in hosts if entry_host(item) == host), None)
+        if existing is not None and not (isinstance(existing, dict) and "rules" in existing):
+            # Already unrestricted; drop any lingering temp entry so it doesn't
             # keep showing as temporarily-allowed alongside the permanent one.
             with state.temp_lock:
                 state.temp_allows.pop(host, None)
             return jsonify({"ok": True})
 
-        new_data = {**data, "allowed_hosts": hosts + [{"host": host}]}
+        # A host currently carrying `rules:` gets that entry replaced by the
+        # unrestricted form -- the durable version of the temp-allow escape
+        # hatch. A host with no entry at all is simply appended.
+        new_hosts = [item for item in hosts if entry_host(item) != host] + [{"host": host}]
+        new_data = {**data, "hosts": new_hosts}
         try:
-            # Validate against the full config (credentials, restricted_hosts,
+            # Validate against the full config (credentials, service presets,
             # etc. all reload together) before writing anything to disk, so a
             # pre-existing bad section elsewhere can't leave config.yaml and
             # the running state out of sync.

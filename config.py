@@ -11,13 +11,20 @@ Config YAML format:
                                          # (RFC 8305); 0 disables. Works around
                                          # mitmproxy issue #8088; needs restart.
 
-  allowed_hosts:
-    - api.anthropic.com                  # plain string: all cookies pass through
-    - host: platform.claude.com
+  hosts:
+    - api.anthropic.com                  # plain string: unrestricted, all cookies pass
+    - host: platform.claude.com          # mapping, no `rules`: unrestricted
       allow_response_cookies: []         # no cookies allowed (all stripped)
     - host: internal.example.com
       allow_response_cookies:
         - csrftoken                      # only csrftoken passes through
+    - host: artifacts.internal.example.com   # mapping with `rules`: restricted,
+      rules:                                 # same engine as service presets
+        - methods: [GET, HEAD]
+          path: "/repo/[a-z0-9-]{1,64}/[a-zA-Z0-9._-]{1,128}"
+          query:                         # omit `query` to forbid query strings
+            version: "[a-z0-9.]{1,32}"
+      request_headers: [authorization]   # extras beyond the base header allowlist
 
   services:                              # service presets (see services.SERVICE_PRESETS
     - npm                                # and docs/service-presets.md). Bare string:
@@ -40,22 +47,13 @@ Config YAML format:
       header: Cookie
       real_value: "session=abc123"       # inject mode: omit fake_value
 
-  restricted_hosts:                      # custom rule sets, same engine as presets
-    - host: artifacts.internal.example.com
-      rules:
-        - methods: [GET, HEAD]
-          path: "/repo/[a-z0-9-]{1,64}/[a-zA-Z0-9._-]{1,128}"
-          query:                         # omit `query` to forbid query strings
-            version: "[a-z0-9.]{1,32}"
-      request_headers: [authorization]   # extras beyond the base header allowlist
-
-  Precedence: allowed_hosts (unrestricted) > temporary allows (unrestricted)
+  Precedence: unrestricted hosts entry > temporary allows (unrestricted)
   > restricted rules (403 on violation) > pending approval (503).
   Note: swap-mode credentials on a restricted host require the header to be
   listed in that host's request_headers, or scrubbing removes it before the
   broker sees it. Inject-mode credentials are unaffected (injected post-scrub).
   Service presets wire this automatically; hand-written `credentials` entries
-  on `restricted_hosts` must list the header themselves.
+  on a restricted `hosts:` entry must list the header themselves.
 
 Secrets file format (simple flat key/value map):
 
@@ -108,23 +106,21 @@ def _expand_secrets(obj, secrets: dict):
     return obj
 
 
-def _host_entries(data: dict, section: str, *, require_rules: bool = False) -> list:
-    """Validate a section as a list of str-or-dict entries, dicts having a "host" key.
+def _host_entries(data: dict, section: str = "hosts") -> list:
+    """Validate `hosts:` as a list of str-or-dict entries, dicts having a "host" key.
 
-    require_rules is set for restricted_hosts: unlike allowed_hosts, a bare
-    string isn't valid there (there's no rule set to compile), so it must be a
-    mapping with a "rules" list too.
+    An entry compiles to a restricted rule set iff it carries a "rules" key;
+    otherwise it's unrestricted (a bare string is always unrestricted, since
+    there's no mapping to hang a "rules" list off of).
     """
     entries = data.get(section) or []
     if not isinstance(entries, list):
         raise ValueError(f"{section} must be a list, got {type(entries).__name__}")
     for i, item in enumerate(entries):
-        if not require_rules and isinstance(item, str):
+        if isinstance(item, str):
             continue
         if not isinstance(item, dict) or not isinstance(item.get("host"), str):
             raise ValueError(f"{section}[{i}] must be a string or a mapping with a 'host' key")
-        if require_rules and not isinstance(item.get("rules"), list):
-            raise ValueError(f"{section}[{i}] must be a mapping with a 'rules' list")
     return entries
 
 
@@ -137,10 +133,9 @@ class Config:
     either exists fully formed or not at all (no partial policy state).
     """
 
-    allowlist: set[str]
+    hosts: dict  # host -> registries.HostRules (restricted) | None (unrestricted)
     host_config: dict[str, HostConfig]
     credentials: list[Credential]
-    restricted: dict  # host -> registries.HostRules
     management_port: int = 8082
     happy_eyeballs_delay: float = 0.25
 
@@ -177,11 +172,18 @@ class Config:
                 "allowed_registries was renamed to services; "
                 "move the preset names there (e.g. services: [go, npm])"
             )
+        if "allowed_hosts" in data:
+            raise ValueError(
+                "allowed_hosts was merged into hosts; "
+                "move entries there unchanged (e.g. hosts: [api.anthropic.com])"
+            )
+        if "restricted_hosts" in data:
+            raise ValueError(
+                "restricted_hosts was merged into hosts; "
+                "move entries there unchanged (each entry keeps its 'rules' list)"
+            )
 
-        allowed_hosts = _host_entries(data, "allowed_hosts")
-        restricted_hosts = _host_entries(data, "restricted_hosts", require_rules=True)
-
-        allowlist = {i if isinstance(i, str) else i["host"] for i in allowed_hosts}
+        host_entries = _host_entries(data)
 
         credentials = []
         for i, entry in enumerate(data.get("credentials") or []):
@@ -198,11 +200,11 @@ class Config:
             ))
 
         # Service presets: each `services` entry expands into the existing
-        # primitives — full-allow hosts, restricted rule sets, and brokered
+        # primitives — hosts (restricted or unrestricted) and brokered
         # credentials. Restricted hosts strip all response cookies by default:
         # registries don't need them, and Set-Cookie is a session/tracking
         # channel into the sandbox.
-        restricted = {}
+        hosts = {}
         host_config = {}
         for i, entry in enumerate(data.get("services") or []):
             if isinstance(entry, str):
@@ -219,11 +221,11 @@ class Config:
                     f"available: {sorted(services_module.SERVICE_PRESETS)}"
                 )
 
-            hosts = dict(preset.hosts)
+            preset_hosts = dict(preset.hosts)
             if preset.param_host:
                 if not isinstance(entry.get("host"), str):
                     raise ValueError(f"services[{i}] ({name}) requires a 'host'")
-                hosts[entry["host"]] = None
+                preset_hosts[entry["host"]] = None
             elif "host" in entry:
                 raise ValueError(f"services[{i}] ({name}) does not take a 'host'")
 
@@ -253,55 +255,47 @@ class Config:
                 ))
 
             allow_cred_host = bool(entry.get("allow_host", True))
-            for host, rules in hosts.items():
+            for host, rules in preset_hosts.items():
                 if rules is not None:
-                    restricted[host] = rules
+                    hosts[host] = rules
                     host_config[host] = HostConfig(allow_response_cookies=[])
                 elif host != cred_host or allow_cred_host:
-                    allowlist.add(host)
+                    hosts[host] = None
 
             # A swap-mode credential on a restricted host only works if its
             # header survives that host's header scrubbing; wire it in so
             # combined presets are correct by construction.
-            if spec is not None and cred_host in restricted:
-                rules = restricted[cred_host]
-                restricted[cred_host] = dataclasses.replace(
-                    rules,
-                    request_headers=rules.request_headers | {spec.header.lower()},
+            cred_rules = hosts.get(cred_host)
+            if spec is not None and isinstance(cred_rules, registries.HostRules):
+                hosts[cred_host] = dataclasses.replace(
+                    cred_rules,
+                    request_headers=cred_rules.request_headers | {spec.header.lower()},
                 )
 
-        # Custom `restricted_hosts` entries compile with the same engine; one
-        # naming a host a service preset also covers replaces the preset's
-        # rules for that host.
-        for item in restricted_hosts:
-            restricted[item["host"]] = registries.compile_host_rules(item, source="config")
-
-        for host in sorted(set(restricted) & allowlist):
-            print(json.dumps({
-                "event": "config_warning",
-                "message": (
-                    f"host {host} is in both allowed_hosts and a restricted rule set; "
-                    "allowed_hosts wins (unrestricted)"
-                ),
-            }))
-
-        # Per-host cookie rules for custom entries (service presets set theirs
-        # above; later sections override earlier ones for the same host).
-        for item in restricted_hosts:
-            host_config[item["host"]] = HostConfig(
-                allow_response_cookies=item.get("allow_response_cookies", [])
-            )
-        for item in allowed_hosts:
-            if not isinstance(item, str):
-                host_config[item["host"]] = HostConfig(
+        # Hand-written `hosts:` entries compile with the same engine and are
+        # applied last, so one naming a host a service preset also covers
+        # replaces whatever the preset produced for that host — restricted or
+        # not, in either direction.
+        for item in host_entries:
+            if isinstance(item, str):
+                hosts[item] = None
+                continue
+            host = item["host"]
+            if "rules" in item:
+                hosts[host] = registries.compile_host_rules(item, source="config")
+                host_config[host] = HostConfig(
+                    allow_response_cookies=item.get("allow_response_cookies", [])
+                )
+            else:
+                hosts[host] = None
+                host_config[host] = HostConfig(
                     allow_response_cookies=item.get("allow_response_cookies")
                 )
 
         return cls(
-            allowlist=allowlist,
+            hosts=hosts,
             host_config=host_config,
             credentials=credentials,
-            restricted=restricted,
             management_port=int(data.get("management_port", 8082)),
             happy_eyeballs_delay=float(data.get("happy_eyeballs_delay", 0.25) or 0),
         )
@@ -310,10 +304,9 @@ class Config:
 @dataclass
 class ProxyState:
     config_path: str  # path to config YAML, used by reload()
-    allowlist: set[str] = field(default_factory=set)
+    hosts: dict = field(default_factory=dict)  # host -> registries.HostRules | None
     credentials: list[Credential] = field(default_factory=list)
     host_config: dict[str, HostConfig] = field(default_factory=dict)
-    restricted: dict = field(default_factory=dict)  # host -> registries.HostRules
     management_port: int = 8082
     temp_allows: dict[str, float] = field(default_factory=dict)  # host -> expires_at (epoch)
     temp_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -328,10 +321,9 @@ class ProxyState:
         half-updated one. management_port is intentionally not re-applied —
         the API server is already bound; the port is set once at construction.
         """
-        self.allowlist = set(config.allowlist)
+        self.hosts = dict(config.hosts)
         self.host_config = dict(config.host_config)
         self.credentials = list(config.credentials)
-        self.restricted = dict(config.restricted)
 
     def reload(self) -> None:
         """Re-read the config file and apply it. Shared by SIGHUP and the API."""

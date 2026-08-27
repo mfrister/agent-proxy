@@ -146,7 +146,7 @@ def _proxy_context(tmp, handler_class, config_text):
 @pytest.fixture(scope="module")
 def proxy(tmp_path_factory):
     config_text = (
-        "allowed_hosts:\n"
+        "hosts:\n"
         "  - host: 127.0.0.1\n"
         "credentials:\n"
         "  - host: 127.0.0.1\n"
@@ -167,7 +167,7 @@ def proxy_cookie(tmp_path_factory):
     with _proxy_context(
         tmp_path_factory.mktemp("functional_cookie"),
         CookieHandler,
-        "allowed_hosts:\n"
+        "hosts:\n"
         "  - host: 127.0.0.1\n"
         "    allow_response_cookies:\n"
         "      - csrftoken\n",
@@ -176,7 +176,7 @@ def proxy_cookie(tmp_path_factory):
 
 
 RESTRICTED_CONFIG = (
-    "restricted_hosts:\n"
+    "hosts:\n"
     "  - host: 127.0.0.1\n"
     "    rules:\n"
     "      - methods: [GET, HEAD]\n"
@@ -230,7 +230,7 @@ def proxy_secrets(tmp_path):
     secrets.write_text("REAL_API_KEY: real-key\n")
     config_text = (
         f"secrets_file: {secrets}\n"
-        "allowed_hosts:\n"
+        "hosts:\n"
         "  - host: 127.0.0.1\n"
         "credentials:\n"
         "  - host: 127.0.0.1\n"

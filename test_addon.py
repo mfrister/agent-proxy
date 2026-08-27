@@ -108,14 +108,14 @@ class TestHappyEyeballs:
 class TestAllowlistAddon:
     def test_allowed_host_passes(self):
         from addon import AllowlistAddon
-        addon = AllowlistAddon(make_state(allowlist={"good.com"}))
+        addon = AllowlistAddon(make_state(hosts={"good.com": None}))
         flow = make_flow("good.com")
         addon.request(flow)
         assert flow.response is None
 
     def test_blocked_host_gets_503(self):
         from addon import AllowlistAddon
-        addon = AllowlistAddon(make_state(allowlist=set()))
+        addon = AllowlistAddon(make_state(hosts={}))
         flow = make_flow("evil.com")
         addon.request(flow)
         assert flow.response is not None
@@ -125,7 +125,7 @@ class TestAllowlistAddon:
 
     def test_blocked_host_logged(self):
         from addon import AllowlistAddon
-        state = make_state(allowlist=set())
+        state = make_state(hosts={})
         addon = AllowlistAddon(state)
         flow = make_flow("evil.com", method="POST", path="/steal")
         addon.request(flow)
@@ -138,7 +138,7 @@ class TestAllowlistAddon:
     def test_temp_allow_within_ttl_passes(self):
         from addon import AllowlistAddon
         state = make_state(
-            allowlist=set(),
+            hosts={},
             temp_allows={"temp.com": time.time() + 60},
         )
         addon = AllowlistAddon(state)
@@ -149,7 +149,7 @@ class TestAllowlistAddon:
     def test_temp_allow_expired_blocks(self):
         from addon import AllowlistAddon
         state = make_state(
-            allowlist=set(),
+            hosts={},
             temp_allows={"temp.com": time.time() - 1},
         )
         addon = AllowlistAddon(state)
@@ -160,7 +160,7 @@ class TestAllowlistAddon:
 
     def test_multiple_denials_all_logged(self):
         from addon import AllowlistAddon
-        state = make_state(allowlist=set())
+        state = make_state(hosts={})
         addon = AllowlistAddon(state)
         for host in ["a.com", "b.com", "c.com"]:
             addon.request(make_flow(host))
@@ -168,7 +168,7 @@ class TestAllowlistAddon:
 
     def test_denial_entry_typed_pending_approval(self):
         from addon import AllowlistAddon
-        state = make_state(allowlist=set())
+        state = make_state(hosts={})
         AllowlistAddon(state).request(make_flow("evil.com"))
         assert state.deny_log[0]["type"] == "pending_approval"
 
@@ -178,7 +178,7 @@ class TestAllowlistAddon:
 class TestRegistryPolicy:
     def test_matching_request_passes(self):
         from addon import AllowlistAddon
-        addon = AllowlistAddon(make_state(allowlist=set(), restricted=make_restricted()))
+        addon = AllowlistAddon(make_state(hosts=make_restricted()))
         flow = make_flow("registry.example.com", path="/pkg/foo")
         addon.request(flow)
         assert flow.response is None
@@ -186,14 +186,14 @@ class TestRegistryPolicy:
 
     def test_allowed_query_param_passes(self):
         from addon import AllowlistAddon
-        addon = AllowlistAddon(make_state(allowlist=set(), restricted=make_restricted()))
+        addon = AllowlistAddon(make_state(hosts=make_restricted()))
         flow = make_flow("registry.example.com", path="/pkg/foo?version=1.2.3")
         addon.request(flow)
         assert flow.response is None
 
     def test_violation_gets_403_without_retry_after(self, capsys):
         from addon import AllowlistAddon
-        state = make_state(allowlist=set(), restricted=make_restricted())
+        state = make_state(hosts=make_restricted())
         addon = AllowlistAddon(state)
         flow = make_flow("registry.example.com", method="POST", path="/pkg/foo")
         addon.request(flow)
@@ -209,22 +209,30 @@ class TestRegistryPolicy:
 
     def test_disallowed_query_param_blocked(self):
         from addon import AllowlistAddon
-        addon = AllowlistAddon(make_state(allowlist=set(), restricted=make_restricted()))
+        addon = AllowlistAddon(make_state(hosts=make_restricted()))
         flow = make_flow("registry.example.com", path="/pkg/foo?data=secret")
         addon.request(flow)
         assert flow.response.status_code == 403
 
     def test_body_on_get_blocked(self):
         from addon import AllowlistAddon
-        addon = AllowlistAddon(make_state(allowlist=set(), restricted=make_restricted()))
+        addon = AllowlistAddon(make_state(hosts=make_restricted()))
         flow = make_flow("registry.example.com", path="/pkg/foo", body=b"exfil")
         addon.request(flow)
         assert flow.response.status_code == 403
 
-    def test_allowlist_beats_restricted(self):
+    def test_unrestricted_host_short_circuits_before_temp_allow_check(self):
+        # An unrestricted `hosts:` entry can no longer coexist with a rule set
+        # on the same host (unified dict, one entry per host) -- but the
+        # ordering that used to demonstrate ("allowlist beats restricted")
+        # still matters: unrestricted must win *before* temp_allows is even
+        # consulted. Prove it by making the temp-allow lookup irrelevant
+        # (expired) and confirming the request still passes.
         from addon import AllowlistAddon
         addon = AllowlistAddon(make_state(
-            allowlist={"registry.example.com"}, restricted=make_restricted()))
+            hosts={"registry.example.com": None},
+            temp_allows={"registry.example.com": time.time() - 1},
+        ))
         flow = make_flow("registry.example.com", method="POST", path="/anything")
         addon.request(flow)
         assert flow.response is None
@@ -232,9 +240,8 @@ class TestRegistryPolicy:
     def test_temp_allow_beats_restricted(self):
         from addon import AllowlistAddon
         addon = AllowlistAddon(make_state(
-            allowlist=set(),
+            hosts=make_restricted(),
             temp_allows={"registry.example.com": time.time() + 60},
-            restricted=make_restricted(),
         ))
         flow = make_flow("registry.example.com", method="POST", path="/anything")
         addon.request(flow)
@@ -242,14 +249,14 @@ class TestRegistryPolicy:
 
     def test_unlisted_host_still_gets_503(self):
         from addon import AllowlistAddon
-        addon = AllowlistAddon(make_state(allowlist=set(), restricted=make_restricted()))
+        addon = AllowlistAddon(make_state(hosts=make_restricted()))
         flow = make_flow("other.com")
         addon.request(flow)
         assert flow.response.status_code == 503
 
     def test_headers_scrubbed_names_logged_values_not(self, capsys):
         from addon import AllowlistAddon
-        addon = AllowlistAddon(make_state(allowlist=set(), restricted=make_restricted()))
+        addon = AllowlistAddon(make_state(hosts=make_restricted()))
         flow = make_flow("registry.example.com", path="/pkg/foo", headers={
             "Accept": "*/*",
             "X-Exfil": "top-secret-value",
@@ -268,7 +275,7 @@ class TestRegistryPolicy:
 
     def test_overlong_header_clamped(self):
         from addon import AllowlistAddon
-        addon = AllowlistAddon(make_state(allowlist=set(), restricted=make_restricted()))
+        addon = AllowlistAddon(make_state(hosts=make_restricted()))
         flow = make_flow("registry.example.com", path="/pkg/foo",
                          headers={"User-Agent": "u" * 600})
         addon.request(flow)
@@ -278,8 +285,7 @@ class TestRegistryPolicy:
     def test_declared_header_survives(self):
         from addon import AllowlistAddon
         addon = AllowlistAddon(make_state(
-            allowlist=set(),
-            restricted=make_restricted(request_headers=["authorization"]),
+            hosts=make_restricted(request_headers=["authorization"]),
         ))
         flow = make_flow("registry.example.com", path="/pkg/foo",
                          headers={"Authorization": "Bearer tok"})
@@ -421,20 +427,20 @@ class TestSighupReload:
         from addon import setup_sighup
 
         config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts:\n  - host: original.com\n")
+        config.write_text("hosts:\n  - host: original.com\n")
 
         state = make_state(
-            allowlist={"original.com"},
+            hosts={"original.com": None},
             config_path=str(config),
         )
         setup_sighup(state)
 
-        config.write_text("allowed_hosts:\n  - host: original.com\n  - host: new.com\n")
+        config.write_text("hosts:\n  - host: original.com\n  - host: new.com\n")
         os.kill(os.getpid(), signal.SIGHUP)
         time.sleep(0.05)
 
-        assert "new.com" in state.allowlist
-        assert "original.com" in state.allowlist
+        assert "new.com" in state.hosts and state.hosts["new.com"] is None
+        assert "original.com" in state.hosts and state.hosts["original.com"] is None
 
     def test_sighup_reloads_credentials(self, tmp_path):
         from addon import setup_sighup
@@ -468,17 +474,17 @@ class TestSighupReload:
         from addon import setup_sighup
 
         config = tmp_path / "config.yaml"
-        config.write_text("allowed_hosts: []\n")
+        config.write_text("hosts: []\n")
 
-        state = make_state(allowlist=set(), config_path=str(config))
+        state = make_state(hosts={}, config_path=str(config))
         setup_sighup(state)
-        assert state.restricted == {}
+        assert state.hosts == {}
 
         config.write_text("services: [go]\n")
         os.kill(os.getpid(), signal.SIGHUP)
         time.sleep(0.05)
 
-        assert "proxy.golang.org" in state.restricted
+        assert state.hosts["proxy.golang.org"] is not None
 
 
 # ── Cookie allowlist (response side) ──────────────────────────────────────────
