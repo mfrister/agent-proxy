@@ -6,7 +6,7 @@ def make_state(**overrides):
     from config import ProxyState
 
     defaults = dict(
-        allowlist={"allowed.com"},
+        hosts={"allowed.com": None},
         config_path="config.yaml",
     )
     defaults.update(overrides)

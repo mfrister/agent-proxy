@@ -18,10 +18,10 @@ def mgmt(tmp_path):
     from management_api import create_app
 
     config = tmp_path / "config.yaml"
-    config.write_text("allowed_hosts:\n  - host: existing.com\n")
+    config.write_text("hosts:\n  - host: existing.com\n")
 
     state = make_state(
-        allowlist={"existing.com"},
+        hosts={"existing.com": None},
         config_path=str(config),
     )
     app = create_app(state)
@@ -70,7 +70,7 @@ class TestManagementAPI:
         assert data["restricted"] == {}
 
     def test_get_allowlist_restricted_grouped_by_source(self, mgmt):
-        mgmt._state.restricted = make_restricted()
+        mgmt._state.hosts = {**mgmt._state.hosts, **make_restricted()}
         data = mgmt.get("/allowlist").get_json()
         assert data["restricted"] == {"testpreset": ["registry.example.com"]}
 
@@ -94,7 +94,7 @@ class TestManagementAPI:
     def test_post_allow_permanent_updates_state(self, mgmt):
         r = mgmt.post("/allow/permanent", json={"host": "new.com"})
         assert r.get_json()["ok"] is True
-        assert "new.com" in mgmt._state.allowlist
+        assert mgmt._state.hosts.get("new.com") is None and "new.com" in mgmt._state.hosts
 
     def test_post_allow_permanent_clears_temp_entry(self, mgmt):
         state = mgmt._state
@@ -102,7 +102,7 @@ class TestManagementAPI:
             state.temp_allows["new.com"] = time.time() + 60
         r = mgmt.post("/allow/permanent", json={"host": "new.com"})
         assert r.get_json()["ok"] is True
-        assert "new.com" in state.allowlist
+        assert "new.com" in state.hosts and state.hosts["new.com"] is None
         with state.temp_lock:
             assert "new.com" not in state.temp_allows
 
@@ -115,6 +115,35 @@ class TestManagementAPI:
         with state.temp_lock:
             assert "existing.com" not in state.temp_allows
 
+    def test_post_allow_permanent_promotes_restricted_host(self, mgmt):
+        # A host currently covered by a `rules:` entry gets that entry
+        # replaced by the unrestricted form -- the durable version of the
+        # temp-allow escape hatch.
+        config_path = mgmt._state.config_path
+        with open(config_path) as f:
+            data = f.read()
+        with open(config_path, "w") as f:
+            f.write(
+                data +
+                "  - host: restricted.com\n"
+                "    rules:\n"
+                "      - methods: [GET]\n"
+                "        path: \"/only-this\"\n"
+            )
+        mgmt._state.reload()
+        assert mgmt._state.hosts["restricted.com"] is not None
+
+        r = mgmt.post("/allow/permanent", json={"host": "restricted.com"})
+        assert r.get_json()["ok"] is True
+        assert mgmt._state.hosts["restricted.com"] is None
+
+        with open(config_path) as f:
+            written = yaml.safe_load(f)
+        entries = written["hosts"]
+        matching = [h for h in entries if isinstance(h, dict) and h.get("host") == "restricted.com"]
+        assert len(matching) == 1
+        assert "rules" not in matching[0]
+
     def test_post_allow_permanent_writes_file(self, mgmt, tmp_path):
         mgmt.post("/allow/permanent", json={"host": "written.com"})
         config_path = mgmt._state.config_path
@@ -122,7 +151,7 @@ class TestManagementAPI:
             data = yaml.safe_load(f)
         host_names = [
             h if isinstance(h, str) else h["host"]
-            for h in data["allowed_hosts"]
+            for h in data["hosts"]
         ]
         assert "written.com" in host_names
 
@@ -133,7 +162,7 @@ class TestManagementAPI:
             data = yaml.safe_load(f)
         host_names = [
             h if isinstance(h, str) else h["host"]
-            for h in data["allowed_hosts"]
+            for h in data["hosts"]
         ]
         assert host_names.count("existing.com") == 1
 
@@ -141,7 +170,7 @@ class TestManagementAPI:
         mgmt.post("/allow/permanent", json={"host": "newdict.com"})
         with open(mgmt._state.config_path) as f:
             data = yaml.safe_load(f)
-        hosts = data["allowed_hosts"]
+        hosts = data["hosts"]
         assert any(
             (isinstance(h, dict) and h["host"] == "newdict.com") for h in hosts
         )
@@ -164,7 +193,7 @@ class TestManagementAPI:
         with open(state.config_path, "w") as f:
             f.write(
                 f"secrets_file: {secrets}\n"
-                "allowed_hosts:\n  - host: existing.com\n"
+                "hosts:\n  - host: existing.com\n"
                 "services:\n"
                 "  - service: github\n"
                 "    fake_value: ghp_fake\n"
@@ -189,7 +218,7 @@ class TestManagementAPI:
     def test_post_allow_permanent_rejects_without_touching_disk_or_state(self, mgmt):
         # An unrelated bad section (e.g. a malformed credential) must not let
         # this endpoint write a new host to disk while failing to update the
-        # in-memory allowlist -- that would leave the two out of sync.
+        # in-memory host policy -- that would leave the two out of sync.
         config_path = mgmt._state.config_path
         with open(config_path) as f:
             original = f.read()
@@ -201,7 +230,7 @@ class TestManagementAPI:
 
         assert r.status_code == 500
         assert r.get_json()["ok"] is False
-        assert "new.com" not in mgmt._state.allowlist
+        assert "new.com" not in mgmt._state.hosts
         with open(config_path) as f:
             assert f.read() == bad
 
@@ -224,7 +253,7 @@ class TestServicesEndpoints:
     def test_post_registry_service_updates_state_and_config(self, mgmt):
         r = mgmt.post("/services", json={"service": "npm"})
         assert r.get_json() == {"ok": True, "service": {"service": "npm", "kind": "registry"}}
-        assert "registry.npmjs.org" in mgmt._state.restricted
+        assert mgmt._state.hosts.get("registry.npmjs.org") is not None
         with open(mgmt._state.config_path) as f:
             assert yaml.safe_load(f)["services"] == ["npm"]
 
@@ -255,7 +284,7 @@ class TestServicesEndpoints:
         cred = mgmt_secrets._state.credentials[0]
         assert cred.real_value == f"token {real}"
         assert cred.fake_value == f"token {svc['fake_value']}"
-        assert "api.github.com" in mgmt_secrets._state.allowlist
+        assert mgmt_secrets._state.hosts.get("api.github.com") is None and "api.github.com" in mgmt_secrets._state.hosts
 
         # And GET /services stays redacted.
         listed = mgmt_secrets.get("/services")
@@ -328,7 +357,7 @@ class TestServicesEndpoints:
         r = mgmt_secrets.delete("/services", json={"service": "github"})
         assert r.get_json()["ok"] is True
         assert mgmt_secrets._state.credentials == []
-        assert "api.github.com" not in mgmt_secrets._state.allowlist
+        assert "api.github.com" not in mgmt_secrets._state.hosts
         with open(mgmt_secrets._secrets_path) as f:
             assert yaml.safe_load(f) == {}
         with open(mgmt_secrets._state.config_path) as f:

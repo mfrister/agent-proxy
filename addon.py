@@ -62,9 +62,12 @@ def enable_happy_eyeballs(delay: float) -> None:
 
 # ── Addons ─────────────────────────────────────────────────────────────────────
 
+_NOT_CONFIGURED = object()  # sentinel: host has no `hosts:` entry at all
+
+
 class AllowlistAddon:
     """
-    Checks every request against the permanent allowlist and active temporary
+    Checks every request against the unified host policy and active temporary
     allows. Denied requests receive a 503 response and are logged.
     """
 
@@ -75,16 +78,16 @@ class AllowlistAddon:
         host = flow.request.pretty_host
         s = self.state
 
-        if host in s.allowlist:
+        host_rules = s.hosts.get(host, _NOT_CONFIGURED)
+        if host_rules is None:  # unrestricted
             return
 
         with s.temp_lock:
             exp = s.temp_allows.get(host)
-            if exp and time.time() < exp:
+            if exp and time.time() < exp:  # temp-allow is inherently unrestricted
                 return
 
-        host_rules = s.restricted.get(host)
-        if host_rules is not None:
+        if host_rules is not _NOT_CONFIGURED:
             self._apply_registry_policy(flow, host_rules)
             return
 
@@ -289,11 +292,12 @@ class ManagementApiAddon:
 def setup_sighup(state: ProxyState):
     def handler(signum, frame):
         state.reload()
+        restricted_count = sum(1 for rules in state.hosts.values() if rules is not None)
         print(json.dumps({
             "event": "sighup_reload",
-            "host_count": len(state.allowlist),
+            "host_count": len(state.hosts),
             "credential_count": len(state.credentials),
-            "restricted_count": len(state.restricted),
+            "restricted_count": restricted_count,
         }))
     signal.signal(signal.SIGHUP, handler)
 

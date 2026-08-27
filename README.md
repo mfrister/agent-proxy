@@ -41,7 +41,7 @@ The CA cert is generated on first run at `~/.mitmproxy/` (or the path set by `--
 **`config.yaml`** — domain allowlist and per-host options (copy from `config.default.yaml` and customize):
 
 ```yaml
-allowed_hosts:
+hosts:
   - host: api.anthropic.com       # all Set-Cookie headers pass through (default)
   - host: platform.claude.com
     allow_response_cookies: []    # strip all Set-Cookie headers
@@ -69,7 +69,7 @@ services:
     real_value: "${GITLAB_TOKEN}"
 ```
 
-**Registry presets** (`go`, `npm`, `docker`, `ghcr`, `pypi`, `crates`) pin exact hostnames and only permit GET/HEAD requests matching known, bounded URL patterns (package metadata, tarballs, manifests, blobs, pull-scoped auth tokens). Query strings and request headers are allowlisted; everything else is blocked with a 403 (a policy violation, unlike the 503 pending-approval flow) and shows up in the deny log tagged `policy_violation`. Custom hosts can use the same rule engine via `restricted_hosts` — see `config.default.yaml` for the schema.
+**Registry presets** (`go`, `npm`, `docker`, `ghcr`, `pypi`, `crates`) pin exact hostnames and only permit GET/HEAD requests matching known, bounded URL patterns (package metadata, tarballs, manifests, blobs, pull-scoped auth tokens). Query strings and request headers are allowlisted; everything else is blocked with a 403 (a policy violation, unlike the 503 pending-approval flow) and shows up in the deny log tagged `policy_violation`. Custom hosts can use the same rule engine via a `hosts:` entry with a `rules:` list — see `config.default.yaml` for the schema.
 
 **Credential presets** (`github` for github.com, `gitlab` for self-hosted instances) know the header format the service's CLI sends (`Authorization: token …` for `gh`, `PRIVATE-TOKEN: …` for `glab`) and the fake-token shape it accepts. Keep real tokens in `secrets_file` and reference them as `${KEY}`; they never appear in config.yaml, management API responses, or logs. Set `allow_host: false` to broker the token without allowlisting the host.
 

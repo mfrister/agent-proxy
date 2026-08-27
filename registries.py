@@ -8,8 +8,8 @@ pattern + query-param allowlist), and use only allowlisted request headers.
 A request body is rejected unless the matched rule opts in with allow_body,
 in which case it is still bounded by max_body_bytes and, optionally, pinned to
 a set of allowed content types. Curated presets for common package registries
-live in PRESETS; users can define custom rule sets under `restricted_hosts` in
-config.yaml using the same schema.
+live in PRESETS; users can define custom rule sets under `hosts:` in
+config.yaml using the same schema (an entry with a `rules` key).
 
 Threat model, restriction design, and known limitations are documented in
 docs/service-presets.md.
