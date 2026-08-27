@@ -4,10 +4,12 @@ that enforces them.
 
 A "restricted host" sits between a fully allowed host and a denied one: requests
 are permitted only if they match a per-host rule set (method + anchored path
-pattern + query-param allowlist), carry no body, and use only allowlisted
-request headers. Curated presets for common package registries live in PRESETS;
-users can define custom rule sets under `restricted_hosts` in config.yaml using
-the same schema.
+pattern + query-param allowlist), and use only allowlisted request headers.
+A request body is rejected unless the matched rule opts in with allow_body,
+in which case it is still bounded by max_body_bytes and, optionally, pinned to
+a set of allowed content types. Curated presets for common package registries
+live in PRESETS; users can define custom rule sets under `restricted_hosts` in
+config.yaml using the same schema.
 
 Threat model, restriction design, and known limitations are documented in
 docs/service-presets.md.
@@ -16,6 +18,9 @@ Pattern guardrails (enforced at compile time, for presets and user rules alike):
   - Patterns are matched with re.fullmatch, never search.
   - Unbounded quantifiers (*, +, {n,}) are rejected; every repetition must have
     an explicit upper bound.
+  - A bare '.' immediately before a bounded quantifier (e.g. `.{0,512}`) is
+    rejected — it is a near-unbounded wildcard in disguise; use an explicit
+    character class instead.
   - A literal `%` in a path pattern requires allow_percent: true on the rule,
     so percent-encoding smuggling has to be opted into deliberately.
 """
@@ -36,6 +41,10 @@ class RouteRule:
                                 # A "*" key matches any parameter whose name
                                 # fullmatches _WILDCARD_PARAM_NAME (CDN signed URLs).
     allow_percent: bool = False # permit literal % in the request path
+    allow_body: bool = False    # permit a non-empty body on this route
+    max_body_bytes: int | None = None  # required and > 0 iff allow_body
+    content_types: frozenset | None = None  # None = any; else allowed base
+                                             # media types (lowercased)
 
 
 @dataclass(frozen=True)
@@ -94,8 +103,27 @@ def _assert_bounded(pattern: str):
         )
 
 
+def _assert_no_bare_dot_wildcard(pattern: str):
+    """Reject a bare '.' sitting directly in front of a *bounded* quantifier.
+
+    _assert_bounded only rejects unbounded repetition, so `.{0,512}` sails
+    through it — but a bare '.' still matches almost anything (including '/'),
+    so that's a ~512-byte near-unbounded wildcard wearing a bound as a
+    disguise. Scoped rule sets need genuine "rest of path" segments, which
+    makes this reachable in practice; require an explicit character class
+    instead (e.g. `[A-Za-z0-9._/-]{0,512}`).
+    """
+    stripped = _ESCAPE.sub("E", _CHAR_CLASS.sub("C", pattern))
+    if re.search(r"\.\{", stripped):
+        raise ValueError(
+            f"Bare '.' before a bounded quantifier is a near-unbounded wildcard; "
+            f"use an explicit character class: {pattern!r}"
+        )
+
+
 def _compile_path(pattern: str, allow_percent: bool) -> re.Pattern:
     _assert_bounded(pattern)
+    _assert_no_bare_dot_wildcard(pattern)
     if "%" in pattern and not allow_percent:
         raise ValueError(
             f"Path pattern contains '%' but rule does not set allow_percent: {pattern!r}"
@@ -103,11 +131,34 @@ def _compile_path(pattern: str, allow_percent: bool) -> re.Pattern:
     return re.compile(pattern)
 
 
+def literal_alternation(items) -> str:
+    """Case-insensitive alternation of re.escape'd literals.
+
+    GitHub and GitLab resolve owner/repo case-insensitively, so a case-sensitive
+    match would deny legitimate requests (over-restrictive, never permissive).
+    (?i:...) is scoped, so it does not loosen the rest of the pattern.
+    """
+    return "(?i:" + "|".join(re.escape(i) for i in items) + ")"
+
+
 def compile_host_rules(spec: dict, source: str) -> HostRules:
     """Compile one host's rule spec (preset data or config.yaml dict)."""
     rules = []
     for r in spec["rules"]:
         allow_percent = bool(r.get("allow_percent", False))
+        allow_body = bool(r.get("allow_body", False))
+        max_body_bytes = r.get("max_body_bytes")
+        if allow_body and not (max_body_bytes and max_body_bytes > 0):
+            raise ValueError(
+                f"allow_body requires a positive max_body_bytes: {r!r}"
+            )
+        if max_body_bytes is not None and not allow_body:
+            raise ValueError(
+                f"max_body_bytes without allow_body has no effect: {r!r}"
+            )
+        content_types = r.get("content_types")
+        if content_types is not None:
+            content_types = frozenset(ct.lower() for ct in content_types)
         query = None
         if r.get("query") is not None:
             query = {}
@@ -119,6 +170,9 @@ def compile_host_rules(spec: dict, source: str) -> HostRules:
             path=_compile_path(r["path"], allow_percent),
             query=query,
             allow_percent=allow_percent,
+            allow_body=allow_body,
+            max_body_bytes=max_body_bytes,
+            content_types=content_types,
         ))
     return HostRules(
         rules=tuple(rules),
@@ -150,12 +204,14 @@ def _check_query(rule: RouteRule, query: str):
 
 
 def evaluate(host_rules: HostRules, method: str, path_with_query: str,
-             headers, has_body: bool):
+             headers, body_len: int, content_type: str | None = None):
     """
     Check one request against a host's rules.
 
     Returns Allowed (with headers to scrub) or Violation (with a reason).
     `headers` is any mapping supporting .items(); mitmproxy Headers works.
+    `body_len` should be the actual buffered body length, not a client-supplied
+    Content-Length (which can lie).
     """
     if len(path_with_query) > host_rules.max_url_len:
         return Violation(f"URL exceeds {host_rules.max_url_len} characters")
@@ -183,8 +239,17 @@ def evaluate(host_rules: HostRules, method: str, path_with_query: str,
     if not matched:
         return Violation(reason)
 
-    if has_body:
-        return Violation("request body not allowed")
+    # Body check comes after the match so it can consult the matched rule
+    # (allow_body/max_body_bytes/content_types are per-rule, not per-host).
+    if body_len > 0:
+        if not rule.allow_body:
+            return Violation("request body not allowed")
+        if body_len > rule.max_body_bytes:
+            return Violation(f"request body exceeds {rule.max_body_bytes} bytes")
+        if rule.content_types is not None:
+            base = (content_type or "").split(";", 1)[0].strip().lower()
+            if base not in rule.content_types:
+                return Violation(f"content-type {content_type!r} not allowed for this path")
 
     allowed_headers = BASE_REQUEST_HEADERS | host_rules.request_headers
     drop, clamp = [], []
@@ -231,9 +296,11 @@ GET_HEAD = ["GET", "HEAD"]
 
 
 def _r(path: str, query: dict | None = None, methods: list = GET_HEAD,
-       allow_percent: bool = False) -> dict:
+       allow_percent: bool = False, allow_body: bool = False,
+       max_body_bytes: int | None = None, content_types: list | None = None) -> dict:
     return {"methods": methods, "path": path, "query": query,
-            "allow_percent": allow_percent}
+            "allow_percent": allow_percent, "allow_body": allow_body,
+            "max_body_bytes": max_body_bytes, "content_types": content_types}
 
 
 def _preset(name: str, hosts: dict) -> dict:
