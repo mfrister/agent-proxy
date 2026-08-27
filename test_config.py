@@ -15,6 +15,48 @@ from conftest import make_state
 
 # ── Config.load ────────────────────────────────────────────────────────────────
 
+class TestRedactKnownSecrets:
+    # Belt-and-braces backstop for Finding 1: _expand_secret_fields (tested
+    # above via TestConfigLoad/TestScopedServiceExpansion) is the real fix --
+    # this only pins that Config.from_data still scrubs a live secret value
+    # out of any ValueError it raises, as a safety net against some future
+    # field growing a ${KEY} use that isn't real_value/fake_value.
+    def test_redacts_known_secret_value(self):
+        from config import _redact_known_secrets
+        msg = _redact_known_secrets(
+            "'host' 'AKIA-super-secret' does not match the required pattern",
+            {"AWS_KEY": "AKIA-super-secret"},
+        )
+        assert "AKIA-super-secret" not in msg
+        assert "[REDACTED]" in msg
+
+    def test_leaves_ordinary_messages_unaffected(self):
+        from config import _redact_known_secrets
+        msg = "services[0] (github): unknown key(s) wrtie; available flags: ['write']"
+        assert _redact_known_secrets(msg, {"AWS_KEY": "AKIA-super-secret"}) == msg
+
+    def test_from_data_scrubs_secret_that_reaches_a_validation_error(self, tmp_path, monkeypatch):
+        # Simulate a future field that (mistakenly) still gets whole-value
+        # secret expansion and then fails a pattern check, by monkeypatching
+        # _host_entries to raise a ValueError containing an expanded secret
+        # -- exactly the shape Finding 1 produced before the real fix.
+        import config as config_module
+        from config import Config
+
+        real_secret = "AKIA-super-secret-value"
+
+        def _boom(data, section="hosts"):
+            raise ValueError(f"hosts[0]: {real_secret!r} does not match the required pattern")
+
+        monkeypatch.setattr(config_module, "_host_entries", _boom)
+
+        secrets = tmp_path / "secrets.yaml"
+        secrets.write_text(f"AWS_KEY: {real_secret}\n")
+        with pytest.raises(ValueError) as exc_info:
+            Config.from_data({"secrets_file": str(secrets), "hosts": []})
+        assert real_secret not in str(exc_info.value)
+
+
 class TestConfigLoad:
     def test_missing_file_empty_config_with_warning(self, tmp_path, capsys):
         from config import Config
