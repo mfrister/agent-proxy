@@ -294,13 +294,12 @@ SERVICE_PRESETS = {
     # GitHub CLI (gh) against github.com. gh sends
     # `Authorization: token <t>` on REST calls to api.github.com.
     #
-    # `hosts` still grants api.github.com blanket access here -- Config.from_data
-    # does not yet consult scope_template (that expansion lands separately);
-    # scope_params/scope_flags/scope_template are exercised directly by
-    # test_services.py in the meantime.
+    # No `hosts` entry: api.github.com is reachable only through
+    # scope_template below. Config.from_data requires every entry to supply
+    # either `scope:` (compiled through scope_template) or the explicit,
+    # logged `unrestricted: true` opt-out -- there is no default-open path.
     "github": ServicePreset(
         name="github",
-        hosts={"api.github.com": None},
         credential=CredentialSpec(
             header="Authorization",
             value_template="token {token}",
@@ -322,8 +321,9 @@ SERVICE_PRESETS = {
     # GitLab CLI (glab) against a self-hosted instance; the entry supplies the
     # host. glab (go-gitlab) sends `PRIVATE-TOKEN: <t>`, no value prefix.
     #
-    # See the github preset's comment above: the host stays fully allowed
-    # here until Config.from_data's scoped expansion lands.
+    # See the github preset's comment above: the operator-supplied host is
+    # scoped through scope_template by default, same as github; there is no
+    # `hosts` entry granting it blanket access.
     "gitlab": ServicePreset(
         name="gitlab",
         host_param=ScopeParam("host", r"[A-Za-z0-9.-]{1,253}", list=False, required=True),

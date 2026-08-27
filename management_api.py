@@ -247,6 +247,19 @@ def create_app(state: ProxyState) -> Flask:
                          "real_value": "${" + key + "}"}
             if host:
                 new_entry["host"] = host
+            # Scoping fields pass through verbatim: `scope` stays raw here
+            # (re-escaped and re-derived on every Config.from_data load, never
+            # persisted compiled), and Config.from_data is the sole authority
+            # on whether a scopable preset got exactly one of scope/
+            # unrestricted -- the full scope/flags editing UX is a later step;
+            # this just keeps a scopable preset postable through this API.
+            if "scope" in body:
+                new_entry["scope"] = body["scope"]
+            if "unrestricted" in body:
+                new_entry["unrestricted"] = body["unrestricted"]
+            for flag in preset.scope_flags:
+                if flag.name in body:
+                    new_entry[flag.name] = body[flag.name]
 
         new_data = {**data, "services": entries + [new_entry]}
         try:
