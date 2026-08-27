@@ -605,3 +605,59 @@ class TestScopedServiceExpansion:
         rules = cfg.hosts["api.github.com"]
         assert isinstance(rules, registries.HostRules)
         assert rules.source == "config"
+
+    def test_hosts_entry_over_scoped_service_keeps_credential_header(self, capsys):
+        # Finding 3: a hand-written `hosts:` entry for a host a *scoped*
+        # (not unrestricted) service preset also touches replaces the
+        # preset's compiled rules wholesale, including the request_headers
+        # merge that keeps `authorization` alive through AllowlistAddon's
+        # header scrubbing. Without re-wiring it, CredentialBrokerAddon
+        # (which runs after AllowlistAddon) never sees the header to swap
+        # in the real token, and the request goes upstream unauthenticated
+        # -- silently, since that looks like an ordinary 200, not a
+        # policy_violation or a pending approval. The existing override test
+        # above uses `unrestricted: true`, which never reaches this branch
+        # (preset.hosts is empty for github, so there's no compiled
+        # request_headers to lose in the first place).
+        from config import Config
+        cfg = Config.from_data({
+            "services": [
+                {"service": "github", "scope": {"repos": ["myorg/myrepo"]}, **GITHUB_CRED},
+            ],
+            "hosts": [
+                {"host": "api.github.com", "rules": [
+                    {"methods": ["GET"], "path": "/repos/myorg/myrepo/releases"},
+                ]},
+            ],
+        })
+        rules = cfg.hosts["api.github.com"]
+        assert isinstance(rules, registries.HostRules)
+        assert rules.source == "config"
+        assert "authorization" in rules.request_headers
+
+        events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        [event] = [e for e in events if e["event"] == "hosts_entry_rewires_credential_header"]
+        assert event["host"] == "api.github.com"
+        assert event["headers"] == ["authorization"]
+
+    def test_hosts_entry_over_hand_written_credential_does_not_auto_wire(self):
+        # The auto-wire is deliberately scoped to service-preset-generated
+        # credentials (Credential.preset is not None). A hand-written
+        # `credentials:` entry on a restricted `hosts:` entry is documented
+        # to need its header listed by the operator -- this must stay that
+        # way, or a raw credentials entry would start silently getting a
+        # header allowlisted for it that the operator never asked for.
+        from config import Config
+        cfg = Config.from_data({
+            "credentials": [
+                {"host": "api.example.com", "header": "Authorization",
+                 "real_value": "tok"},
+            ],
+            "hosts": [
+                {"host": "api.example.com", "rules": [
+                    {"methods": ["GET"], "path": "/data"},
+                ]},
+            ],
+        })
+        rules = cfg.hosts["api.example.com"]
+        assert "authorization" not in rules.request_headers
