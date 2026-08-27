@@ -1,4 +1,4 @@
-"""
+r"""
 Registry access rules: read-only package-registry presets and the rule engine
 that enforces them.
 
@@ -14,13 +14,19 @@ config.yaml using the same schema (an entry with a `rules` key).
 Threat model, restriction design, and known limitations are documented in
 docs/service-presets.md.
 
-Pattern guardrails (enforced at compile time, for presets and user rules alike):
+Pattern guardrails (enforced at compile time, identically for path patterns
+and query-value patterns, for presets and user rules alike):
   - Patterns are matched with re.fullmatch, never search.
   - Unbounded quantifiers (*, +, {n,}) are rejected; every repetition must have
     an explicit upper bound.
-  - A bare '.' immediately before a bounded quantifier (e.g. `.{0,512}`) is
-    rejected — it is a near-unbounded wildcard in disguise; use an explicit
-    character class instead.
+  - A bounded repeat (e.g. `{0,512}`) whose body can match '/' *opaquely* is
+    rejected — not just a bare '.' immediately before the quantifier, but
+    every equivalent spelling at any nesting depth: `(?:.)`, `(.)`, a
+    negated class/category that doesn't specifically exclude '/' (`[^x]`,
+    `\W`, `\S`, `\D`), and so on. Each of these is a near-unbounded wildcard
+    in disguise. An explicit, deliberately-scoped character class that lists
+    '/' among its members (e.g. `[A-Za-z0-9._/-]{0,512}`) is allowed, since
+    that inclusion is visible and intentional rather than implicit.
   - A literal `%` in a path pattern requires allow_percent: true on the rule,
     so percent-encoding smuggling has to be opted into deliberately.
 """
@@ -28,6 +34,18 @@ Pattern guardrails (enforced at compile time, for presets and user rules alike):
 import re
 from dataclasses import dataclass
 from urllib.parse import parse_qsl
+
+# Private stdlib API: re._parser is the regex engine's own parser (named
+# sre_parse before Python 3.11; the project's floor is 3.12.8). It's the only
+# sound way to answer "can this bounded repeat's body match '/'?" regardless
+# of how many grouping constructs sit between a wildcard-ish construct and
+# its quantifier -- a textual/substring check can always be defeated by
+# another construct in between (see _find_dangerous_repeat's docstring).
+# If this private module is ever removed or restructured, PRESETS (compiled
+# at import time, bottom of this file) fails to import and every test errors
+# immediately and loudly -- there's no way for a break here to silently stop
+# enforcing the guardrail.
+import re._parser as _sre_parse
 
 
 # ── Rule schema ────────────────────────────────────────────────────────────────
@@ -103,27 +121,177 @@ def _assert_bounded(pattern: str):
         )
 
 
-def _assert_no_bare_dot_wildcard(pattern: str):
-    """Reject a bare '.' sitting directly in front of a *bounded* quantifier.
+_SLASH = ord("/")
 
-    _assert_bounded only rejects unbounded repetition, so `.{0,512}` sails
-    through it — but a bare '.' still matches almost anything (including '/'),
-    so that's a ~512-byte near-unbounded wildcard wearing a bound as a
-    disguise. Scoped rule sets need genuine "rest of path" segments, which
-    makes this reachable in practice; require an explicit character class
-    instead (e.g. `[A-Za-z0-9._/-]{0,512}`).
+
+def _build_category_slash_table() -> dict:
+    """Does each of the six built-in class shorthands (\\d \\D \\s \\S \\w \\W)
+    match '/'? Derived by asking re's own parser+matcher rather than
+    hardcoded, so it can't silently drift from actual regex semantics if a
+    future Python release ever changes what counts as a "word" character.
     """
-    stripped = _ESCAPE.sub("E", _CHAR_CLASS.sub("C", pattern))
-    if re.search(r"\.\{", stripped):
+    table = {}
+    for esc in (r"\d", r"\D", r"\s", r"\S", r"\w", r"\W"):
+        [(_, members)] = _sre_parse.parse(esc)  # [(IN, [(CATEGORY, cat)])]
+        [(_, cat)] = members
+        table[cat] = bool(re.compile(esc).fullmatch("/"))
+    return table
+
+
+_CATEGORY_MATCHES_SLASH = _build_category_slash_table()
+
+
+def _category_matches_slash(cat) -> bool:
+    # A category outside the six built-ins (obscure locale/linebreak
+    # variants this codebase never writes) is unknown — fail safe.
+    return _CATEGORY_MATCHES_SLASH.get(cat, True)
+
+
+def _members_match_slash(items) -> bool:
+    """True if the union of these character-class members (literals, ranges,
+    category shorthands — ignoring any leading NEGATE marker) includes '/'.
+    """
+    for op, av in items:
+        if op == _sre_parse.LITERAL and av == _SLASH:
+            return True
+        if op == _sre_parse.RANGE and av[0] <= _SLASH <= av[1]:
+            return True
+        if op == _sre_parse.CATEGORY and _category_matches_slash(av):
+            return True
+    return False
+
+
+def _in_is_opaque_slash_source(items) -> bool:
+    """Classify a character class (the args of a parsed IN node).
+
+    A *negated* class ([^...]) is defined by what it excludes, so it's
+    opaque unless the exclusion set specifically covers '/': [^/] can never
+    match '/', but [^x] admits it (and everything else) by omission.
+
+    A *positive* class ([...]) is defined by what it explicitly lists, so a
+    literal '/' or a range spanning it is a deliberate, visible choice — the
+    "rest of path" pattern scoped rule sets need, e.g.
+    [A-Za-z0-9._/-]{0,512} — not opaque. The one exception is a
+    complement-flavoured shorthand used *inside* a positive class (\\W, \\S,
+    \\D): those admit '/' the same way a negated class does, just without a
+    top-level NEGATE marker, so they're still opaque.
+    """
+    negate = bool(items) and items[0][0] == _sre_parse.NEGATE
+    members = items[1:] if negate else items
+    if negate:
+        return not _members_match_slash(members)
+    return any(op == _sre_parse.CATEGORY and _category_matches_slash(av)
+               for op, av in members)
+
+
+def _body_has_opaque_slash(subpattern) -> bool:
+    """Recursively scan a parsed subpattern for a construct that can match
+    '/' *opaquely* — i.e. by not excluding it, rather than by deliberately
+    listing it (see _in_is_opaque_slash_source). Called on the body of a
+    bounded repeat, since that's what turns "one path segment" into "rest
+    of the URL", silently, when repeated ~hundreds of times.
+    """
+    for op, av in subpattern:
+        if op == _sre_parse.ANY:
+            return True
+        elif op == _sre_parse.NOT_LITERAL:
+            if av != _SLASH:
+                return True
+        elif op == _sre_parse.LITERAL:
+            pass  # a specific character, deliberate no matter which one
+        elif op == _sre_parse.IN:
+            if _in_is_opaque_slash_source(av):
+                return True
+        elif op in (_sre_parse.MAX_REPEAT, _sre_parse.MIN_REPEAT):
+            _, max_, body = av
+            if max_ != 0 and _body_has_opaque_slash(body):
+                return True
+        elif op == _sre_parse.SUBPATTERN:
+            if _body_has_opaque_slash(av[3]):
+                return True
+        elif op == _sre_parse.BRANCH:
+            if any(_body_has_opaque_slash(b) for b in av[1]):
+                return True
+        elif op in (_sre_parse.ASSERT, _sre_parse.ASSERT_NOT):
+            pass  # zero-width: a lookaround doesn't add characters to the match
+        elif op == _sre_parse.AT:
+            pass  # anchor: zero-width
+        elif op in (_sre_parse.GROUPREF, _sre_parse.GROUPREF_EXISTS):
+            return True  # backreference: captured content unknown — fail safe
+        else:
+            return True  # any node type not recognised above — fail safe
+    return False
+
+
+def _find_dangerous_repeat(subpattern) -> bool:
+    """Walk the whole parsed pattern for a bounded repeat whose body can
+    match '/' opaquely, at any nesting depth.
+
+    This replaces a textual/substring search (the previous approach: strip
+    escapes and character classes, then look for the literal substring
+    '.{'). That approach is structurally unsound — it can always be
+    defeated by putting another construct between the wildcard-ish token
+    and its quantifier: `(?:.){0,512}`, `(.){0,512}`, `(a.){0,512}` all
+    sail past a '.{' substring search untouched. Parsing the pattern with
+    the regex engine's own parser and walking the resulting tree catches
+    every spelling of "this repeat's body can match '/'" uniformly,
+    regardless of how it's nested.
+    """
+    for op, av in subpattern:
+        if op in (_sre_parse.MAX_REPEAT, _sre_parse.MIN_REPEAT):
+            _, max_, body = av
+            if max_ != 0 and _body_has_opaque_slash(body):
+                return True
+            if _find_dangerous_repeat(body):
+                return True
+        elif op == _sre_parse.SUBPATTERN:
+            if _find_dangerous_repeat(av[3]):
+                return True
+        elif op == _sre_parse.BRANCH:
+            if any(_find_dangerous_repeat(b) for b in av[1]):
+                return True
+        elif op in (_sre_parse.ASSERT, _sre_parse.ASSERT_NOT):
+            if _find_dangerous_repeat(av[1]):
+                return True
+    return False
+
+
+def _assert_no_wildcard_repeat(pattern: str):
+    """Reject a bounded repeat (e.g. `{0,512}`) whose body can match '/'
+    opaquely — a bare '.', `(?:.)`, `(.)`, a negated class/category that
+    doesn't specifically exclude '/' (`[^x]`, `\\W`, `\\S`, `\\D`), etc.,
+    at any nesting depth. _assert_bounded only rejects unbounded repetition,
+    so `.{0,512}` sails through it — but a bare '.' still matches almost
+    anything (including '/'), so that's a ~512-byte near-unbounded wildcard
+    wearing a bound as a disguise. Scoped rule sets need genuine "rest of
+    path" segments, which makes this reachable in practice; require an
+    explicit character class instead (e.g. `[A-Za-z0-9._/-]{0,512}`), which
+    this does *not* reject even though it too can match '/' — that's a
+    deliberate, visible inclusion rather than an implicit one.
+    """
+    if _find_dangerous_repeat(_sre_parse.parse(pattern)):
         raise ValueError(
-            f"Bare '.' before a bounded quantifier is a near-unbounded wildcard; "
-            f"use an explicit character class: {pattern!r}"
+            f"A bounded repeat in this pattern can match '/' without saying "
+            f"so explicitly (a bare '.', a negated class/category that "
+            f"doesn't exclude '/', etc.) — this silently turns a scoped "
+            f"path or query rule into a cross-segment wildcard. Use an "
+            f"explicit character class that lists exactly what's allowed, "
+            f"e.g. [A-Za-z0-9._/-]{{0,512}}: {pattern!r}"
         )
 
 
-def _compile_path(pattern: str, allow_percent: bool) -> re.Pattern:
+def _assert_pattern_safe(pattern: str):
+    """Both compile-time guardrails (unbounded quantifiers, opaque '/'
+    -matching repeats), applied uniformly to every pattern this module
+    compiles — path *and* query value — so a future third call site can't
+    reintroduce either gap by only calling one of them.
+    """
     _assert_bounded(pattern)
-    _assert_no_bare_dot_wildcard(pattern)
+    _assert_no_wildcard_repeat(pattern)
+
+
+def _compile_path(pattern: str, allow_percent: bool) -> re.Pattern:
+    _assert_pattern_safe(pattern)
     if "%" in pattern and not allow_percent:
         raise ValueError(
             f"Path pattern contains '%' but rule does not set allow_percent: {pattern!r}"
@@ -163,7 +331,13 @@ def compile_host_rules(spec: dict, source: str) -> HostRules:
         if r.get("query") is not None:
             query = {}
             for name, pat in r["query"].items():
-                _assert_bounded(pat)
+                # Same guardrails as path patterns (_assert_pattern_safe), not
+                # just _assert_bounded — a query value has no '/' boundary
+                # semantics, but an opaque near-unbounded wildcard there is
+                # still a near-unbounded wildcard, and the module-level
+                # guardrail contract above covers "presets and user rules
+                # alike" without scoping itself to paths only.
+                _assert_pattern_safe(pat)
                 query[name] = re.compile(pat)
         rules.append(RouteRule(
             methods=frozenset(m.upper() for m in r["methods"]),

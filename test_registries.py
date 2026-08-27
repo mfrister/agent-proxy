@@ -364,13 +364,35 @@ class TestAllowBody:
         assert "body" in verdict.reason
 
 
-# ── Bare-dot wildcard lint ────────────────────────────────────────────────────
+# ── Wildcard-repeat lint ───────────────────────────────────────────────────────
 
-class TestBareDotWildcardLint:
-    def test_bare_dot_before_bounded_quantifier_rejected(self):
-        with pytest.raises(ValueError, match="Bare"):
+class TestWildcardRepeatLint:
+    # Every spelling of "a bounded repeat whose body can match '/' without
+    # saying so explicitly" — the grouping-construct bypasses that defeated
+    # the old '.{' substring search, plus one nested a level deeper.
+    BYPASS_PATTERNS = [
+        ".{0,512}",
+        "(?:.){0,512}",
+        "(.){0,512}",
+        "(a.){0,512}",
+        "(?:(a.)){0,5}",       # nested one level deeper
+        "((?:.)){0,5}",        # nested one level deeper, no literal
+    ]
+
+    @pytest.mark.parametrize("frag", BYPASS_PATTERNS)
+    def test_bypass_spellings_rejected_in_path(self, frag):
+        with pytest.raises(ValueError, match="cross-segment wildcard"):
             compile_host_rules({"rules": [
-                {"methods": ["GET"], "path": "/x/.{0,512}"},
+                {"methods": ["GET"], "path": "/x/" + frag},
+            ]}, "test")
+
+    @pytest.mark.parametrize("frag", BYPASS_PATTERNS)
+    def test_bypass_spellings_rejected_in_query_value(self, frag):
+        # Finding 2: query-value patterns previously only ran _assert_bounded,
+        # never this lint, so all of these compiled unrejected before the fix.
+        with pytest.raises(ValueError, match="cross-segment wildcard"):
+            compile_host_rules({"rules": [
+                {"methods": ["GET"], "path": "/x", "query": {"v": frag}},
             ]}, "test")
 
     def test_explicit_character_class_accepted(self):
@@ -378,6 +400,20 @@ class TestBareDotWildcardLint:
             {"methods": ["GET"], "path": "/x/[A-Za-z0-9._/-]{0,512}"},
         ]}, "test")
         assert isinstance(evaluate(rules, "GET", "/x/foo/bar.txt", {}, 0), Allowed)
+
+    def test_explicit_character_class_accepted_in_query_value(self):
+        rules = compile_host_rules({"rules": [
+            {"methods": ["GET"], "path": "/x",
+             "query": {"v": "[A-Za-z0-9._-]{1,100}"}},
+        ]}, "test")
+        assert isinstance(evaluate(rules, "GET", "/x?v=abc.def", {}, 0), Allowed)
+
+    def test_bounded_segment_class_accepted(self):
+        # [A-Za-z0-9._-]{1,100} — a tightly-scoped single-segment class, no '/'.
+        rules = compile_host_rules({"rules": [
+            {"methods": ["GET"], "path": "/x/[A-Za-z0-9._-]{1,100}"},
+        ]}, "test")
+        assert isinstance(evaluate(rules, "GET", "/x/my-repo.git", {}, 0), Allowed)
 
     def test_escaped_dot_before_bounded_quantifier_not_flagged(self):
         # \.{1,2} quantifies the escaped (literal) dot itself — bounded
@@ -397,6 +433,31 @@ class TestBareDotWildcardLint:
             {"methods": ["GET"], "path": "/x/[.]{1,4}"},
         ]}, "test")
         assert isinstance(evaluate(rules, "GET", "/x/.", {}, 0), Allowed)
+
+    def test_negated_class_excluding_slash_accepted(self):
+        # [^/]{0,64} can never match '/' — bounded to a single path segment,
+        # so it's safe and useful (unlike a bare '.', which crosses segments).
+        rules = compile_host_rules({"rules": [
+            {"methods": ["GET"], "path": "/x/[^/]{0,64}"},
+        ]}, "test")
+        assert isinstance(evaluate(rules, "GET", "/x/one-segment", {}, 0), Allowed)
+        assert isinstance(evaluate(rules, "GET", "/x/two/segments", {}, 0), Violation)
+
+    def test_negated_class_not_excluding_slash_rejected(self):
+        # [^x]{0,512} excludes only 'x' — '/' (and almost everything else)
+        # still matches, so this is the same disguised wildcard as '.{0,512}'.
+        with pytest.raises(ValueError, match="cross-segment wildcard"):
+            compile_host_rules({"rules": [
+                {"methods": ["GET"], "path": "/x/[^x]{0,512}"},
+            ]}, "test")
+
+    def test_all_presets_still_compile(self):
+        # Import-time coverage is implicit (PRESETS is built at import), but
+        # this documents the intent explicitly: the lint must not be so
+        # strict that it breaks any curated preset.
+        for name, hosts in registries.PRESETS.items():
+            for host, host_rules in hosts.items():
+                assert host_rules.rules, (name, host)
 
 
 # ── literal_alternation ───────────────────────────────────────────────────────
