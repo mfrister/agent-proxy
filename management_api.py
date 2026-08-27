@@ -21,7 +21,7 @@ import yaml
 from flask import Flask, jsonify, request as flask_request
 
 import services as services_module
-from config import Config, ProxyState
+from config import Config, ProxyState, require_bool
 
 
 def _service_key(entry) -> tuple:
@@ -267,7 +267,10 @@ def create_app(state: ProxyState) -> Flask:
             # (which still runs below as the final authority).
             if preset.scope_params:
                 scope = body.get("scope")
-                unrestricted = bool(body.get("unrestricted", False))
+                try:
+                    unrestricted = require_bool(body, "unrestricted", False)
+                except ValueError as e:
+                    return jsonify({"ok": False, "error": str(e)}), 400
                 if scope and unrestricted:
                     return jsonify({
                         "ok": False,
@@ -277,6 +280,17 @@ def create_app(state: ProxyState) -> Flask:
                 if not unrestricted:
                     try:
                         preset.build_scope(scope)
+                    except ValueError as e:
+                        return jsonify({"ok": False, "error": str(e)}), 400
+
+            # Scope flags (write, graphql, ...) gate real access the same way
+            # `unrestricted` does -- reject a non-boolean value here too,
+            # rather than letting it reach Config.from_data as a stored
+            # config.yaml value.
+            for flag in preset.scope_flags:
+                if flag.name in body:
+                    try:
+                        require_bool(body, flag.name, False)
                     except ValueError as e:
                         return jsonify({"ok": False, "error": str(e)}), 400
 
@@ -374,6 +388,19 @@ def create_app(state: ProxyState) -> Flask:
             with open(secrets_path, "w") as f:
                 yaml.safe_dump(secrets_data, f)
             rollback = (secrets_path, original_text)
+
+        # `unrestricted` and every scope flag gate real access, same as on
+        # POST -- reject a non-boolean value instead of coercing it.
+        try:
+            if "unrestricted" in body:
+                require_bool(body, "unrestricted")
+            for flag in (preset.scope_flags if preset else ()):
+                if flag.name in body:
+                    require_bool(body, flag.name)
+        except ValueError as e:
+            if rollback:
+                _restore_secrets(*rollback)
+            return jsonify({"ok": False, "error": str(e)}), 400
 
         # scope/unrestricted are mutually exclusive on the entry, same as
         # Config.from_data's expansion: setting one clears the other rather

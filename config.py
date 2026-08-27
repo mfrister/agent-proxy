@@ -142,6 +142,29 @@ def _expand_secret_fields(data: dict, secrets: dict) -> dict:
     return new_data
 
 
+def require_bool(container: dict, name: str, default: bool | None = None) -> bool:
+    """Read a boolean config/API key strictly.
+
+    Only an actual `True`/`False` is accepted -- never a string ("no",
+    "false", "0", ...) or an int (0, 1). YAML happily parses a hand-quoted
+    `unrestricted: "no"` as the Python str "no", and a JSON API client can
+    send any JSON type for a field; Python's bare `bool(...)` treats any
+    non-empty string (including "no" and "false") and any nonzero int as
+    truthy. For a key that gates broad access -- `unrestricted`, a service
+    scope flag such as `write`/`graphql`, `allow_host` -- that coercion
+    silently grants exactly the access the operator (or API caller) meant to
+    decline. Being strict here is deliberate, not merely consistent.
+    """
+    if name not in container:
+        if default is None:
+            raise ValueError(f"{name!r} is required and must be true or false")
+        return default
+    value = container[name]
+    if not isinstance(value, bool):
+        raise ValueError(f"{name!r} must be true or false, got {value!r}")
+    return value
+
+
 def _host_entries(data: dict, section: str = "hosts") -> list:
     """Validate `hosts:` as a list of str-or-dict entries, dicts having a "host" key.
 
@@ -314,7 +337,10 @@ class Config:
                     f"services[{i}] ({name}): unknown key(s) {', '.join(unknown_flags)}; "
                     f"available flags: {sorted(known_flags)}"
                 )
-            flags = {f.name: True for f in preset.scope_flags if entry.get(f.name)}
+            flags = {
+                f.name: True for f in preset.scope_flags
+                if f.name in entry and require_bool(entry, f.name, False)
+            }
             for f in preset.scope_flags:
                 if flags.get(f.name) and f.unscoped:
                     print(json.dumps({
@@ -333,7 +359,7 @@ class Config:
             preset_hosts = dict(preset.hosts)
             if preset.scope_params:
                 has_scope = "scope" in entry
-                unrestricted = bool(entry.get("unrestricted", False))
+                unrestricted = require_bool(entry, "unrestricted", False)
                 if has_scope and unrestricted:
                     raise ValueError(
                         f"services[{i}] ({name}): 'scope' and 'unrestricted: true' "
@@ -369,7 +395,7 @@ class Config:
             elif resolved_host is not None:
                 preset_hosts[resolved_host] = None
 
-            allow_cred_host = bool(entry.get("allow_host", True))
+            allow_cred_host = require_bool(entry, "allow_host", True)
             # Later `services` entries can overwrite an earlier one's host
             # here (last write wins), unlike the old separate allowlist/
             # restricted split where "unrestricted once added" always won.

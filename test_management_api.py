@@ -524,6 +524,29 @@ class TestServicesEndpoints:
         assert r.status_code == 400
         assert "mutually exclusive" in r.get_json()["error"]
 
+    @pytest.mark.parametrize("bad_value", ["no", "false", "0", "", 1, 0])
+    def test_post_unrestricted_non_bool_rejected(self, mgmt_secrets, bad_value):
+        # Finding 2: `bool("no")` is True, so a JSON client sending the
+        # string "no" (or any other non-bool) used to grant exactly the
+        # blanket access it was declining. state.hosts must stay untouched.
+        r = mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok", "unrestricted": bad_value,
+        })
+        assert r.status_code == 400
+        assert "unrestricted" in r.get_json()["error"]
+        assert "api.github.com" not in mgmt_secrets._state.hosts
+
+    @pytest.mark.parametrize("bad_value", ["no", "false", "0", "", 1, 0])
+    def test_post_scope_flag_non_bool_rejected(self, mgmt_secrets, bad_value):
+        r = mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok",
+            "scope": {"repos": ["myorg/myrepo"]}, "write": bad_value,
+        })
+        assert r.status_code == 400
+        assert "write" in r.get_json()["error"]
+        # Nothing persisted -- the secret was never written either.
+        assert not mgmt_secrets._secrets_path.exists()
+
     def test_put_edits_scope_without_touching_token(self, mgmt_secrets):
         posted = mgmt_secrets.post("/services", json={
             "service": "github", "real_value": "tok",
@@ -566,6 +589,34 @@ class TestServicesEndpoints:
         assert svc.get("unrestricted") is True
         assert "scope" not in svc
         assert mgmt_secrets._state.hosts.get("api.github.com") is None
+
+    @pytest.mark.parametrize("bad_value", ["no", "false", "0", "", 1, 0])
+    def test_put_unrestricted_non_bool_rejected(self, mgmt_secrets, bad_value):
+        mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok",
+            "scope": {"repos": ["myorg/myrepo"]},
+        })
+        r = mgmt_secrets.put("/services", json={
+            "service": "github", "unrestricted": bad_value,
+        })
+        assert r.status_code == 400
+        assert "unrestricted" in r.get_json()["error"]
+        # The pre-existing scoped entry is untouched.
+        with open(mgmt_secrets._state.config_path) as f:
+            entry = yaml.safe_load(f)["services"][0]
+        assert entry["scope"] == {"repos": ["myorg/myrepo"]}
+
+    @pytest.mark.parametrize("bad_value", ["no", "false", "0", "", 1, 0])
+    def test_put_scope_flag_non_bool_rejected(self, mgmt_secrets, bad_value):
+        mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok",
+            "scope": {"repos": ["myorg/myrepo"]},
+        })
+        r = mgmt_secrets.put("/services", json={
+            "service": "github", "write": bad_value,
+        })
+        assert r.status_code == 400
+        assert "write" in r.get_json()["error"]
 
     def test_put_requires_at_least_one_field(self, mgmt_secrets):
         mgmt_secrets.post("/services", json={

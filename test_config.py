@@ -517,6 +517,72 @@ class TestScopedServiceExpansion:
         assert "AKIA-super-secret-other-service-key" not in message
         assert "${AWS_SECRET_KEY}" in message
 
+    @pytest.mark.parametrize("bad_value", ["no", "false", "0", "", 1, 0])
+    def test_unrestricted_non_bool_rejected(self, bad_value):
+        # Finding 2: bool("no") is True in Python, so a hand-quoted
+        # `unrestricted: "no"` in YAML (or a JSON string/int from an API
+        # caller) used to grant exactly the blanket access the operator was
+        # declining. Only an actual bool is accepted now.
+        from config import Config
+        with pytest.raises(ValueError, match="unrestricted"):
+            Config.from_data({"services": [
+                {"service": "github", "unrestricted": bad_value, **GITHUB_CRED},
+            ]})
+
+    def test_unrestricted_true_still_works(self):
+        from config import Config
+        cfg = Config.from_data({"services": [
+            {"service": "github", "unrestricted": True, **GITHUB_CRED},
+        ]})
+        assert cfg.hosts["api.github.com"] is None
+
+    def test_unrestricted_false_still_requires_scope(self):
+        from config import Config
+        with pytest.raises(ValueError, match="must be scoped"):
+            Config.from_data({"services": [
+                {"service": "github", "unrestricted": False, **GITHUB_CRED},
+            ]})
+
+    @pytest.mark.parametrize("bad_value", ["no", "false", "0", "", 1, 0])
+    def test_scope_flag_non_bool_rejected(self, bad_value):
+        from config import Config
+        with pytest.raises(ValueError, match="write"):
+            Config.from_data({"services": [
+                {"service": "github", "scope": {"repos": ["myorg/myrepo"]},
+                 "write": bad_value, **GITHUB_CRED},
+            ]})
+
+    def test_scope_flag_true_still_works(self):
+        from config import Config
+        cfg = Config.from_data({"services": [
+            {"service": "github", "scope": {"repos": ["myorg/myrepo"]},
+             "write": True, **GITHUB_CRED},
+        ]})
+        rules = cfg.hosts["api.github.com"]
+        allowed = registries.evaluate(
+            rules, method="POST", path_with_query="/repos/myorg/myrepo/issues",
+            headers={"content-type": "application/json"}, body_len=10,
+            content_type="application/json",
+        )
+        assert isinstance(allowed, registries.Allowed)
+
+    @pytest.mark.parametrize("bad_value", ["no", "false", "0", "", 1, 0])
+    def test_allow_host_non_bool_rejected(self, bad_value):
+        from config import Config
+        with pytest.raises(ValueError, match="allow_host"):
+            Config.from_data({"services": [
+                {"service": "github", "unrestricted": True, "allow_host": bad_value,
+                 **GITHUB_CRED},
+            ]})
+
+    def test_allow_host_false_still_works(self):
+        from config import Config
+        cfg = Config.from_data({"services": [
+            {"service": "github", "unrestricted": True, "allow_host": False,
+             **GITHUB_CRED},
+        ]})
+        assert "api.github.com" not in cfg.hosts
+
     def test_hosts_entry_restricts_host_preset_left_unrestricted(self):
         # The reverse (and security-relevant) direction of
         # test_hosts_entry_overrides_preset_with_no_warning: a hand-written
