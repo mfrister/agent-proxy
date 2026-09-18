@@ -121,11 +121,11 @@ class AllowlistAddon:
 
         if isinstance(verdict, registries.Violation):
             flow.response = http.Response.make(
-                403,
+                503,
                 f"Request to {host} is not currently allowed by policy "
                 f"'{host_rules.source}': {verdict.reason}. Request is pending "
                 "human approval. Retry the request after approval is granted.",
-                {"Content-Type": "text/plain"},
+                {"Content-Type": "text/plain", "Retry-After": "5"},
             )
             entry = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
