@@ -326,7 +326,10 @@ history for either is the audit trail for policy changes.
 - **Swap-mode credentials** on a restricted host require the credential header
   to be listed in that host's `request_headers`; otherwise scrubbing removes it
   before the credential broker sees it. Inject-mode credentials are unaffected
-  (injection happens after scrubbing).
+  (injection happens after scrubbing). Service presets wire this
+  automatically (see "Credential presets" below); a hand-written
+  `credentials:` entry on a restricted `hosts:` entry must list the header
+  itself.
 - If a preset pattern turns out too tight for a legitimate workflow, the
   violation shows up in the TUI; temp-allowing the host is the immediate
   escape hatch, and a custom `hosts:` entry (which replaces the preset's

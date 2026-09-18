@@ -1,70 +1,13 @@
 """
 Configuration loading and shared proxy state.
 
-Config YAML format:
-
-  secrets_file: /path/to/secrets.yaml   # optional; separate file with secret values
-
-  management_port: 8082                  # management API port (default: 8082)
-
-  happy_eyeballs_delay: 0.25             # race IPv6/IPv4 upstream connects
-                                         # (RFC 8305); 0 disables. Works around
-                                         # mitmproxy issue #8088; needs restart.
-
-  hosts:
-    - api.anthropic.com                  # plain string: unrestricted, all cookies pass
-    - host: platform.claude.com          # mapping, no `rules`: unrestricted
-      allow_response_cookies: []         # no cookies allowed (all stripped)
-    - host: internal.example.com
-      allow_response_cookies:
-        - csrftoken                      # only csrftoken passes through
-    - host: artifacts.internal.example.com   # mapping with `rules`: restricted,
-      rules:                                 # same engine as service presets
-        - methods: [GET, HEAD]
-          path: "/repo/[a-z0-9-]{1,64}/[a-zA-Z0-9._-]{1,128}"
-          query:                         # omit `query` to forbid query strings
-            version: "[a-z0-9.]{1,32}"
-      request_headers: [authorization]   # extras beyond the base header allowlist
-
-  services:                              # service presets (see services.SERVICE_PRESETS
-    - npm                                # and docs/service-presets.md). Bare string:
-    - go                                 # read-only package-registry rule sets.
-    - service: github                    # credential presets broker an API token:
-      scope:                             # must be scoped (or `unrestricted: true`):
-        repos: ["my-org/my-repo"]        # repos/orgs (github) or projects/groups (gitlab)
-      fake_value: "ghp_fake…"            # the CLI sends the fake, the proxy swaps
-      real_value: "${GITHUB_TOKEN}"      # in the real one. ${KEY} -> secrets_file.
-    - service: gitlab                    # self-hosted services take the host in
-      host: gitlab.example.com           # the entry
-      scope:
-        projects: ["my-group/my-project"]
-      fake_value: "glpat-fake…"
-      real_value: "${GITLAB_TOKEN}"
-      # allow_host: false                # broker the token but don't allowlist the host
-
-  credentials:                           # custom credentials (escape hatch)
-    - host: api.example.com
-      header: Authorization
-      fake_value: "Bearer sk-fake"       # swap mode: agent sends fake, proxy swaps real
-      real_value: "${MY_API_KEY}"        # ${KEY} references a key in secrets_file
-    - host: internal.example.com
-      header: Cookie
-      real_value: "session=abc123"       # inject mode: omit fake_value
-
-  Precedence: unrestricted hosts entry > temporary allows (unrestricted)
-  > restricted rules (503 on violation, same as pending approval -- a human
-  may grant a temporary allow, so the client should keep retrying) > pending
-  approval (503).
-  Note: swap-mode credentials on a restricted host require the header to be
-  listed in that host's request_headers, or scrubbing removes it before the
-  broker sees it. Inject-mode credentials are unaffected (injected post-scrub).
-  Service presets wire this automatically; hand-written `credentials` entries
-  on a restricted `hosts:` entry must list the header themselves.
-
-Secrets file format (simple flat key/value map):
-
-  MY_API_KEY: "Bearer sk-real-key-here"
-  OTHER_SECRET: "some-value"
+See config.default.yaml for the config and secrets file formats, with a
+worked, test-covered example of every section. Enforcement precedence
+(unrestricted hosts entry > temporary allows > restricted rules > pending
+approval) is documented in docs/service-presets.md ("How enforcement
+works"); how header scrubbing and credential wiring interact on a restricted
+host is covered in that same file's "Credential presets" and "Known
+client-side friction" sections.
 """
 
 import collections
