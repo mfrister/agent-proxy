@@ -2,13 +2,23 @@
 # Keep this file outside the codebase so agents never see real credentials.
 # Example: secrets_file: /home/user/.config/agent-proxy/secrets.yaml
 #
-# Credentials support ${KEY} references resolved from that file:
+# Secrets file format (simple flat key/value map):
+#   MY_API_KEY: "Bearer sk-real-key-here"
+#   OTHER_SECRET: "some-value"
+#
+# Credentials support ${KEY} references resolved from that file. Two modes:
+# swap (agent sends a fake value, the proxy swaps in the real one -- set
+# fake_value) and inject (the proxy sets the header unconditionally -- omit
+# fake_value):
 # >>> example: credentials
 #   credentials:
 #     - host: api.openai.com
 #       header: Authorization
-#       fake_value: "Bearer sk-fake"
+#       fake_value: "Bearer sk-fake"       # swap mode: agent sends fake, proxy swaps real
 #       real_value: "${OPENAI_API_KEY}"
+#     - host: internal.example.com
+#       header: Cookie
+#       real_value: "session=abc123"       # inject mode: omit fake_value
 # <<<
 
 # management_port: 8082   # port for the management API (default: 8082)
@@ -23,8 +33,22 @@
 # happy_eyeballs_delay: 0.25
 
 hosts:
-  - host: api.anthropic.com
-  - host: platform.claude.com
+  - host: api.anthropic.com            # mapping form; a bare string ("api.anthropic.com")
+  - host: platform.claude.com          # works identically -- both are unrestricted.
+
+  # allow_response_cookies controls which Set-Cookie headers from a host
+  # reach the sandbox. Omitting it (as above) passes all of them through; an
+  # empty list strips every Set-Cookie header; a non-empty list allowlists
+  # only the named cookies.
+  #
+  # >>> example: cookies
+  # hosts:
+  #   - host: platform.claude.com
+  #     allow_response_cookies: []       # strip all Set-Cookie headers
+  #   - host: internal.example.com
+  #     allow_response_cookies:
+  #       - csrftoken                    # only csrftoken passes through; rest stripped
+  # <<<
 
   # Custom restricted hosts use the same rule engine as service presets
   # below: an entry with a `rules` list is restricted, one without is
@@ -98,6 +122,7 @@ hosts:
 #     write: true                            # allow issue/MR/note writes
 #     fake_value: "glpat-00000000000000fake"
 #     real_value: "${GITLAB_TOKEN}"
+#     # allow_host: false                    # broker the token but don't allowlist the host
 # <<<
 #   # - service: github                      # the explicit, logged opt-out from scoping
 #   #   unrestricted: true                   # -- blanket api.github.com access, no rule engine
