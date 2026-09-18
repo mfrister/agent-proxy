@@ -3,11 +3,13 @@
 # Example: secrets_file: /home/user/.config/agent-proxy/secrets.yaml
 #
 # Credentials support ${KEY} references resolved from that file:
+# >>> example: credentials
 #   credentials:
 #     - host: api.openai.com
 #       header: Authorization
 #       fake_value: "Bearer sk-fake"
 #       real_value: "${OPENAI_API_KEY}"
+# <<<
 
 # management_port: 8082   # port for the management API (default: 8082)
 
@@ -30,14 +32,17 @@ hosts:
   # (no *, + or {n,}). Omitting `query` on a rule forbids query strings
   # entirely.
   #
-  # - host: artifacts.internal.example.com
-  #   rules:
-  #     - methods: [GET, HEAD]
-  #       path: "/repo/[a-z0-9-]{1,64}/[a-zA-Z0-9._-]{1,128}"
-  #       query:
-  #         version: "[a-z0-9.]{1,32}"
-  #   request_headers: [authorization]   # extras beyond the base header allowlist
-  #   allow_response_cookies: []         # default for a restricted entry: strip all
+  # >>> example: restricted-host
+  # hosts:
+  #   - host: artifacts.internal.example.com
+  #     rules:
+  #       - methods: [GET, HEAD]
+  #         path: "/repo/[a-z0-9-]{1,64}/[a-zA-Z0-9._-]{1,128}"
+  #         query:
+  #           version: "[a-z0-9.]{1,32}"
+  #     request_headers: [authorization]   # extras beyond the base header allowlist
+  #     allow_response_cookies: []         # default for a restricted entry: strip all
+  # <<<
 
 # Service presets. Bare names enable read-only package-registry rule sets
 # (restricted hosts): each allows the GET/HEAD traffic its ecosystem needs —
@@ -73,6 +78,7 @@ hosts:
 # *used* beyond this list, they can't stop it from being *valid* beyond it.
 # Threat model and per-preset details: docs/service-presets.md
 #
+# >>> example: services
 # services:
 #   - go
 #   - npm
@@ -92,6 +98,7 @@ hosts:
 #     write: true                            # allow issue/MR/note writes
 #     fake_value: "glpat-00000000000000fake"
 #     real_value: "${GITLAB_TOKEN}"
+# <<<
 #   # - service: github                      # the explicit, logged opt-out from scoping
 #   #   unrestricted: true                   # -- blanket api.github.com access, no rule engine
 #   #   fake_value: "ghp_0000000000000000000000000000000000fake"
