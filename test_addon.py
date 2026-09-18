@@ -198,7 +198,8 @@ class TestRegistryPolicy:
         flow = make_flow("registry.example.com", method="POST", path="/pkg/foo")
         addon.request(flow)
         assert flow.response.status_code == 403
-        assert b"policy violation" in flow.response.content
+        assert b"not currently allowed by policy" in flow.response.content
+        assert b"pending human approval" in flow.response.content
         assert "Retry-After" not in flow.response.headers
         entry = state.deny_log[0]
         assert entry["type"] == "policy_violation"
