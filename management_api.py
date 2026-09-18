@@ -2,18 +2,84 @@
 Management API for the sandbox proxy.
 
 A small Flask app (loopback-only) that lets a human operator inspect denied
-requests and grant temporary or permanent allowlist entries. Served in a
-background thread by ManagementApiAddon (see addon.py).
+requests, grant temporary or permanent allowlist entries, and manage service
+presets. Served in a background thread by ManagementApiAddon (see addon.py).
+
+Real credentials are write-only through this API: they are accepted on
+POST/PUT /services, persisted to the configured secrets_file, referenced from
+config.yaml as ${KEY}, and never returned by any endpoint.
 """
 
 import json
 import logging
+import os
+import re
+import secrets as py_secrets
 import time
 
 import yaml
 from flask import Flask, jsonify, request as flask_request
 
-from config import Config, ProxyState
+import services as services_module
+from config import Config, ProxyState, require_bool
+
+
+def _service_key(entry) -> tuple:
+    """(service, host) identity of a raw `services` config entry."""
+    if isinstance(entry, str):
+        return entry, None
+    return entry.get("service"), entry.get("host")
+
+
+def _secret_key_for(service: str, host: str | None, existing: dict) -> str:
+    """A fresh secrets_file key for a service credential, deduped."""
+    raw = f"{service}_{host}" if host else service
+    base = "CRED_" + re.sub(r"[^A-Za-z0-9]+", "_", raw).upper().strip("_")
+    key, n = base, 2
+    while key in existing:
+        key, n = f"{base}_{n}", n + 1
+    return key
+
+
+def _secret_ref(entry) -> str | None:
+    """The ${KEY} name an entry's real_value references, if any."""
+    if not isinstance(entry, dict):
+        return None
+    m = re.fullmatch(r"\$\{([^}]+)\}", entry.get("real_value") or "")
+    return m.group(1) if m else None
+
+
+def _redacted_view(entry) -> dict:
+    """A `services` entry as returned by the API: never real_value."""
+    name, host = _service_key(entry)
+    preset = services_module.SERVICE_PRESETS.get(name)
+    view = {"service": name}
+    if host:
+        view["host"] = host
+    if preset is not None and preset.credential is not None:
+        view["kind"] = "credential"
+        view["header"] = preset.credential.header
+        if isinstance(entry, dict) and entry.get("fake_value"):
+            view["fake_value"] = entry["fake_value"]
+    else:
+        view["kind"] = "registry"
+    # scope/unrestricted/flags carry no secrets -- surface them as stored
+    # (raw, unescaped) so the TUI/API caller can show and re-edit them.
+    if preset is not None and preset.scope_params and isinstance(entry, dict):
+        if entry.get("unrestricted"):
+            view["unrestricted"] = True
+        elif "scope" in entry:
+            view["scope"] = entry["scope"]
+        for flag in preset.scope_flags:
+            if entry.get(flag.name):
+                view[flag.name] = True
+    return view
+
+
+def _generate_fake(spec) -> str:
+    """A random fake token matching the service client's expected shape."""
+    n = max(0, spec.fake_length - len(spec.fake_prefix))
+    return spec.fake_prefix + py_secrets.token_hex((n + 1) // 2)[:n]
 
 
 def create_app(state: ProxyState) -> Flask:
@@ -35,11 +101,15 @@ def create_app(state: ProxyState) -> Flask:
             active_temps = {
                 h: exp for h, exp in state.temp_allows.items() if now < exp
             }
+        permanent = []
         restricted = {}
-        for host, rules in state.restricted.items():
-            restricted.setdefault(rules.source or "config", []).append(host)
+        for host, rules in state.hosts.items():
+            if rules is None:
+                permanent.append(host)
+            else:
+                restricted.setdefault(rules.source or "config", []).append(host)
         return jsonify({
-            "permanent": sorted(state.allowlist),
+            "permanent": sorted(permanent),
             "temporary": active_temps,
             "restricted": {k: sorted(v) for k, v in restricted.items()},
         })
@@ -61,18 +131,32 @@ def create_app(state: ProxyState) -> Flask:
                 data = yaml.safe_load(f) or {}
         except FileNotFoundError:
             data = {}
-        hosts = data.get("allowed_hosts", [])
-        host_names = [h if isinstance(h, str) else h["host"] for h in hosts]
-        if host in host_names:
-            # Already permanent; drop any lingering temp entry so it doesn't
+        hosts = data.get("hosts", [])
+
+        def entry_host(item):
+            return item if isinstance(item, str) else item.get("host")
+
+        existing = next((item for item in hosts if entry_host(item) == host), None)
+        if existing is not None and not (isinstance(existing, dict) and "rules" in existing):
+            # Already unrestricted; drop any lingering temp entry so it doesn't
             # keep showing as temporarily-allowed alongside the permanent one.
             with state.temp_lock:
                 state.temp_allows.pop(host, None)
             return jsonify({"ok": True})
 
-        new_data = {**data, "allowed_hosts": hosts + [{"host": host}]}
+        # A host currently carrying `rules:` gets that entry replaced by the
+        # unrestricted form -- the durable version of the temp-allow escape
+        # hatch. A host with no entry at all is simply appended. Only `rules`
+        # is dropped: `allow_response_cookies` is a cookie-filtering choice
+        # independent of access, and silently discarding it here would leave
+        # the host with "all cookies pass" instead of what the operator set.
+        promoted = {"host": host}
+        if isinstance(existing, dict) and "allow_response_cookies" in existing:
+            promoted["allow_response_cookies"] = existing["allow_response_cookies"]
+        new_hosts = [item for item in hosts if entry_host(item) != host] + [promoted]
+        new_data = {**data, "hosts": new_hosts}
         try:
-            # Validate against the full config (credentials, restricted_hosts,
+            # Validate against the full config (credentials, service presets,
             # etc. all reload together) before writing anything to disk, so a
             # pre-existing bad section elsewhere can't leave config.yaml and
             # the running state out of sync.
@@ -87,6 +171,315 @@ def create_app(state: ProxyState) -> Flask:
         # Promotion to permanent supersedes any temporary grant for this host.
         with state.temp_lock:
             state.temp_allows.pop(host, None)
+        return jsonify({"ok": True})
+
+    # ── Service presets ────────────────────────────────────────────────────
+
+    def _read_config():
+        try:
+            with open(state.config_path) as f:
+                return yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            return {}
+
+    def _read_secrets(path):
+        """(parsed dict, original file text or None if the file is missing)."""
+        try:
+            with open(path) as f:
+                text = f.read()
+            return yaml.safe_load(text) or {}, text
+        except FileNotFoundError:
+            return {}, None
+
+    def _restore_secrets(path, original_text):
+        if original_text is None:
+            os.remove(path)
+        else:
+            with open(path, "w") as f:
+                f.write(original_text)
+
+    @app.get("/services/available")
+    def get_services_available():
+        catalog = []
+        for name in sorted(services_module.SERVICE_PRESETS):
+            preset = services_module.SERVICE_PRESETS[name]
+            item = {
+                "name": name,
+                "needs_token": preset.credential is not None,
+                "hosts": sorted(preset.hosts),
+                # host_param replaces the old bare `needs_host` bool: its
+                # presence means a host is needed, and its pattern lets a
+                # caller validate before ever posting.
+                "host_param": (
+                    {"name": preset.host_param.name, "pattern": preset.host_param.pattern}
+                    if preset.host_param is not None else None
+                ),
+                "scope_params": [
+                    {"name": p.name, "list": p.list, "required": p.required,
+                     "pattern": p.pattern}
+                    for p in preset.scope_params
+                ],
+                "scope_flags": [
+                    {"name": f.name, "description": f.description, "unscoped": f.unscoped}
+                    for f in preset.scope_flags
+                ],
+            }
+            if preset.credential is not None:
+                item["header"] = preset.credential.header
+                item["fake_prefix"] = preset.credential.fake_prefix
+            catalog.append(item)
+        return jsonify(catalog)
+
+    @app.get("/services")
+    def get_services():
+        data = _read_config()
+        return jsonify([_redacted_view(e) for e in data.get("services") or []])
+
+    @app.post("/services")
+    def add_service():
+        body = flask_request.get_json(force=True)
+        name = body.get("service")
+        host = body.get("host")
+        preset = services_module.SERVICE_PRESETS.get(name)
+        if preset is None:
+            return jsonify({"ok": False, "error": f"unknown service {name!r}"}), 400
+        if host and not preset.host_param:
+            return jsonify({"ok": False, "error": f"{name} does not take a host"}), 400
+
+        data = _read_config()
+        entries = list(data.get("services") or [])
+        if any(_service_key(e) == (name, host) for e in entries):
+            return jsonify({"ok": False, "error": "service already configured"}), 409
+
+        rollback = None
+        if preset.credential is None:
+            new_entry = name
+        else:
+            spec = preset.credential
+            if preset.host_param and not host:
+                return jsonify({"ok": False, "error": f"{name} requires a host"}), 400
+            if not body.get("real_value"):
+                return jsonify({"ok": False, "error": "real_value is required"}), 400
+
+            # Validate scope before touching secrets_file or config.yaml, so a
+            # missing/malformed scope on a scopable preset fails fast with a
+            # specific message instead of a generic 500 from Config.from_data
+            # (which still runs below as the final authority).
+            if preset.scope_params:
+                scope = body.get("scope")
+                try:
+                    unrestricted = require_bool(body, "unrestricted", False)
+                except ValueError as e:
+                    return jsonify({"ok": False, "error": str(e)}), 400
+                if scope and unrestricted:
+                    return jsonify({
+                        "ok": False,
+                        "error": f"{name}: 'scope' and 'unrestricted: true' are "
+                                 f"mutually exclusive",
+                    }), 400
+                if not unrestricted:
+                    try:
+                        preset.build_scope(scope)
+                    except ValueError as e:
+                        return jsonify({"ok": False, "error": str(e)}), 400
+
+            # Scope flags (write, graphql, ...) gate real access the same way
+            # `unrestricted` does -- reject a non-boolean value here too,
+            # rather than letting it reach Config.from_data as a stored
+            # config.yaml value.
+            for flag in preset.scope_flags:
+                if flag.name in body:
+                    try:
+                        require_bool(body, flag.name, False)
+                    except ValueError as e:
+                        return jsonify({"ok": False, "error": str(e)}), 400
+
+            secrets_path = data.get("secrets_file")
+            if not secrets_path:
+                return jsonify({
+                    "ok": False,
+                    "error": "secrets_file must be configured to store the real token",
+                }), 400
+
+            secrets_data, original_text = _read_secrets(secrets_path)
+            key = _secret_key_for(name, host, secrets_data)
+            secrets_data[key] = body["real_value"]
+            with open(secrets_path, "w") as f:
+                yaml.safe_dump(secrets_data, f)
+            rollback = (secrets_path, original_text)
+
+            new_entry = {"service": name, "fake_value": _generate_fake(spec),
+                         "real_value": "${" + key + "}"}
+            if host:
+                new_entry["host"] = host
+            # Scoping fields pass through verbatim: `scope` stays raw here
+            # (re-escaped and re-derived on every Config.from_data load, never
+            # persisted compiled). PUT /services (below) is where scope gets
+            # edited after the fact; build_scope above already gave an early
+            # 400 here, and Config.from_data is still the final authority.
+            if "scope" in body:
+                new_entry["scope"] = body["scope"]
+            if "unrestricted" in body:
+                new_entry["unrestricted"] = body["unrestricted"]
+            for flag in preset.scope_flags:
+                if flag.name in body:
+                    new_entry[flag.name] = body[flag.name]
+
+        new_data = {**data, "services": entries + [new_entry]}
+        try:
+            config = Config.from_data(new_data)
+        except Exception as e:
+            if rollback:
+                _restore_secrets(*rollback)
+            print(json.dumps({"event": "config_error", "message": str(e)}))
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+        with open(state.config_path, "w") as f:
+            yaml.safe_dump(new_data, f)
+        state.apply(config)
+        return jsonify({"ok": True, "service": _redacted_view(new_entry)})
+
+    @app.put("/services")
+    def edit_service():
+        """Rotate a service's token and/or edit its scope -- one verb, since
+        both are "change a field on an existing entry, validate, persist".
+        Editing scope never touches real_value/fake_value and rotating the
+        token never touches scope: each field below is only written into
+        new_entry when the caller actually supplied it.
+        """
+        body = flask_request.get_json(force=True)
+        name, host = body.get("service"), body.get("host")
+        preset = services_module.SERVICE_PRESETS.get(name)
+        flag_names = {f.name for f in preset.scope_flags} if preset else set()
+        provided = [k for k in ("real_value", "scope", "unrestricted", *flag_names) if k in body]
+        if not provided:
+            return jsonify({
+                "ok": False,
+                "error": "at least one of real_value, scope, unrestricted or a flag is required",
+            }), 400
+        if ("scope" in body or "unrestricted" in body) and not (preset and preset.scope_params):
+            return jsonify({"ok": False, "error": f"{name} does not support scoping"}), 400
+
+        data = _read_config()
+        entries = list(data.get("services") or [])
+        idx = next(
+            (i for i, e in enumerate(entries) if _service_key(e) == (name, host)), None
+        )
+        if idx is None:
+            return jsonify({"ok": False, "error": "service not configured"}), 404
+        entry = entries[idx]
+        new_entry = dict(entry) if isinstance(entry, dict) else {"service": entry}
+
+        rollback = None
+        if "real_value" in body:
+            if not body["real_value"]:
+                return jsonify({"ok": False, "error": "real_value is required"}), 400
+            key = _secret_ref(entry)
+            if key is None:
+                return jsonify({
+                    "ok": False,
+                    "error": "service has no ${KEY} token reference to rotate",
+                }), 400
+            secrets_path = data.get("secrets_file")
+            if not secrets_path:
+                return jsonify({"ok": False, "error": "secrets_file is not configured"}), 400
+            secrets_data, original_text = _read_secrets(secrets_path)
+            secrets_data[key] = body["real_value"]
+            with open(secrets_path, "w") as f:
+                yaml.safe_dump(secrets_data, f)
+            rollback = (secrets_path, original_text)
+
+        # `unrestricted` and every scope flag gate real access, same as on
+        # POST -- reject a non-boolean value instead of coercing it.
+        try:
+            if "unrestricted" in body:
+                require_bool(body, "unrestricted")
+            for flag in (preset.scope_flags if preset else ()):
+                if flag.name in body:
+                    require_bool(body, flag.name)
+        except ValueError as e:
+            if rollback:
+                _restore_secrets(*rollback)
+            return jsonify({"ok": False, "error": str(e)}), 400
+
+        # scope/unrestricted are mutually exclusive on the entry, same as
+        # Config.from_data's expansion: setting one clears the other rather
+        # than requiring the caller to explicitly unset it.
+        if "scope" in body:
+            new_entry["scope"] = body["scope"]
+            new_entry.pop("unrestricted", None)
+        if "unrestricted" in body:
+            if body["unrestricted"]:
+                new_entry["unrestricted"] = True
+                new_entry.pop("scope", None)
+            else:
+                new_entry.pop("unrestricted", None)
+        for flag in (preset.scope_flags if preset else ()):
+            if flag.name in body:
+                if body[flag.name]:
+                    new_entry[flag.name] = True
+                else:
+                    new_entry.pop(flag.name, None)
+
+        if preset is not None and preset.scope_params and not new_entry.get("unrestricted"):
+            try:
+                preset.build_scope(new_entry.get("scope"))
+            except ValueError as e:
+                if rollback:
+                    _restore_secrets(*rollback)
+                return jsonify({"ok": False, "error": str(e)}), 400
+
+        new_entries = list(entries)
+        new_entries[idx] = new_entry
+        new_data = {**data, "services": new_entries}
+        try:
+            config = Config.from_data(new_data)
+        except Exception as e:
+            if rollback:
+                _restore_secrets(*rollback)
+            print(json.dumps({"event": "config_error", "message": str(e)}))
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+        with open(state.config_path, "w") as f:
+            yaml.safe_dump(new_data, f)
+        state.apply(config)
+        return jsonify({"ok": True, "service": _redacted_view(new_entry)})
+
+    @app.delete("/services")
+    def remove_service():
+        body = flask_request.get_json(force=True)
+        name, host = body.get("service"), body.get("host")
+
+        data = _read_config()
+        entries = list(data.get("services") or [])
+        entry = next((e for e in entries if _service_key(e) == (name, host)), None)
+        if entry is None:
+            return jsonify({"ok": False, "error": "service not configured"}), 404
+
+        new_data = {**data, "services": [e for e in entries if e is not entry]}
+        try:
+            config = Config.from_data(new_data)
+        except Exception as e:
+            print(json.dumps({"event": "config_error", "message": str(e)}))
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+        with open(state.config_path, "w") as f:
+            yaml.safe_dump(new_data, f)
+        state.apply(config)
+
+        # The entry is gone from the config; scrub its secret, unless another
+        # entry (service or hand-written credential) still references the key.
+        key = _secret_ref(entry)
+        secrets_path = data.get("secrets_file")
+        if key and "${" + key + "}" in yaml.safe_dump(new_data):
+            key = None
+        if key and secrets_path:
+            secrets_data, original_text = _read_secrets(secrets_path)
+            if original_text is not None and key in secrets_data:
+                del secrets_data[key]
+                with open(secrets_path, "w") as f:
+                    yaml.safe_dump(secrets_data, f)
+
         return jsonify({"ok": True})
 
     return app

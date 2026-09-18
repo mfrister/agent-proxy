@@ -2,12 +2,24 @@
 # Keep this file outside the codebase so agents never see real credentials.
 # Example: secrets_file: /home/user/.config/agent-proxy/secrets.yaml
 #
-# Credentials support ${KEY} references resolved from that file:
+# Secrets file format (simple flat key/value map):
+#   MY_API_KEY: "Bearer sk-real-key-here"
+#   OTHER_SECRET: "some-value"
+#
+# Credentials support ${KEY} references resolved from that file. Two modes:
+# swap (agent sends a fake value, the proxy swaps in the real one -- set
+# fake_value) and inject (the proxy sets the header unconditionally -- omit
+# fake_value):
+# >>> example: credentials
 #   credentials:
 #     - host: api.openai.com
 #       header: Authorization
-#       fake_value: "Bearer sk-fake"
+#       fake_value: "Bearer sk-fake"       # swap mode: agent sends fake, proxy swaps real
 #       real_value: "${OPENAI_API_KEY}"
+#     - host: internal.example.com
+#       header: Cookie
+#       real_value: "session=abc123"       # inject mode: omit fake_value
+# <<<
 
 # management_port: 8082   # port for the management API (default: 8082)
 
@@ -20,28 +32,100 @@
 #
 # happy_eyeballs_delay: 0.25
 
-allowed_hosts:
-  - host: api.anthropic.com
-  - host: platform.claude.com
+hosts:
+  - host: api.anthropic.com            # mapping form; a bare string ("api.anthropic.com")
+  - host: platform.claude.com          # works identically -- both are unrestricted.
 
-# Read-only package-registry presets (restricted hosts). Each preset allows the
-# GET/HEAD traffic its ecosystem needs — pinned hosts, anchored URL patterns,
-# query-param and request-header allowlists — while blocking everything else
-# with a 403. Threat model and per-preset details: docs/registry-presets.md
-# Available presets: go, npm, docker, ghcr, pypi, crates
-#
-# allowed_registries: [go, npm, docker, ghcr, pypi, crates]
+  # allow_response_cookies controls which Set-Cookie headers from a host
+  # reach the sandbox. Omitting it (as above) passes all of them through; an
+  # empty list strips every Set-Cookie header; a non-empty list allowlists
+  # only the named cookies.
+  #
+  # >>> example: cookies
+  # hosts:
+  #   - host: platform.claude.com
+  #     allow_response_cookies: []       # strip all Set-Cookie headers
+  #   - host: internal.example.com
+  #     allow_response_cookies:
+  #       - csrftoken                    # only csrftoken passes through; rest stripped
+  # <<<
 
-# Custom restricted hosts use the same rule engine. Patterns are matched with
-# fullmatch and must be bounded (no *, + or {n,}). Omitting `query` on a rule
-# forbids query strings entirely.
+  # Custom restricted hosts use the same rule engine as service presets
+  # below: an entry with a `rules` list is restricted, one without is
+  # unrestricted. Patterns are matched with fullmatch and must be bounded
+  # (no *, + or {n,}). Omitting `query` on a rule forbids query strings
+  # entirely.
+  #
+  # >>> example: restricted-host
+  # hosts:
+  #   - host: artifacts.internal.example.com
+  #     rules:
+  #       - methods: [GET, HEAD]
+  #         path: "/repo/[a-z0-9-]{1,64}/[a-zA-Z0-9._-]{1,128}"
+  #         query:
+  #           version: "[a-z0-9.]{1,32}"
+  #     request_headers: [authorization]   # extras beyond the base header allowlist
+  #     allow_response_cookies: []         # default for a restricted entry: strip all
+  # <<<
+
+# Service presets. Bare names enable read-only package-registry rule sets
+# (restricted hosts): each allows the GET/HEAD traffic its ecosystem needs —
+# pinned hosts, anchored URL patterns, query-param and request-header
+# allowlists — while blocking everything else with a 503 + Retry-After
+# (same shape as the pending-approval response, since a human may grant a
+# temporary allow; the deny log still tags it `policy_violation`).
+# Registry presets (go, npm, docker, ghcr, pypi, crates): full per-preset
+# host/allows table in docs/service-presets.md ("## Presets").
 #
-# restricted_hosts:
-#   - host: artifacts.internal.example.com
-#     rules:
-#       - methods: [GET, HEAD]
-#         path: "/repo/[a-z0-9-]{1,64}/[a-zA-Z0-9._-]{1,128}"
-#         query:
-#           version: "[a-z0-9.]{1,32}"
-#     request_headers: [authorization]   # extras beyond the base header allowlist
-#     allow_response_cookies: []         # default for restricted hosts: strip all
+# github/gitlab are scoped API presets, not blanket-access credential
+# presets: the entry must name the repos/orgs (github) or projects/groups
+# (gitlab) an agent may reach under `scope:`, which compiles into the same
+# restricted-host rule engine the registry presets use -- everything else on
+# api.github.com (or the gitlab instance) gets the same 503 + Retry-After
+# treatment. `write: true` opts in to
+# issue/PR/comment writes (github) or issue/MR/note writes (gitlab); write
+# bodies are size- and content-type-bounded, never inspected, so repo
+# scoping bounds *which* repos are reachable, not what gets written into
+# them. `graphql: true` (github only) opens unscoped `POST /graphql` --
+# GraphQL can address a repo through opaque global IDs that no path pattern
+# can constrain, so scoping it soundly means using a fine-grained PAT, not
+# this flag. `unrestricted: true` is the explicit, logged opt-out from
+# scoping entirely (blanket host access, like the old default) -- a scopable
+# service requires exactly one of `scope:` or `unrestricted: true`; setting
+# neither is a config-load error, not a warning. Self-hosted services
+# (gitlab) also take the instance host in the entry.
+#
+# Whichever way it's scoped, the API token is still brokered the same as
+# any credential preset: the CLI in the sandbox holds the fake token, the
+# proxy swaps in the real one -- but the token itself should *also* be
+# scoped (a GitHub fine-grained PAT limited to the same repos, or a GitLab
+# project access token): these proxy rules stop a broader token from being
+# *used* beyond this list, they can't stop it from being *valid* beyond it.
+# Threat model and per-preset details: docs/service-presets.md
+#
+# >>> example: services
+# services:
+#   - go
+#   - npm
+#   - service: github
+#     scope:
+#       repos: [myorg/myrepo, myorg/other]   # exact owner/repo
+#       orgs: [myorg-sandbox]                # every repo under this org
+#     write: true                            # allow issue/PR/comment writes
+#     # graphql: true                        # allow POST /graphql -- UNSCOPED, see above
+#     fake_value: "ghp_0000000000000000000000000000000000fake"
+#     real_value: "${GITHUB_TOKEN}"
+#   - service: gitlab
+#     host: gitlab.example.com
+#     scope:
+#       projects: [team/backend]             # exact namespace/…/project
+#       groups: [team/sandbox]               # every project directly under this group
+#     write: true                            # allow issue/MR/note writes
+#     fake_value: "glpat-00000000000000fake"
+#     real_value: "${GITLAB_TOKEN}"
+#     # allow_host: false                    # broker the token but don't allowlist the host
+# <<<
+#   # - service: github                      # the explicit, logged opt-out from scoping
+#   #   unrestricted: true                   # -- blanket api.github.com access, no rule engine
+#   #   fake_value: "ghp_0000000000000000000000000000000000fake"
+#   #   real_value: "${GITHUB_TOKEN}"

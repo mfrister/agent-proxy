@@ -11,14 +11,31 @@ from datetime import datetime
 import httpx
 from rich.markup import escape
 from rich.text import Text
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.events import Focus
 from textual.reactive import reactive
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.screen import ModalScreen, Screen
+from textual.widgets import DataTable, Footer, Header, Input, Label, Static
 
 DURATIONS: list[tuple[str, int]] = [("1m", 60), ("10m", 600), ("2h", 7200)]
+
+
+async def _api_request(base_url: str, method: str, path: str, body: dict | None = None):
+    """Call the management API; raise RuntimeError with the API's error text."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        r = await client.request(method, f"{base_url}{path}", json=body)
+    try:
+        data = r.json()
+    except Exception:
+        r.raise_for_status()
+        raise RuntimeError(f"unexpected response: {r.text[:200]}")
+    if r.status_code >= 400:
+        error = data.get("error") if isinstance(data, dict) else None
+        raise RuntimeError(error or f"HTTP {r.status_code}")
+    return data
 
 
 def _fmt_time(iso: str) -> str:
@@ -53,7 +70,10 @@ class DurationBar(Static):
             else:
                 parts.append(f"  {label}  ")
         dur_str = "".join(parts)
-        return f"Duration: {dur_str}   [dim]t[/dim]=temp  [dim]p[/dim]=perm  [dim]r[/dim]=refresh  [dim]q[/dim]=quit"
+        return (
+            f"Duration: {dur_str}   [dim]t[/dim]=temp  [dim]p[/dim]=perm  "
+            f"[dim]s[/dim]=services  [dim]r[/dim]=refresh  [dim]q[/dim]=quit"
+        )
 
 
 class UrlBar(Static):
@@ -70,6 +90,465 @@ class UrlBar(Static):
         if self.reason:
             line += f"  [red]✗ {escape(self.reason)}[/red]"
         return line
+
+
+class PickServiceScreen(ModalScreen[dict | None]):
+    """Pick a service preset from the /services/available catalog."""
+
+    CSS = """
+    PickServiceScreen {
+        align: center middle;
+    }
+    #pick-dialog {
+        width: 76;
+        height: auto;
+        max-height: 80%;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #pick-table {
+        height: auto;
+        max-height: 20;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("j", "cursor_down", "Down", show=False),
+    ]
+
+    def __init__(self, catalog: list[dict]) -> None:
+        super().__init__()
+        self._catalog = catalog
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pick-dialog"):
+            yield Label("Add service — Enter to select, Esc to cancel")
+            yield DataTable(id="pick-table", cursor_type="row", zebra_stripes=True)
+
+    def on_mount(self) -> None:
+        table = self.query_one("#pick-table", DataTable)
+        table.add_columns("Service", "Kind", "Hosts / header")
+        for item in self._catalog:
+            if item["needs_token"]:
+                kind = "credential"
+                detail = f"{', '.join(item['hosts']) or '<your host>'} ({item['header']})"
+            else:
+                kind = "registry"
+                detail = ", ".join(item["hosts"])
+            table.add_row(item["name"], kind, detail, key=item["name"])
+        table.focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cursor_up(self) -> None:
+        self.query_one("#pick-table", DataTable).action_cursor_up()
+
+    def action_cursor_down(self) -> None:
+        self.query_one("#pick-table", DataTable).action_cursor_down()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        # DataTable emits this on Enter (and click) for the cursor row.
+        self.dismiss(self._catalog[event.cursor_row])
+
+
+class TextPromptScreen(ModalScreen[str | None]):
+    """One-line text prompt; password=True masks the input."""
+
+    CSS = """
+    TextPromptScreen {
+        align: center middle;
+    }
+    #prompt-dialog {
+        width: 76;
+        height: auto;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, prompt: str, password: bool = False) -> None:
+        super().__init__()
+        self._prompt = prompt
+        self._password = password
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="prompt-dialog"):
+            yield Label(self._prompt)
+            yield Input(password=self._password, id="prompt-input")
+
+    def on_mount(self) -> None:
+        self.query_one("#prompt-input", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    """Yes/no confirmation."""
+
+    CSS = """
+    ConfirmScreen {
+        align: center middle;
+    }
+    #confirm-dialog {
+        width: 60;
+        height: auto;
+        border: thick $warning;
+        background: $surface;
+        padding: 1 2;
+    }
+    """
+
+    BINDINGS = [
+        Binding("y", "yes", "Yes"),
+        Binding("n,escape", "no", "No"),
+    ]
+
+    def __init__(self, question: str) -> None:
+        super().__init__()
+        self._question = question
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Label(self._question)
+            yield Label("[dim]y[/dim]=yes  [dim]n[/dim]=no")
+
+    def action_yes(self) -> None:
+        self.dismiss(True)
+
+    def action_no(self) -> None:
+        self.dismiss(False)
+
+
+class ServicesScreen(Screen):
+    """Configured service presets, with add / rotate-token / remove.
+
+    Real tokens are entered once (masked) and sent to the management API,
+    which stores them in secrets_file; they are never displayed or re-fetched.
+    The generated fake token stays visible — it's what the CLI is given.
+    """
+
+    CSS = """
+    #services-pane {
+        border: solid $primary;
+        border-title-align: left;
+        height: 1fr;
+    }
+    #services-hint {
+        height: 1;
+        background: $panel;
+        padding: 0 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape,q", "back", "Back"),
+        Binding("a", "add_service", "Add"),
+        Binding("o", "rotate_token", "Rotate token"),
+        Binding("e", "edit_scope", "Edit scope"),
+        Binding("x", "remove_service", "Remove"),
+        Binding("r", "refresh", "Refresh", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("j", "cursor_down", "Down", show=False),
+    ]
+
+    def __init__(self, base_url: str) -> None:
+        super().__init__()
+        self.base_url = base_url
+        self._rows: list[dict] = []
+        # name -> /services/available catalog item; loaded once (presets are
+        # static for the lifetime of the process) and used to render the
+        # Scope column and drive the add/edit prompts.
+        self._catalog: dict[str, dict] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical(id="services-pane"):
+            yield DataTable(id="services-table", cursor_type="row", zebra_stripes=True)
+        yield Static(
+            "[dim]a[/dim]=add  [dim]o[/dim]=rotate token  [dim]e[/dim]=edit scope  "
+            "[dim]x[/dim]=remove  [dim]r[/dim]=refresh  [dim]esc[/dim]=back",
+            id="services-hint",
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        pane = self.query_one("#services-pane", Vertical)
+        pane.border_title = "SERVICES"
+        table = self.query_one("#services-table", DataTable)
+        table.add_columns("Service", "Host", "Kind", "Header", "Fake token", "Scope")
+        table.focus()
+        self.run_worker(self._refresh())
+
+    def _scope_cell(self, row: dict) -> Text | str:
+        """Render a row's Scope column: named scope + flags, with any
+        `unscoped` flag highlighted so the blanket-access choice stays
+        visible in the table, not just at the moment it was made."""
+        if row.get("unrestricted"):
+            return Text("UNRESTRICTED", style="bold red")
+        preset = self._catalog.get(row["service"], {})
+        scope_params = preset.get("scope_params") or []
+        scope_flags = preset.get("scope_flags") or []
+        if not scope_params:
+            return ""
+
+        text = Text()
+        scope = row.get("scope") or {}
+        for param in scope_params:
+            values = scope.get(param["name"])
+            if not values:
+                continue
+            if isinstance(values, list):
+                values = ",".join(values)
+            if text.plain:
+                text.append("  ")
+            text.append(f"{param['name']}={values}")
+        for flag in scope_flags:
+            if not row.get(flag["name"]):
+                continue
+            if text.plain:
+                text.append("  ")
+            text.append(flag["name"], style="bold red" if flag["unscoped"] else None)
+        return text if text.plain else Text("—", style="dim")
+
+    async def _refresh(self) -> None:
+        if not self._catalog:
+            try:
+                catalog = await _api_request(self.base_url, "GET", "/services/available")
+                self._catalog = {item["name"]: item for item in catalog}
+            except Exception:
+                pass  # table still renders; Scope column just loses highlighting
+        try:
+            self._rows = await _api_request(self.base_url, "GET", "/services")
+        except Exception as exc:
+            self.notify(f"Fetch error: {exc}", severity="error", timeout=5)
+            return
+        table = self.query_one("#services-table", DataTable)
+        current_row = table.cursor_row
+        table.clear()
+        for row in self._rows:
+            table.add_row(
+                row["service"],
+                row.get("host", ""),
+                row["kind"],
+                row.get("header", ""),
+                row.get("fake_value", ""),
+                self._scope_cell(row),
+                key=f"{row['service']}:{row.get('host', '')}",
+            )
+        if current_row < len(self._rows):
+            table.move_cursor(row=current_row)
+
+    def _selected(self) -> dict | None:
+        table = self.query_one("#services-table", DataTable)
+        if 0 <= table.cursor_row < len(self._rows):
+            return self._rows[table.cursor_row]
+        return None
+
+    def _identity(self, row: dict) -> dict:
+        body = {"service": row["service"]}
+        if row.get("host"):
+            body["host"] = row["host"]
+        return body
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    def action_cursor_up(self) -> None:
+        self.query_one("#services-table", DataTable).action_cursor_up()
+
+    def action_cursor_down(self) -> None:
+        self.query_one("#services-table", DataTable).action_cursor_down()
+
+    async def action_refresh(self) -> None:
+        await self._refresh()
+
+    async def _prompt_scope(self, name: str, scope_params: list[dict]) -> dict:
+        """One TextPromptScreen per scope param; comma-separated for list
+        params. A blank answer skips that param (no key in the result)."""
+        scope: dict = {}
+        for param in scope_params:
+            prompt = f"{name} scope: {param['name']}"
+            if param["list"]:
+                prompt += " (comma-separated)"
+            raw = await self.app.push_screen_wait(TextPromptScreen(f"{prompt}:"))
+            if not raw:
+                continue
+            if param["list"]:
+                values = [v.strip() for v in raw.split(",") if v.strip()]
+                if values:
+                    scope[param["name"]] = values
+            else:
+                scope[param["name"]] = raw.strip()
+        return scope
+
+    async def _prompt_scope_or_unrestricted(self, name: str, scope_params: list[dict]) -> dict | None:
+        """Prompt every scope param; if the operator leaves all of them
+        blank, spell out the consequence in plain language before granting
+        blanket access. Returns {"scope": {...}} or {"unrestricted": True},
+        or None if the operator declined unrestricted access (caller should
+        abort -- this is the one place that blanket-access decision is made
+        by a human, so there is no silent fallback).
+        """
+        scope = await self._prompt_scope(name, scope_params)
+        if scope:
+            return {"scope": scope}
+        confirmed = await self.app.push_screen_wait(ConfirmScreen(
+            f"No scope given for {name}.\n\n"
+            f"[bold red]Without a scope, {name} will be able to reach "
+            f"EVERYTHING the token can reach[/bold red] -- every repo, org, "
+            "or project it's valid for, not just the ones you name here.\n\n"
+            f"Grant {name} unrestricted access anyway?"
+        ))
+        return {"unrestricted": True} if confirmed else None
+
+    async def _prompt_flags(self, name: str, scope_flags: list[dict]) -> dict:
+        """One ConfirmScreen per declared flag. Always records True/False
+        explicitly (not just True on yes) so an edit can turn a flag back
+        off, not only on."""
+        flags: dict = {}
+        for flag in scope_flags:
+            question = f"Enable {flag['name']} for {name}?\n\n{flag['description']}"
+            if flag["unscoped"]:
+                question += (
+                    "\n\n[bold red]This defeats scoping[/bold red] -- it lets "
+                    f"{name} reach beyond the scope named above."
+                )
+            flags[flag["name"]] = await self.app.push_screen_wait(ConfirmScreen(question))
+        return flags
+
+    @work
+    async def action_add_service(self) -> None:
+        try:
+            catalog = await _api_request(self.base_url, "GET", "/services/available")
+        except Exception as exc:
+            self.notify(f"Fetch error: {exc}", severity="error", timeout=5)
+            return
+        item = await self.app.push_screen_wait(PickServiceScreen(catalog))
+        if item is None:
+            return
+        body = {"service": item["name"]}
+        if item["host_param"]:
+            host = await self.app.push_screen_wait(TextPromptScreen(
+                f"Host for {item['name']} (e.g. gitlab.example.com):"
+            ))
+            if not host:
+                return
+            body["host"] = host
+        if item["needs_token"]:
+            token = await self.app.push_screen_wait(TextPromptScreen(
+                f"Real token for {item['name']} — stored in secrets_file, "
+                "never shown again:",
+                password=True,
+            ))
+            if not token:
+                return
+            body["real_value"] = token
+        if item["scope_params"]:
+            scoping = await self._prompt_scope_or_unrestricted(item["name"], item["scope_params"])
+            if scoping is None:
+                self.notify(f"Add cancelled — {item['name']} needs a scope", severity="warning")
+                return
+            body.update(scoping)
+        if item["scope_flags"]:
+            body.update(await self._prompt_flags(item["name"], item["scope_flags"]))
+        try:
+            result = await _api_request(self.base_url, "POST", "/services", body)
+        except Exception as exc:
+            self.notify(f"Error: {exc}", severity="error", timeout=8)
+            return
+        fake = result["service"].get("fake_value")
+        if fake:
+            self.notify(
+                f"Added {item['name']}. Give the CLI the fake token "
+                f"(also in the table): {fake}",
+                timeout=10,
+            )
+        else:
+            self.notify(f"Added {item['name']}")
+        await self._refresh()
+
+    @work
+    async def action_edit_scope(self) -> None:
+        row = self._selected()
+        if row is None:
+            return
+        preset = self._catalog.get(row["service"])
+        if not preset or not preset["scope_params"]:
+            self.notify(f"{row['service']} has no scope to edit", severity="warning")
+            return
+        scoping = await self._prompt_scope_or_unrestricted(row["service"], preset["scope_params"])
+        if scoping is None:
+            self.notify("Scope edit cancelled — no scope given", severity="warning")
+            return
+        body = {**self._identity(row), **scoping}
+        if preset["scope_flags"]:
+            body.update(await self._prompt_flags(row["service"], preset["scope_flags"]))
+        try:
+            # Extended PUT /services: scope/flags only, never real_value --
+            # editing scope must not touch the brokered token.
+            await _api_request(self.base_url, "PUT", "/services", body)
+        except Exception as exc:
+            self.notify(f"Error: {exc}", severity="error", timeout=8)
+            return
+        self.notify(f"Updated scope for {row['service']}")
+        await self._refresh()
+
+    @work
+    async def action_rotate_token(self) -> None:
+        row = self._selected()
+        if row is None:
+            return
+        if row["kind"] != "credential":
+            self.notify("Registry services have no token to rotate", severity="warning")
+            return
+        token = await self.app.push_screen_wait(TextPromptScreen(
+            f"New real token for {row['service']} — the fake token the CLI "
+            "holds stays the same:",
+            password=True,
+        ))
+        if not token:
+            return
+        try:
+            await _api_request(
+                self.base_url, "PUT", "/services",
+                {**self._identity(row), "real_value": token},
+            )
+        except Exception as exc:
+            self.notify(f"Error: {exc}", severity="error", timeout=8)
+            return
+        self.notify(f"Rotated token for {row['service']}")
+        await self._refresh()
+
+    @work
+    async def action_remove_service(self) -> None:
+        row = self._selected()
+        if row is None:
+            return
+        label = row["service"] + (f" ({row['host']})" if row.get("host") else "")
+        confirmed = await self.app.push_screen_wait(ConfirmScreen(
+            f"Remove service {label}? Its host access and any stored token "
+            "are removed."
+        ))
+        if not confirmed:
+            return
+        try:
+            await _api_request(self.base_url, "DELETE", "/services", self._identity(row))
+        except Exception as exc:
+            self.notify(f"Error: {exc}", severity="error", timeout=8)
+            return
+        self.notify(f"Removed {label}")
+        await self._refresh()
 
 
 class ProxyMonitor(App[None]):
@@ -136,6 +615,7 @@ class ProxyMonitor(App[None]):
         Binding("d", "cycle_duration", "Cycle duration", show=False),
         Binding("t", "temp_allow", "Temp allow", show=False),
         Binding("p", "perm_allow", "Perm allow", show=False),
+        Binding("s", "services", "Services", show=False),
         Binding("k", "move_up", "Up", show=False),
         Binding("j", "move_down", "Down", show=False),
     ]
@@ -350,6 +830,9 @@ class ProxyMonitor(App[None]):
     async def action_refresh(self) -> None:
         self._skip_ticks = 0
         await self._refresh_data()
+
+    def action_services(self) -> None:
+        self.push_screen(ServicesScreen(self.base_url))
 
     def _selected_left_host(self) -> str | None:
         """Host of the selected left-pane row (denied or temp-allowed)."""

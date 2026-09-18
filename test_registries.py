@@ -4,20 +4,30 @@ Tests for the registry rule engine and preset data.
 Run with:  pytest test_registries.py -v
 """
 
+import re
+
 import pytest
 
 import registries
-from registries import Allowed, Violation, compile_host_rules, evaluate
+from registries import (
+    Allowed,
+    Violation,
+    compile_host_rules,
+    evaluate,
+    literal_alternation,
+)
 
 
-def check(preset: str, host: str, method: str, path: str, has_body: bool = False):
+def check(preset: str, host: str, method: str, path: str, body_len: int = 0,
+          content_type: str | None = None):
     """Evaluate a request against a preset host with no extra headers."""
     return evaluate(
         registries.PRESETS[preset][host],
         method=method,
         path_with_query=path,
         headers={},
-        has_body=has_body,
+        body_len=body_len,
+        content_type=content_type,
     )
 
 
@@ -169,43 +179,43 @@ def simple_rules(**spec_overrides):
 class TestEvaluate:
     def test_fullmatch_prefix_attack(self):
         # A pattern must match the whole path, not a prefix of it
-        verdict = evaluate(simple_rules(), "GET", "/repo/foo/../../etc", {}, False)
+        verdict = evaluate(simple_rules(), "GET", "/repo/foo/../../etc", {}, 0)
         assert isinstance(verdict, Violation)
-        verdict = evaluate(simple_rules(), "GET", "/repo/foo/extra", {}, False)
+        verdict = evaluate(simple_rules(), "GET", "/repo/foo/extra", {}, 0)
         assert isinstance(verdict, Violation)
 
     def test_query_allowed_param(self):
-        verdict = evaluate(simple_rules(), "GET", "/repo/foo?version=1.2.3", {}, False)
+        verdict = evaluate(simple_rules(), "GET", "/repo/foo?version=1.2.3", {}, 0)
         assert isinstance(verdict, Allowed)
 
     def test_query_unknown_param_rejected(self):
-        verdict = evaluate(simple_rules(), "GET", "/repo/foo?data=secret", {}, False)
+        verdict = evaluate(simple_rules(), "GET", "/repo/foo?data=secret", {}, 0)
         assert isinstance(verdict, Violation)
         assert "data" in verdict.reason
 
     def test_query_bad_value_rejected(self):
-        verdict = evaluate(simple_rules(), "GET", "/repo/foo?version=UPPER", {}, False)
+        verdict = evaluate(simple_rules(), "GET", "/repo/foo?version=UPPER", {}, 0)
         assert isinstance(verdict, Violation)
 
     def test_valueless_query_field_still_checked(self):
-        verdict = evaluate(simple_rules(), "GET", "/repo/foo?smuggled-data", {}, False)
+        verdict = evaluate(simple_rules(), "GET", "/repo/foo?smuggled-data", {}, 0)
         assert isinstance(verdict, Violation)
 
     def test_body_rejected(self):
-        verdict = evaluate(simple_rules(), "GET", "/repo/foo", {}, True)
+        verdict = evaluate(simple_rules(), "GET", "/repo/foo", {}, 10)
         assert isinstance(verdict, Violation)
         assert "body" in verdict.reason
 
     def test_url_too_long(self):
-        verdict = evaluate(simple_rules(), "GET", "/repo/" + "a" * 5000, {}, False)
+        verdict = evaluate(simple_rules(), "GET", "/repo/" + "a" * 5000, {}, 0)
         assert isinstance(verdict, Violation)
 
     def test_percent_encoded_traversal_rejected(self):
-        verdict = evaluate(simple_rules(), "GET", "/repo/%2e%2e", {}, False)
+        verdict = evaluate(simple_rules(), "GET", "/repo/%2e%2e", {}, 0)
         assert isinstance(verdict, Violation)
 
     def test_method_violation_reason(self):
-        verdict = evaluate(simple_rules(), "POST", "/repo/foo", {}, False)
+        verdict = evaluate(simple_rules(), "POST", "/repo/foo", {}, 0)
         assert isinstance(verdict, Violation)
         assert "POST" in verdict.reason
 
@@ -214,9 +224,9 @@ class TestEvaluate:
             "rules": [{"methods": ["GET"], "path": "/blob",
                        "query": {"*": "[a-z0-9]{0,64}"}}],
         }, source="test")
-        assert isinstance(evaluate(rules, "GET", "/blob?sig=abc123", {}, False), Allowed)
+        assert isinstance(evaluate(rules, "GET", "/blob?sig=abc123", {}, 0), Allowed)
         long_name = "n" * 50
-        verdict = evaluate(rules, "GET", f"/blob?{long_name}=x", {}, False)
+        verdict = evaluate(rules, "GET", f"/blob?{long_name}=x", {}, 0)
         assert isinstance(verdict, Violation)
 
 
@@ -225,28 +235,28 @@ class TestHeaderScrubbing:
         verdict = evaluate(
             simple_rules(), "GET", "/repo/foo",
             {"Accept": "*/*", "X-Exfil": "secret", "User-Agent": "curl"},
-            False,
+            0,
         )
         assert isinstance(verdict, Allowed)
         assert verdict.drop_headers == ("X-Exfil",)
 
     def test_authorization_dropped_unless_declared(self):
         verdict = evaluate(simple_rules(), "GET", "/repo/foo",
-                           {"Authorization": "Bearer x"}, False)
+                           {"Authorization": "Bearer x"}, 0)
         assert verdict.drop_headers == ("Authorization",)
 
         rules = simple_rules(request_headers=["authorization"])
-        verdict = evaluate(rules, "GET", "/repo/foo", {"Authorization": "Bearer x"}, False)
+        verdict = evaluate(rules, "GET", "/repo/foo", {"Authorization": "Bearer x"}, 0)
         assert verdict.drop_headers == ()
 
     def test_overlong_value_clamped(self):
         verdict = evaluate(simple_rules(), "GET", "/repo/foo",
-                           {"User-Agent": "u" * 600}, False)
+                           {"User-Agent": "u" * 600}, 0)
         assert verdict.clamp_headers == (("User-Agent", 512),)
 
     def test_docker_registry_allows_authorization(self):
         rules = registries.PRESETS["docker"]["registry-1.docker.io"]
-        verdict = evaluate(rules, "GET", "/v2/", {"Authorization": "Bearer tok"}, False)
+        verdict = evaluate(rules, "GET", "/v2/", {"Authorization": "Bearer tok"}, 0)
         assert isinstance(verdict, Allowed)
         assert verdict.drop_headers == ()
 
@@ -269,7 +279,7 @@ class TestCompileGuardrails:
         # '+' inside a character class is a literal, not a quantifier
         rules = compile_host_rules(
             {"rules": [{"methods": ["GET"], "path": "/x/[a-z+]{1,10}"}]}, "test")
-        assert isinstance(evaluate(rules, "GET", "/x/a+b", {}, False), Allowed)
+        assert isinstance(evaluate(rules, "GET", "/x/a+b", {}, 0), Allowed)
 
     def test_percent_requires_flag(self):
         with pytest.raises(ValueError, match="allow_percent"):
@@ -287,3 +297,186 @@ class TestCompileGuardrails:
                 assert host_rules.source == name
                 for rule in host_rules.rules:
                     assert rule.methods <= {"GET", "HEAD"}, (name, host)
+
+    def test_allow_body_without_max_body_bytes_rejected(self):
+        with pytest.raises(ValueError, match="max_body_bytes"):
+            compile_host_rules({"rules": [
+                {"methods": ["POST"], "path": "/write", "allow_body": True},
+            ]}, "test")
+
+    def test_allow_body_with_zero_max_body_bytes_rejected(self):
+        # max_body_bytes must be positive, not just present
+        with pytest.raises(ValueError, match="max_body_bytes"):
+            compile_host_rules({"rules": [
+                {"methods": ["POST"], "path": "/write",
+                 "allow_body": True, "max_body_bytes": 0},
+            ]}, "test")
+
+    def test_max_body_bytes_without_allow_body_rejected(self):
+        with pytest.raises(ValueError, match="allow_body"):
+            compile_host_rules({"rules": [
+                {"methods": ["POST"], "path": "/write", "max_body_bytes": 64},
+            ]}, "test")
+
+
+# ── Per-rule request bodies ──────────────────────────────────────────────────
+
+def body_rules(**rule_overrides):
+    rule = {
+        "methods": ["POST"], "path": "/write",
+        "allow_body": True, "max_body_bytes": 64,
+        "content_types": ["application/json"],
+    }
+    rule.update(rule_overrides)
+    return compile_host_rules({"rules": [rule]}, source="test")
+
+
+class TestAllowBody:
+    def test_bounded_body_accepted(self):
+        verdict = evaluate(body_rules(), "POST", "/write", {}, 32, "application/json")
+        assert isinstance(verdict, Allowed)
+
+    def test_oversized_body_rejected(self):
+        verdict = evaluate(body_rules(), "POST", "/write", {}, 65, "application/json")
+        assert isinstance(verdict, Violation)
+        assert "exceeds" in verdict.reason
+
+    def test_wrong_content_type_rejected(self):
+        verdict = evaluate(body_rules(), "POST", "/write", {}, 10, "text/plain")
+        assert isinstance(verdict, Violation)
+        assert "content-type" in verdict.reason
+
+    def test_content_type_parameters_ignored(self):
+        # only the base media type (before ';') is checked against content_types
+        verdict = evaluate(body_rules(), "POST", "/write", {}, 10,
+                            "application/json; charset=utf-8")
+        assert isinstance(verdict, Allowed)
+
+    def test_content_types_none_accepts_any(self):
+        rules = body_rules(content_types=None)
+        verdict = evaluate(rules, "POST", "/write", {}, 10, "anything/whatever")
+        assert isinstance(verdict, Allowed)
+
+    def test_rule_without_allow_body_still_rejects_any_body(self):
+        # simple_rules() default: allow_body=False
+        verdict = evaluate(simple_rules(), "GET", "/repo/foo", {}, 1)
+        assert isinstance(verdict, Violation)
+        assert "body" in verdict.reason
+
+
+# ── Wildcard-repeat lint ───────────────────────────────────────────────────────
+
+class TestWildcardRepeatLint:
+    # Every spelling of "a bounded repeat whose body can match '/' without
+    # saying so explicitly" — the grouping-construct bypasses that defeated
+    # the old '.{' substring search, plus one nested a level deeper.
+    BYPASS_PATTERNS = [
+        ".{0,512}",
+        "(?:.){0,512}",
+        "(.){0,512}",
+        "(a.){0,512}",
+        "(?:(a.)){0,5}",       # nested one level deeper
+        "((?:.)){0,5}",        # nested one level deeper, no literal
+    ]
+
+    @pytest.mark.parametrize("frag", BYPASS_PATTERNS)
+    def test_bypass_spellings_rejected_in_path(self, frag):
+        with pytest.raises(ValueError, match="cross-segment wildcard"):
+            compile_host_rules({"rules": [
+                {"methods": ["GET"], "path": "/x/" + frag},
+            ]}, "test")
+
+    @pytest.mark.parametrize("frag", BYPASS_PATTERNS)
+    def test_bypass_spellings_rejected_in_query_value(self, frag):
+        # Finding 2: query-value patterns previously only ran _assert_bounded,
+        # never this lint, so all of these compiled unrejected before the fix.
+        with pytest.raises(ValueError, match="cross-segment wildcard"):
+            compile_host_rules({"rules": [
+                {"methods": ["GET"], "path": "/x", "query": {"v": frag}},
+            ]}, "test")
+
+    def test_explicit_character_class_accepted(self):
+        rules = compile_host_rules({"rules": [
+            {"methods": ["GET"], "path": "/x/[A-Za-z0-9._/-]{0,512}"},
+        ]}, "test")
+        assert isinstance(evaluate(rules, "GET", "/x/foo/bar.txt", {}, 0), Allowed)
+
+    def test_explicit_character_class_accepted_in_query_value(self):
+        rules = compile_host_rules({"rules": [
+            {"methods": ["GET"], "path": "/x",
+             "query": {"v": "[A-Za-z0-9._-]{1,100}"}},
+        ]}, "test")
+        assert isinstance(evaluate(rules, "GET", "/x?v=abc.def", {}, 0), Allowed)
+
+    def test_bounded_segment_class_accepted(self):
+        # [A-Za-z0-9._-]{1,100} — a tightly-scoped single-segment class, no '/'.
+        rules = compile_host_rules({"rules": [
+            {"methods": ["GET"], "path": "/x/[A-Za-z0-9._-]{1,100}"},
+        ]}, "test")
+        assert isinstance(evaluate(rules, "GET", "/x/my-repo.git", {}, 0), Allowed)
+
+    def test_escaped_dot_before_bounded_quantifier_not_flagged(self):
+        # \.{1,2} quantifies the escaped (literal) dot itself — bounded
+        # repetition of a specific character, not a stand-in for "any char".
+        # (single dot, not two — ".." would separately trip the traversal check)
+        rules = compile_host_rules({"rules": [
+            {"methods": ["GET"], "path": r"/x/a\.{1,2}"},
+        ]}, "test")
+        assert isinstance(evaluate(rules, "GET", "/x/a.", {}, 0), Allowed)
+        assert isinstance(evaluate(rules, "GET", "/x/aXX", {}, 0), Violation)
+
+    def test_dot_inside_character_class_not_flagged(self):
+        # [.]{1,4} is a character class containing only '.' — bounded and
+        # specific, unlike a bare '.' which matches almost anything.
+        # (single dot — ".." would separately trip the traversal check)
+        rules = compile_host_rules({"rules": [
+            {"methods": ["GET"], "path": "/x/[.]{1,4}"},
+        ]}, "test")
+        assert isinstance(evaluate(rules, "GET", "/x/.", {}, 0), Allowed)
+
+    def test_negated_class_excluding_slash_accepted(self):
+        # [^/]{0,64} can never match '/' — bounded to a single path segment,
+        # so it's safe and useful (unlike a bare '.', which crosses segments).
+        rules = compile_host_rules({"rules": [
+            {"methods": ["GET"], "path": "/x/[^/]{0,64}"},
+        ]}, "test")
+        assert isinstance(evaluate(rules, "GET", "/x/one-segment", {}, 0), Allowed)
+        assert isinstance(evaluate(rules, "GET", "/x/two/segments", {}, 0), Violation)
+
+    def test_negated_class_not_excluding_slash_rejected(self):
+        # [^x]{0,512} excludes only 'x' — '/' (and almost everything else)
+        # still matches, so this is the same disguised wildcard as '.{0,512}'.
+        with pytest.raises(ValueError, match="cross-segment wildcard"):
+            compile_host_rules({"rules": [
+                {"methods": ["GET"], "path": "/x/[^x]{0,512}"},
+            ]}, "test")
+
+    def test_all_presets_still_compile(self):
+        # Import-time coverage is implicit (PRESETS is built at import), but
+        # this documents the intent explicitly: the lint must not be so
+        # strict that it breaks any curated preset.
+        for name, hosts in registries.PRESETS.items():
+            for host, host_rules in hosts.items():
+                assert host_rules.rules, (name, host)
+
+
+# ── literal_alternation ───────────────────────────────────────────────────────
+
+class TestLiteralAlternation:
+    def test_matches_items_literally(self):
+        pattern = literal_alternation(("a.b", "c(d"))
+        assert re.fullmatch(pattern, "a.b")
+        assert re.fullmatch(pattern, "c(d")
+
+    def test_unescaped_metacharacters_do_not_leak_through(self):
+        # if '.' or '(' were left unescaped, "axb" or a bare "d" would match
+        pattern = literal_alternation(("a.b", "c(d"))
+        assert re.fullmatch(pattern, "axb") is None
+        assert re.fullmatch(pattern, "d") is None
+
+    def test_case_insensitive(self):
+        # GitHub/GitLab resolve owner/repo case-insensitively
+        pattern = literal_alternation(("MyOrg/MyRepo",))
+        assert re.fullmatch(pattern, "MyOrg/MyRepo")
+        assert re.fullmatch(pattern, "myorg/myrepo")
+        assert re.fullmatch(pattern, "MYORG/MYREPO")

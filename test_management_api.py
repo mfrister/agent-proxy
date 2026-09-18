@@ -18,10 +18,10 @@ def mgmt(tmp_path):
     from management_api import create_app
 
     config = tmp_path / "config.yaml"
-    config.write_text("allowed_hosts:\n  - host: existing.com\n")
+    config.write_text("hosts:\n  - host: existing.com\n")
 
     state = make_state(
-        allowlist={"existing.com"},
+        hosts={"existing.com": None},
         config_path=str(config),
     )
     app = create_app(state)
@@ -29,6 +29,19 @@ def mgmt(tmp_path):
     with app.test_client() as client:
         client._state = state
         yield client
+
+
+@pytest.fixture
+def mgmt_secrets(mgmt, tmp_path):
+    """The mgmt client with a secrets_file configured (required for tokens)."""
+    secrets = tmp_path / "secrets.yaml"
+    config_path = mgmt._state.config_path
+    with open(config_path) as f:
+        original = f.read()
+    with open(config_path, "w") as f:
+        f.write(f"secrets_file: {secrets}\n" + original)
+    mgmt._secrets_path = secrets
+    return mgmt
 
 
 class TestManagementAPI:
@@ -57,7 +70,7 @@ class TestManagementAPI:
         assert data["restricted"] == {}
 
     def test_get_allowlist_restricted_grouped_by_source(self, mgmt):
-        mgmt._state.restricted = make_restricted()
+        mgmt._state.hosts = {**mgmt._state.hosts, **make_restricted()}
         data = mgmt.get("/allowlist").get_json()
         assert data["restricted"] == {"testpreset": ["registry.example.com"]}
 
@@ -81,7 +94,7 @@ class TestManagementAPI:
     def test_post_allow_permanent_updates_state(self, mgmt):
         r = mgmt.post("/allow/permanent", json={"host": "new.com"})
         assert r.get_json()["ok"] is True
-        assert "new.com" in mgmt._state.allowlist
+        assert mgmt._state.hosts.get("new.com") is None and "new.com" in mgmt._state.hosts
 
     def test_post_allow_permanent_clears_temp_entry(self, mgmt):
         state = mgmt._state
@@ -89,7 +102,7 @@ class TestManagementAPI:
             state.temp_allows["new.com"] = time.time() + 60
         r = mgmt.post("/allow/permanent", json={"host": "new.com"})
         assert r.get_json()["ok"] is True
-        assert "new.com" in state.allowlist
+        assert "new.com" in state.hosts and state.hosts["new.com"] is None
         with state.temp_lock:
             assert "new.com" not in state.temp_allows
 
@@ -102,6 +115,62 @@ class TestManagementAPI:
         with state.temp_lock:
             assert "existing.com" not in state.temp_allows
 
+    def test_post_allow_permanent_promotes_restricted_host(self, mgmt):
+        # A host currently covered by a `rules:` entry gets that entry
+        # replaced by the unrestricted form -- the durable version of the
+        # temp-allow escape hatch.
+        config_path = mgmt._state.config_path
+        with open(config_path) as f:
+            data = f.read()
+        with open(config_path, "w") as f:
+            f.write(
+                data +
+                "  - host: restricted.com\n"
+                "    rules:\n"
+                "      - methods: [GET]\n"
+                "        path: \"/only-this\"\n"
+            )
+        mgmt._state.reload()
+        assert mgmt._state.hosts["restricted.com"] is not None
+
+        r = mgmt.post("/allow/permanent", json={"host": "restricted.com"})
+        assert r.get_json()["ok"] is True
+        assert mgmt._state.hosts["restricted.com"] is None
+
+        with open(config_path) as f:
+            written = yaml.safe_load(f)
+        entries = written["hosts"]
+        matching = [h for h in entries if isinstance(h, dict) and h.get("host") == "restricted.com"]
+        assert len(matching) == 1
+        assert "rules" not in matching[0]
+
+    def test_post_allow_permanent_preserves_allow_response_cookies(self, mgmt):
+        # Promotion must drop `rules:` but keep `allow_response_cookies:` --
+        # dropping it silently falls back to "all cookies pass".
+        config_path = mgmt._state.config_path
+        with open(config_path) as f:
+            data = f.read()
+        with open(config_path, "w") as f:
+            f.write(
+                data +
+                "  - host: cookie.com\n"
+                "    allow_response_cookies: [csrftoken]\n"
+                "    rules:\n"
+                "      - methods: [GET]\n"
+                "        path: \"/only-this\"\n"
+            )
+        mgmt._state.reload()
+
+        r = mgmt.post("/allow/permanent", json={"host": "cookie.com"})
+        assert r.get_json()["ok"] is True
+        assert mgmt._state.hosts["cookie.com"] is None
+
+        with open(config_path) as f:
+            written = yaml.safe_load(f)
+        entry = next(h for h in written["hosts"] if isinstance(h, dict) and h.get("host") == "cookie.com")
+        assert "rules" not in entry
+        assert entry["allow_response_cookies"] == ["csrftoken"]
+
     def test_post_allow_permanent_writes_file(self, mgmt, tmp_path):
         mgmt.post("/allow/permanent", json={"host": "written.com"})
         config_path = mgmt._state.config_path
@@ -109,7 +178,7 @@ class TestManagementAPI:
             data = yaml.safe_load(f)
         host_names = [
             h if isinstance(h, str) else h["host"]
-            for h in data["allowed_hosts"]
+            for h in data["hosts"]
         ]
         assert "written.com" in host_names
 
@@ -120,7 +189,7 @@ class TestManagementAPI:
             data = yaml.safe_load(f)
         host_names = [
             h if isinstance(h, str) else h["host"]
-            for h in data["allowed_hosts"]
+            for h in data["hosts"]
         ]
         assert host_names.count("existing.com") == 1
 
@@ -128,15 +197,83 @@ class TestManagementAPI:
         mgmt.post("/allow/permanent", json={"host": "newdict.com"})
         with open(mgmt._state.config_path) as f:
             data = yaml.safe_load(f)
-        hosts = data["allowed_hosts"]
+        hosts = data["hosts"]
         assert any(
             (isinstance(h, dict) and h["host"] == "newdict.com") for h in hosts
         )
 
+    def test_real_credential_never_appears_in_any_response(self, mgmt, tmp_path):
+        # The management API must never expose brokered real credentials, and
+        # /allow/permanent must round-trip the raw config (${KEY} references)
+        # rather than the secret-expanded form.
+        real_token = "REAL-SECRET-TOKEN-a3f9"
+        from config import Credential
+        state = mgmt._state
+        state.credentials = [Credential(
+            host="api.github.com", header="Authorization",
+            fake_value="token ghp_fake", real_value=f"token {real_token}",
+            preset="github",
+        )]
+
+        # A second secret shaped so it fails the gitlab `host` pattern
+        # (a slash isn't a legal hostname character) and one that fails the
+        # github `scope.repos` pattern (an "owner/repo" value with no '/') --
+        # both exercise Finding 1's channel: ${KEY} used somewhere other
+        # than real_value/fake_value, expanded before the pattern check that
+        # then rejects it, echoing the secret into the ValueError.
+        bad_host_secret = "AKIA-other-secret/with-a-slash"
+        bad_scope_secret = "AKIA-yet-another-secret-no-slash"
+
+        secrets = tmp_path / "secrets.yaml"
+        secrets.write_text(
+            f"GITHUB_TOKEN: {real_token}\n"
+            f"BAD_HOST_SECRET: {bad_host_secret}\n"
+            f"BAD_SCOPE_SECRET: {bad_scope_secret}\n"
+        )
+        with open(state.config_path, "w") as f:
+            f.write(
+                f"secrets_file: {secrets}\n"
+                "hosts:\n  - host: existing.com\n"
+                "services:\n"
+                "  - service: github\n"
+                "    fake_value: ghp_fake\n"
+                "    real_value: ${GITHUB_TOKEN}\n"
+                "    unrestricted: true\n"
+            )
+
+        responses = [
+            mgmt.get("/denied"),
+            mgmt.get("/allowlist"),
+            mgmt.post("/allow/temp", json={"host": "temp.com"}),
+            mgmt.post("/allow/permanent", json={"host": "new.com"}),
+            # Finding 1/4: these used to fail config validation with a
+            # ValueError carrying the expanded secret verbatim, surfaced
+            # straight into the HTTP error response.
+            mgmt.post("/services", json={
+                "service": "gitlab", "host": "${BAD_HOST_SECRET}",
+                "unrestricted": True, "real_value": "tok",
+            }),
+            mgmt.post("/services", json={
+                "service": "github", "real_value": "tok",
+                "scope": {"repos": ["${BAD_SCOPE_SECRET}"]},
+            }),
+        ]
+        for r in responses:
+            body = r.get_data(as_text=True)
+            assert real_token not in body
+            assert bad_host_secret not in body
+            assert bad_scope_secret not in body
+
+        # The rewritten config still references the secret, not its value.
+        with open(state.config_path) as f:
+            written = f.read()
+        assert real_token not in written
+        assert "${GITHUB_TOKEN}" in written
+
     def test_post_allow_permanent_rejects_without_touching_disk_or_state(self, mgmt):
         # An unrelated bad section (e.g. a malformed credential) must not let
         # this endpoint write a new host to disk while failing to update the
-        # in-memory allowlist -- that would leave the two out of sync.
+        # in-memory host policy -- that would leave the two out of sync.
         config_path = mgmt._state.config_path
         with open(config_path) as f:
             original = f.read()
@@ -148,6 +285,364 @@ class TestManagementAPI:
 
         assert r.status_code == 500
         assert r.get_json()["ok"] is False
-        assert "new.com" not in mgmt._state.allowlist
+        assert "new.com" not in mgmt._state.hosts
         with open(config_path) as f:
             assert f.read() == bad
+
+
+class TestServicesEndpoints:
+    def test_available_catalog_has_no_secret_fields(self, mgmt):
+        data = mgmt.get("/services/available").get_json()
+        by_name = {item["name"]: item for item in data}
+        assert by_name["npm"] == {
+            "name": "npm", "needs_token": False,
+            "hosts": ["registry.npmjs.org"],
+            "host_param": None, "scope_params": [], "scope_flags": [],
+        }
+        assert by_name["github"]["needs_token"] is True
+        assert by_name["github"]["header"] == "Authorization"
+        assert by_name["github"]["fake_prefix"] == "ghp_"
+        assert by_name["gitlab"]["host_param"] == {
+            "name": "host", "pattern": by_name["gitlab"]["host_param"]["pattern"],
+        }
+        for item in data:
+            assert "real_value" not in item and "fake_value" not in item
+
+    def test_available_catalog_advertises_scope_params_and_flags(self, mgmt):
+        data = mgmt.get("/services/available").get_json()
+        by_name = {item["name"]: item for item in data}
+
+        gh = by_name["github"]
+        assert {p["name"] for p in gh["scope_params"]} == {"repos", "orgs"}
+        repos_param = next(p for p in gh["scope_params"] if p["name"] == "repos")
+        assert repos_param["list"] is True
+        assert repos_param["required"] is False
+        assert isinstance(repos_param["pattern"], str) and repos_param["pattern"]
+        flags = {f["name"]: f for f in gh["scope_flags"]}
+        assert flags["write"] == {
+            "name": "write", "description": "allow issue/PR/comment writes",
+            "unscoped": False,
+        }
+        assert flags["graphql"]["unscoped"] is True
+
+        gl = by_name["gitlab"]
+        assert {p["name"] for p in gl["scope_params"]} == {"projects", "groups"}
+        assert {f["name"] for f in gl["scope_flags"]} == {"write"}
+
+        # Non-scopable presets advertise nothing to scope.
+        assert by_name["npm"]["scope_params"] == []
+        assert by_name["npm"]["scope_flags"] == []
+
+    def test_post_registry_service_updates_state_and_config(self, mgmt):
+        r = mgmt.post("/services", json={"service": "npm"})
+        assert r.get_json() == {"ok": True, "service": {"service": "npm", "kind": "registry"}}
+        assert mgmt._state.hosts.get("registry.npmjs.org") is not None
+        with open(mgmt._state.config_path) as f:
+            assert yaml.safe_load(f)["services"] == ["npm"]
+
+    def test_post_credential_service_writes_secret_and_ref(self, mgmt_secrets):
+        # unrestricted: true exercises the credential-write/rotate plumbing
+        # this test targets; the scoped path has its own coverage in
+        # test_config.py (this is the "management API" surface, not a
+        # second copy of the scoping security property).
+        real = "REAL-SECRET-TOKEN-a3f9"
+        r = mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": real, "unrestricted": True,
+        })
+        body = r.get_json()
+        assert body["ok"] is True
+
+        # Response carries the generated fake (for the CLI), never the real token.
+        svc = body["service"]
+        assert svc["kind"] == "credential"
+        assert svc["header"] == "Authorization"
+        assert svc["fake_value"].startswith("ghp_")
+        assert len(svc["fake_value"]) == 40
+        assert real not in r.get_data(as_text=True)
+
+        # Real token lands only in secrets_file; config holds the ${KEY} ref.
+        with open(mgmt_secrets._secrets_path) as f:
+            assert yaml.safe_load(f) == {"CRED_GITHUB": real}
+        with open(mgmt_secrets._state.config_path) as f:
+            config_text = f.read()
+        assert real not in config_text
+        entry = yaml.safe_load(config_text)["services"][0]
+        assert entry["real_value"] == "${CRED_GITHUB}"
+
+        # State is live: credential brokered and host allowlisted.
+        cred = mgmt_secrets._state.credentials[0]
+        assert cred.real_value == f"token {real}"
+        assert cred.fake_value == f"token {svc['fake_value']}"
+        assert mgmt_secrets._state.hosts.get("api.github.com") is None and "api.github.com" in mgmt_secrets._state.hosts
+
+        # And GET /services stays redacted.
+        listed = mgmt_secrets.get("/services")
+        assert listed.get_json() == [svc]
+        assert real not in listed.get_data(as_text=True)
+
+    def test_post_gitlab_requires_host(self, mgmt_secrets):
+        r = mgmt_secrets.post("/services", json={"service": "gitlab", "real_value": "x"})
+        assert r.status_code == 400
+        r = mgmt_secrets.post("/services", json={
+            "service": "gitlab", "host": "gitlab.example.com", "real_value": "x",
+            "unrestricted": True,
+        })
+        assert r.get_json()["ok"] is True
+        assert mgmt_secrets._state.credentials[0].host == "gitlab.example.com"
+
+    def test_post_credential_requires_secrets_file(self, mgmt):
+        # unrestricted: true so this exercises the secrets_file check itself,
+        # not the (separately tested) scope-required check that would
+        # otherwise fire first.
+        r = mgmt.post("/services", json={
+            "service": "github", "real_value": "x", "unrestricted": True,
+        })
+        assert r.status_code == 400
+        assert "secrets_file" in r.get_json()["error"]
+
+    def test_post_credential_requires_real_value(self, mgmt_secrets):
+        r = mgmt_secrets.post("/services", json={"service": "github"})
+        assert r.status_code == 400
+        assert "real_value" in r.get_json()["error"]
+
+    def test_post_unknown_service_rejected(self, mgmt):
+        assert mgmt.post("/services", json={"service": "nope"}).status_code == 400
+
+    def test_post_duplicate_service_rejected(self, mgmt):
+        mgmt.post("/services", json={"service": "npm"})
+        assert mgmt.post("/services", json={"service": "npm"}).status_code == 409
+
+    def test_post_rolls_back_secret_when_validation_fails(self, mgmt_secrets):
+        # Break an unrelated config section after fixture setup, then attempt
+        # to add a credential service: the secret written before validation
+        # must be rolled back, and neither config nor state may change.
+        config_path = mgmt_secrets._state.config_path
+        with open(config_path) as f:
+            original = f.read()
+        bad = original + "credentials:\n  - host: api.example.com\n"
+        with open(config_path, "w") as f:
+            f.write(bad)
+
+        r = mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "x", "unrestricted": True,
+        })
+
+        assert r.status_code == 500
+        assert not mgmt_secrets._secrets_path.exists()
+        assert mgmt_secrets._state.credentials == []
+        with open(config_path) as f:
+            assert f.read() == bad
+
+    def test_put_rotates_secret_in_place(self, mgmt_secrets):
+        mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "old", "unrestricted": True,
+        })
+        old_fake = mgmt_secrets._state.credentials[0].fake_value
+
+        r = mgmt_secrets.put("/services", json={"service": "github", "real_value": "new"})
+        assert r.get_json()["ok"] is True
+        with open(mgmt_secrets._secrets_path) as f:
+            assert yaml.safe_load(f) == {"CRED_GITHUB": "new"}
+        cred = mgmt_secrets._state.credentials[0]
+        assert cred.real_value == "token new"
+        assert cred.fake_value == old_fake  # the CLI keeps its fake
+
+    def test_put_unconfigured_service_404(self, mgmt_secrets):
+        r = mgmt_secrets.put("/services", json={"service": "github", "real_value": "x"})
+        assert r.status_code == 404
+
+    def test_delete_removes_entry_and_secret(self, mgmt_secrets):
+        mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok", "unrestricted": True,
+        })
+        r = mgmt_secrets.delete("/services", json={"service": "github"})
+        assert r.get_json()["ok"] is True
+        assert mgmt_secrets._state.credentials == []
+        assert "api.github.com" not in mgmt_secrets._state.hosts
+        with open(mgmt_secrets._secrets_path) as f:
+            assert yaml.safe_load(f) == {}
+        with open(mgmt_secrets._state.config_path) as f:
+            assert yaml.safe_load(f)["services"] == []
+
+    def test_delete_keeps_secret_still_referenced_elsewhere(self, mgmt_secrets):
+        mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok", "unrestricted": True,
+        })
+        # A hand-written credential referencing the same key must survive.
+        config_path = mgmt_secrets._state.config_path
+        with open(config_path) as f:
+            data = yaml.safe_load(f)
+        data["credentials"] = [{
+            "host": "other.example.com", "header": "Authorization",
+            "real_value": "${CRED_GITHUB}",
+        }]
+        with open(config_path, "w") as f:
+            yaml.safe_dump(data, f)
+
+        r = mgmt_secrets.delete("/services", json={"service": "github"})
+        assert r.get_json()["ok"] is True
+        with open(mgmt_secrets._secrets_path) as f:
+            assert yaml.safe_load(f) == {"CRED_GITHUB": "tok"}
+
+    def test_delete_unconfigured_service_404(self, mgmt):
+        assert mgmt.delete("/services", json={"service": "npm"}).status_code == 404
+
+    def test_post_scoped_service_round_trips_scope(self, mgmt_secrets):
+        r = mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok",
+            "scope": {"repos": ["myorg/myrepo"]}, "write": True,
+        })
+        body = r.get_json()
+        assert body["ok"] is True
+        svc = body["service"]
+        assert svc["scope"] == {"repos": ["myorg/myrepo"]}
+        assert svc["write"] is True
+        assert "unrestricted" not in svc
+        # Raw, not escaped/compiled -- GET /services returns the same shape.
+        listed = mgmt_secrets.get("/services").get_json()
+        assert listed == [svc]
+        with open(mgmt_secrets._state.config_path) as f:
+            entry = yaml.safe_load(f)["services"][0]
+        assert entry["scope"] == {"repos": ["myorg/myrepo"]}
+
+    def test_post_scoped_service_without_scope_or_opt_out_is_400(self, mgmt_secrets):
+        r = mgmt_secrets.post("/services", json={"service": "github", "real_value": "tok"})
+        assert r.status_code == 400
+        error = r.get_json()["error"]
+        assert "github" in error and "scope" in error
+        # Nothing should have been written -- config.yaml and secrets_file
+        # both stay exactly as the fixture left them.
+        assert not mgmt_secrets._secrets_path.exists()
+        with open(mgmt_secrets._state.config_path) as f:
+            assert "services" not in yaml.safe_load(f)
+
+    def test_post_scoped_service_scope_and_unrestricted_mutually_exclusive(self, mgmt_secrets):
+        r = mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok",
+            "scope": {"repos": ["myorg/myrepo"]}, "unrestricted": True,
+        })
+        assert r.status_code == 400
+        assert "mutually exclusive" in r.get_json()["error"]
+
+    @pytest.mark.parametrize("bad_value", ["no", "false", "0", "", 1, 0])
+    def test_post_unrestricted_non_bool_rejected(self, mgmt_secrets, bad_value):
+        # Finding 2: `bool("no")` is True, so a JSON client sending the
+        # string "no" (or any other non-bool) used to grant exactly the
+        # blanket access it was declining. state.hosts must stay untouched.
+        r = mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok", "unrestricted": bad_value,
+        })
+        assert r.status_code == 400
+        assert "unrestricted" in r.get_json()["error"]
+        assert "api.github.com" not in mgmt_secrets._state.hosts
+
+    @pytest.mark.parametrize("bad_value", ["no", "false", "0", "", 1, 0])
+    def test_post_scope_flag_non_bool_rejected(self, mgmt_secrets, bad_value):
+        r = mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok",
+            "scope": {"repos": ["myorg/myrepo"]}, "write": bad_value,
+        })
+        assert r.status_code == 400
+        assert "write" in r.get_json()["error"]
+        # Nothing persisted -- the secret was never written either.
+        assert not mgmt_secrets._secrets_path.exists()
+
+    def test_put_edits_scope_without_touching_token(self, mgmt_secrets):
+        posted = mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok",
+            "scope": {"repos": ["myorg/myrepo"]},
+        }).get_json()["service"]
+
+        r = mgmt_secrets.put("/services", json={
+            "service": "github", "scope": {"orgs": ["myorg-sandbox"]},
+        })
+        assert r.get_json()["ok"] is True
+        svc = r.get_json()["service"]
+        assert svc["scope"] == {"orgs": ["myorg-sandbox"]}
+        assert svc["fake_value"] == posted["fake_value"]  # token untouched
+
+        # secrets_file untouched by a scope-only edit.
+        with open(mgmt_secrets._secrets_path) as f:
+            assert yaml.safe_load(f) == {"CRED_GITHUB": "tok"}
+
+    def test_put_rotates_token_without_touching_scope(self, mgmt_secrets):
+        mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "old",
+            "scope": {"repos": ["myorg/myrepo"]},
+        })
+
+        r = mgmt_secrets.put("/services", json={"service": "github", "real_value": "new"})
+        assert r.get_json()["ok"] is True
+        svc = r.get_json()["service"]
+        assert svc["scope"] == {"repos": ["myorg/myrepo"]}
+        with open(mgmt_secrets._secrets_path) as f:
+            assert yaml.safe_load(f) == {"CRED_GITHUB": "new"}
+
+    def test_put_switch_to_unrestricted_clears_scope(self, mgmt_secrets):
+        mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok",
+            "scope": {"repos": ["myorg/myrepo"]},
+        })
+        r = mgmt_secrets.put("/services", json={"service": "github", "unrestricted": True})
+        assert r.get_json()["ok"] is True
+        svc = r.get_json()["service"]
+        assert svc.get("unrestricted") is True
+        assert "scope" not in svc
+        assert mgmt_secrets._state.hosts.get("api.github.com") is None
+
+    @pytest.mark.parametrize("bad_value", ["no", "false", "0", "", 1, 0])
+    def test_put_unrestricted_non_bool_rejected(self, mgmt_secrets, bad_value):
+        mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok",
+            "scope": {"repos": ["myorg/myrepo"]},
+        })
+        r = mgmt_secrets.put("/services", json={
+            "service": "github", "unrestricted": bad_value,
+        })
+        assert r.status_code == 400
+        assert "unrestricted" in r.get_json()["error"]
+        # The pre-existing scoped entry is untouched.
+        with open(mgmt_secrets._state.config_path) as f:
+            entry = yaml.safe_load(f)["services"][0]
+        assert entry["scope"] == {"repos": ["myorg/myrepo"]}
+
+    @pytest.mark.parametrize("bad_value", ["no", "false", "0", "", 1, 0])
+    def test_put_scope_flag_non_bool_rejected(self, mgmt_secrets, bad_value):
+        mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok",
+            "scope": {"repos": ["myorg/myrepo"]},
+        })
+        r = mgmt_secrets.put("/services", json={
+            "service": "github", "write": bad_value,
+        })
+        assert r.status_code == 400
+        assert "write" in r.get_json()["error"]
+
+    def test_put_requires_at_least_one_field(self, mgmt_secrets):
+        mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok", "unrestricted": True,
+        })
+        r = mgmt_secrets.put("/services", json={"service": "github"})
+        assert r.status_code == 400
+
+    def test_put_scope_on_non_scopable_service_rejected(self, mgmt):
+        mgmt.post("/services", json={"service": "npm"})
+        r = mgmt.put("/services", json={"service": "npm", "scope": {"repos": ["x/y"]}})
+        assert r.status_code == 400
+
+    def test_secret_keys_deduped_per_host(self, mgmt_secrets):
+        mgmt_secrets.post("/services", json={
+            "service": "gitlab", "host": "a.example.com", "real_value": "ta",
+            "unrestricted": True,
+        })
+        mgmt_secrets.post("/services", json={
+            "service": "gitlab", "host": "b.example.com", "real_value": "tb",
+            "unrestricted": True,
+        })
+        with open(mgmt_secrets._secrets_path) as f:
+            secrets = yaml.safe_load(f)
+        assert secrets == {
+            "CRED_GITLAB_A_EXAMPLE_COM": "ta",
+            "CRED_GITLAB_B_EXAMPLE_COM": "tb",
+        }
+        assert len(mgmt_secrets._state.credentials) == 2
