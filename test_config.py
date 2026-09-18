@@ -5,11 +5,14 @@ Run with:  pytest test_config.py -v
 """
 
 import json
+import pathlib
+import re
 
 import pytest
+import yaml
 
 import registries
-from config import Credential
+from config import Config, Credential
 from conftest import make_state
 
 
@@ -703,3 +706,24 @@ class TestScopedServiceExpansion:
         })
         rules = cfg.hosts["api.example.com"]
         assert "authorization" not in rules.request_headers
+
+
+# ── config.default.yaml examples ─────────────────────────────────────────────
+
+def test_default_yaml_examples_are_valid(tmp_path):
+    # Keeps config.default.yaml's commented `# >>> example: ... # <<<` blocks
+    # (and its live, uncommented config) honest: each must be a standalone
+    # config Config.from_data actually accepts.
+    secrets = tmp_path / "secrets.yaml"
+    secrets.write_text("OPENAI_API_KEY: x\nGITHUB_TOKEN: y\nGITLAB_TOKEN: z\n")
+    text = pathlib.Path(__file__).with_name("config.default.yaml").read_text()
+    blocks = re.findall(
+        r"^[ \t]*# >>> example: \S+\s*\n((?:[ \t]*#.*\n)+?)[ \t]*# <<<\s*\n", text, re.M
+    )
+    assert blocks
+    for block in blocks:
+        stripped = "\n".join(line.split("#", 1)[1] for line in block.splitlines())
+        data = yaml.safe_load(stripped) or {}
+        data["secrets_file"] = str(secrets)
+        Config.from_data(data)
+    Config.from_data(yaml.safe_load(text) or {})
