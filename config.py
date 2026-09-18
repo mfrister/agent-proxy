@@ -30,10 +30,14 @@ Config YAML format:
     - npm                                # and docs/service-presets.md). Bare string:
     - go                                 # read-only package-registry rule sets.
     - service: github                    # credential presets broker an API token:
+      scope:                             # must be scoped (or `unrestricted: true`):
+        repos: ["my-org/my-repo"]        # repos/orgs (github) or projects/groups (gitlab)
       fake_value: "ghp_fake…"            # the CLI sends the fake, the proxy swaps
       real_value: "${GITHUB_TOKEN}"      # in the real one. ${KEY} -> secrets_file.
     - service: gitlab                    # self-hosted services take the host in
       host: gitlab.example.com           # the entry
+      scope:
+        projects: ["my-group/my-project"]
       fake_value: "glpat-fake…"
       real_value: "${GITLAB_TOKEN}"
       # allow_host: false                # broker the token but don't allowlist the host
