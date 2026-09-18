@@ -38,72 +38,33 @@ The CA cert is generated on first run at `~/.mitmproxy/` (or the path set by `--
 
 ## Configuration
 
-**`config.yaml`** — domain allowlist and per-host options (copy from `config.default.yaml` and customize):
+**`config.yaml`** — domain allowlist and per-host options. Copy `config.default.yaml` as your starting point: it's the canonical format reference, with a worked, test-covered example of every section (`hosts`, `services`, `credentials`, and the secrets file).
 
-```yaml
-hosts:
-  - host: api.anthropic.com       # all Set-Cookie headers pass through (default)
-  - host: platform.claude.com
-    allow_response_cookies: []    # strip all Set-Cookie headers
-  - host: internal.example.com
-    allow_response_cookies:
-      - csrftoken                 # only csrftoken passes through; others stripped
-```
+The options most setups touch:
 
-When `allow_response_cookies` is absent, all `Set-Cookie` headers from that host pass through unchanged. An empty list strips everything; a non-empty list is an allowlist.
+- **`hosts:`** — a plain hostname (or a `{host: ...}` mapping) is unrestricted. A mapping can add `allow_response_cookies` to filter `Set-Cookie` headers: omit it to pass all through (default), `[]` to strip everything, or a list to allowlist specific cookies. See the `cookies` example in `config.default.yaml`.
 
 ### Service presets
 
-One `services:` entry grants a named service exactly the egress it needs:
+One `services:` entry grants a named service exactly the egress it needs — read-only **registry presets** (`go`, `npm`, `docker`, `ghcr`, `pypi`, `crates`; full per-preset host/allows table in [docs/service-presets.md](docs/service-presets.md#presets)) or **scoped API presets** (`github`, `gitlab`) that broker a credential and restrict the host to the repos/orgs or projects/groups named under `scope:`, instead of blanket access:
 
 ```yaml
 services:
-  - go                                # registry presets: read-only restricted access
+  - go
   - npm
-  - service: github                   # scoped API preset: repo/org-restricted access,
-    scope:                            # not blanket host access
+  - service: github
+    scope:
       repos: [myorg/myrepo, myorg/other]
       orgs: [myorg-sandbox]           # every repo under this org
-    write: true                       # opt in to issue/PR/comment writes
     fake_value: "ghp_…fake"           # the CLI holds the fake token, the proxy
     real_value: "${GITHUB_TOKEN}"     # swaps in the real one on the way out
-  - service: gitlab
-    host: gitlab.example.com          # self-hosted: the entry supplies the host
-    scope:
-      projects: [team/backend]
-      groups: [team/sandbox]          # every project directly under this group
-    fake_value: "glpat-…fake"
-    real_value: "${GITLAB_TOKEN}"
 ```
 
-**Registry presets** (`go`, `npm`, `docker`, `ghcr`, `pypi`, `crates`) pin exact hostnames and only permit GET/HEAD requests matching known, bounded URL patterns (package metadata, tarballs, manifests, blobs, pull-scoped auth tokens). Query strings and request headers are allowlisted; everything else is blocked with a 503 and `Retry-After: 5` — the same response shape as the pending-approval flow, since a human may grant a temporary allow moments later and the client should keep retrying — and shows up in the deny log tagged `policy_violation` (distinct from `pending_approval`, so operators can still tell the two apart).
-
-**Scoped API presets** (`github` for github.com, `gitlab` for self-hosted instances) restrict `api.github.com`/`/api/v4/...` to the repos/orgs or projects/groups named under `scope:`, compiled into the same rule engine as registry presets — a service entry with neither `scope:` nor `unrestricted: true` fails to load. `write: true` opts in to issue/PR/comment (or MR/note) writes, bounded by size and content-type but not otherwise inspected; `unrestricted: true` is the explicit, logged opt-out back to blanket host access. Presets also know the header format the service's CLI sends (`Authorization: token …` for `gh`, `PRIVATE-TOKEN: …` for `glab`) and the fake-token shape it accepts. Keep real tokens in `secrets_file` and reference them as `${KEY}`; they never appear in config.yaml, management API responses, or logs. The token itself should also be scoped (a GitHub fine-grained PAT, a GitLab project access token) — these proxy rules constrain how a token can be *used* through the proxy, not what it's *valid* for. Set `allow_host: false` alongside `unrestricted: true` to broker the token without granting host access at all (e.g. when a hand-written `hosts:` entry already covers it).
-
-The threat model, restriction design, and known limitations are documented in [docs/service-presets.md](docs/service-presets.md).
+`write: true` opts in to issue/PR/comment (or MR/note) writes; `unrestricted: true` is the explicit, logged opt-out from scoping back to blanket host access, and `allow_host: false` brokers a token without granting its host any access at all. See the `services` example in `config.default.yaml` for the full option set (including self-hosted `gitlab` and `graphql`), and [docs/service-presets.md](docs/service-presets.md) for the threat model, restriction design, and known limitations.
 
 ### Custom credentials
 
-For services without a preset, `credentials:` entries in config.yaml configure the broker directly. Two modes are supported:
-
-**Swap mode** — the agent uses a placeholder value; the proxy replaces it with the real credential before forwarding. Requests with any other non-empty value are blocked (guards against prompt injection).
-
-```yaml
-credentials:
-  - host: api.openai.com
-    header: Authorization
-    fake_value: "Bearer sk-fake"
-    real_value: "${OPENAI_API_KEY}"
-```
-
-**Inject mode** — the proxy unconditionally sets the header, regardless of what the agent sent. Useful for cookies or other credentials the agent should never handle itself. Omit `fake_value`:
-
-```yaml
-credentials:
-  - host: internal.example.com
-    header: Cookie
-    real_value: "session=abc123"
-```
+For services without a preset, `credentials:` entries configure the broker directly: **swap mode** (the agent sends a placeholder `fake_value`; the proxy substitutes the real one before forwarding, and blocks any other non-empty value) or **inject mode** (the proxy sets the header unconditionally — omit `fake_value`). See the `credentials` example in `config.default.yaml`, which shows both forms.
 
 **Environment variables:**
 

@@ -74,7 +74,8 @@ hosts:
 # allowlists — while blocking everything else with a 503 + Retry-After
 # (same shape as the pending-approval response, since a human may grant a
 # temporary allow; the deny log still tags it `policy_violation`).
-# Registry presets: go, npm, docker, ghcr, pypi, crates
+# Registry presets (go, npm, docker, ghcr, pypi, crates): full per-preset
+# host/allows table in docs/service-presets.md ("## Presets").
 #
 # github/gitlab are scoped API presets, not blanket-access credential
 # presets: the entry must name the repos/orgs (github) or projects/groups

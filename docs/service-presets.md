@@ -338,18 +338,8 @@ history for either is the audit trail for policy changes.
 ## Custom restricted hosts
 
 The same engine is available for your own hosts, as a `hosts:` entry with a
-`rules:` list:
-
-```yaml
-hosts:
-  - host: artifacts.internal.example.com
-    rules:
-      - methods: [GET, HEAD]
-        path: "/repo/[a-z0-9-]{1,64}/[a-zA-Z0-9._-]{1,128}"
-        query:                       # omit `query` entirely to forbid query strings
-          version: "[a-z0-9.]{1,32}"
-    request_headers: [authorization] # extras beyond the base allowlist
-```
+`rules:` list — see the `restricted-host` example in `config.default.yaml`
+for the full shape (`methods`, `path`, `query`, `request_headers`).
 
 Guardrails apply to user rules exactly as to presets: patterns are anchored
 (`fullmatch`), unbounded quantifiers (`*`, `+`, `{n,}`) are rejected at load
