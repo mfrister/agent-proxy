@@ -191,16 +191,16 @@ class TestRegistryPolicy:
         addon.request(flow)
         assert flow.response is None
 
-    def test_violation_gets_403_without_retry_after(self, capsys):
+    def test_violation_gets_503_with_retry_after(self, capsys):
         from addon import AllowlistAddon
         state = make_state(hosts=make_restricted())
         addon = AllowlistAddon(state)
         flow = make_flow("registry.example.com", method="POST", path="/pkg/foo")
         addon.request(flow)
-        assert flow.response.status_code == 403
+        assert flow.response.status_code == 503
         assert b"not currently allowed by policy" in flow.response.content
         assert b"pending human approval" in flow.response.content
-        assert "Retry-After" not in flow.response.headers
+        assert flow.response.headers.get("Retry-After") == "5"
         entry = state.deny_log[0]
         assert entry["type"] == "policy_violation"
         assert "POST" in entry["reason"]
@@ -208,19 +208,41 @@ class TestRegistryPolicy:
         assert event["event"] == "registry_policy_violation"
         assert event["policy"] == "testpreset"
 
+    def test_violation_response_indistinguishable_from_pending_approval(self, capsys):
+        # The client only ever sees the HTTP response, so a policy violation
+        # and an unconfigured host must look identical to it (status +
+        # Retry-After) -- only the deny-log `type` tells them apart.
+        from addon import AllowlistAddon
+        violation_state = make_state(hosts=make_restricted())
+        violation_addon = AllowlistAddon(violation_state)
+        violation_flow = make_flow("registry.example.com", method="POST", path="/pkg/foo")
+        violation_addon.request(violation_flow)
+        capsys.readouterr()  # drain the registry_policy_violation audit line
+
+        pending_state = make_state(hosts={})
+        pending_addon = AllowlistAddon(pending_state)
+        pending_flow = make_flow("evil.com")
+        pending_addon.request(pending_flow)
+
+        assert violation_flow.response.status_code == pending_flow.response.status_code
+        assert (violation_flow.response.headers.get("Retry-After")
+                == pending_flow.response.headers.get("Retry-After"))
+        assert violation_state.deny_log[0]["type"] == "policy_violation"
+        assert pending_state.deny_log[0]["type"] == "pending_approval"
+
     def test_disallowed_query_param_blocked(self):
         from addon import AllowlistAddon
         addon = AllowlistAddon(make_state(hosts=make_restricted()))
         flow = make_flow("registry.example.com", path="/pkg/foo?data=secret")
         addon.request(flow)
-        assert flow.response.status_code == 403
+        assert flow.response.status_code == 503
 
     def test_body_on_get_blocked(self):
         from addon import AllowlistAddon
         addon = AllowlistAddon(make_state(hosts=make_restricted()))
         flow = make_flow("registry.example.com", path="/pkg/foo", body=b"exfil")
         addon.request(flow)
-        assert flow.response.status_code == 403
+        assert flow.response.status_code == 503
 
     def test_unrestricted_host_short_circuits_before_temp_allow_check(self):
         # An unrestricted `hosts:` entry can no longer coexist with a rule set

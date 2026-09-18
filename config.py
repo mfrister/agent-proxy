@@ -48,7 +48,9 @@ Config YAML format:
       real_value: "session=abc123"       # inject mode: omit fake_value
 
   Precedence: unrestricted hosts entry > temporary allows (unrestricted)
-  > restricted rules (403 on violation) > pending approval (503).
+  > restricted rules (503 on violation, same as pending approval -- a human
+  may grant a temporary allow, so the client should keep retrying) > pending
+  approval (503).
   Note: swap-mode credentials on a restricted host require the header to be
   listed in that host's request_headers, or scrubbing removes it before the
   broker sees it. Inject-mode credentials are unaffected (injected post-scrub).

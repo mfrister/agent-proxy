@@ -106,7 +106,7 @@ config loads it, same as `unrestricted: true` below.
 
 Practical consequence: the GitHub CLI's `gh pr list`, `gh issue list`, and
 similar read commands go through `gh api graphql` under the hood and fail
-against a scoped-without-`graphql` service (403, `policy_violation`).
+against a scoped-without-`graphql` service (503, `policy_violation`).
 `gh api repos/<owner>/<repo>/pulls` — REST, path-scoped — works against an
 in-scope repo.
 
@@ -265,12 +265,17 @@ Request evaluation order in the proxy:
    the operator action you want when a pattern blocks a legitimate workflow.
 3. Host has restricted rules → evaluate. On match, non-allowlisted request
    headers are scrubbed (names logged, never values) and the request proceeds.
-   On mismatch → **403** with a body explaining the violation. Unlike the
-   503-pending-approval response, a 403 will not resolve by retrying.
+   On mismatch → **503** with `Retry-After: 5` and a body explaining the
+   violation, identical in shape to the pending-approval response below — a
+   human may grant a temporary allow moments later, so the client should keep
+   retrying rather than treat this as final.
 4. Otherwise → 503, pending human approval (existing flow).
 
-Violations appear in the deny log and TUI tagged `type: policy_violation` with
-a `reason` — an agent POSTing to npm is exactly what an operator should see.
+The client-facing response is deliberately the same for both denial kinds.
+Violations remain distinguishable to *operators*: they appear in the deny log
+and TUI tagged `type: policy_violation` with a `reason` — an agent POSTing to
+npm is exactly what an operator should see — whereas an unconfigured host is
+tagged `type: pending_approval`.
 Allowed registry requests are logged with a `registry: <preset>` field.
 
 Response side: restricted hosts strip all `Set-Cookie` headers by default

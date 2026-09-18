@@ -436,12 +436,12 @@ def test_restricted_scrubs_unknown_headers(proxy_restricted):
     assert data["headers"].get("accept") == "application/json"
 
 
-def test_restricted_post_blocked_with_403(proxy_restricted):
+def test_restricted_post_blocked_with_503(proxy_restricted):
     req = urllib.request.Request(
         proxy_restricted["server_url"] + "/pkg/foo", data=b"payload")
     with pytest.raises(urllib.error.HTTPError) as exc:
         proxy_restricted["opener"].open(req)
-    assert exc.value.code == 403
+    assert exc.value.code == 503
     assert b"not currently allowed by policy" in exc.value.read()
 
 
@@ -449,21 +449,21 @@ def test_restricted_disallowed_query_blocked(proxy_restricted):
     with pytest.raises(urllib.error.HTTPError) as exc:
         proxy_restricted["opener"].open(
             proxy_restricted["server_url"] + "/pkg/foo?data=secret")
-    assert exc.value.code == 403
+    assert exc.value.code == 503
 
 
 def test_restricted_disallowed_path_blocked(proxy_restricted):
     with pytest.raises(urllib.error.HTTPError) as exc:
         proxy_restricted["opener"].open(
             proxy_restricted["server_url"] + "/other/path")
-    assert exc.value.code == 403
+    assert exc.value.code == 503
 
 
 def test_temp_allow_lifts_restrictions(proxy_restricted_fn):
     url = proxy_restricted_fn["server_url"] + "/pkg/foo?data=secret"
     with pytest.raises(urllib.error.HTTPError) as exc:
         proxy_restricted_fn["opener"].open(url)
-    assert exc.value.code == 403
+    assert exc.value.code == 503
 
     mgmt_post(proxy_restricted_fn["management_url"], "/allow/temp",
               {"host": "127.0.0.1", "duration_seconds": 60})
@@ -487,11 +487,11 @@ def test_scoped_in_scope_path_passes(proxy_gitlab_scoped):
     assert data["path"] == "/api/v4/projects/acme%2Fwebapp/issues"
 
 
-def test_scoped_out_of_scope_path_403(proxy_gitlab_scoped):
+def test_scoped_out_of_scope_path_503(proxy_gitlab_scoped):
     with pytest.raises(urllib.error.HTTPError) as exc:
         proxy_gitlab_scoped["opener"].open(
             proxy_gitlab_scoped["server_url"] + "/api/v4/projects/other%2Fproject/issues")
-    assert exc.value.code == 403
+    assert exc.value.code == 503
     assert b"not currently allowed by policy" in exc.value.read()
 
     denied = json.loads(mgmt_get(proxy_gitlab_scoped["management_url"], "/denied").read())
@@ -508,7 +508,7 @@ def test_scoped_write_post_passes(proxy_gitlab_scoped):
     assert data["body"] == '{"title": "bug"}'
 
 
-def test_scoped_write_post_without_write_flag_403(proxy_gitlab_scoped_readonly):
+def test_scoped_write_post_without_write_flag_503(proxy_gitlab_scoped_readonly):
     req = urllib.request.Request(
         proxy_gitlab_scoped_readonly["server_url"] + "/api/v4/projects/acme%2Fwebapp/issues",
         data=b'{"title": "bug"}',
@@ -516,7 +516,7 @@ def test_scoped_write_post_without_write_flag_403(proxy_gitlab_scoped_readonly):
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
         proxy_gitlab_scoped_readonly["opener"].open(req)
-    assert exc.value.code == 403
+    assert exc.value.code == 503
     assert b"not currently allowed by policy" in exc.value.read()
 
 
@@ -528,7 +528,7 @@ def test_scoped_graphql_blocked_without_flag(proxy_github_scoped):
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
         proxy_github_scoped["opener"].open(req)
-    assert exc.value.code == 403
+    assert exc.value.code == 503
     assert b"not currently allowed by policy" in exc.value.read()
 
 
@@ -565,7 +565,7 @@ def test_scoped_credential_never_reaches_upstream_on_denied_request(proxy_gitlab
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
         proxy_gitlab_scoped["opener"].open(req)
-    assert exc.value.code == 403
+    assert exc.value.code == 503
     # The upstream echo server never saw this request at all -- the real
     # token (which only CredentialBrokerAddon, downstream of the deny, knows)
     # had no channel to leak through.

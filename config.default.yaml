@@ -42,14 +42,17 @@ hosts:
 # Service presets. Bare names enable read-only package-registry rule sets
 # (restricted hosts): each allows the GET/HEAD traffic its ecosystem needs —
 # pinned hosts, anchored URL patterns, query-param and request-header
-# allowlists — while blocking everything else with a 403.
+# allowlists — while blocking everything else with a 503 + Retry-After
+# (same shape as the pending-approval response, since a human may grant a
+# temporary allow; the deny log still tags it `policy_violation`).
 # Registry presets: go, npm, docker, ghcr, pypi, crates
 #
 # github/gitlab are scoped API presets, not blanket-access credential
 # presets: the entry must name the repos/orgs (github) or projects/groups
 # (gitlab) an agent may reach under `scope:`, which compiles into the same
 # restricted-host rule engine the registry presets use -- everything else on
-# api.github.com (or the gitlab instance) 403s. `write: true` opts in to
+# api.github.com (or the gitlab instance) gets the same 503 + Retry-After
+# treatment. `write: true` opts in to
 # issue/PR/comment writes (github) or issue/MR/note writes (gitlab); write
 # bodies are size- and content-type-bounded, never inspected, so repo
 # scoping bounds *which* repos are reachable, not what gets written into
