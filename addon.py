@@ -122,9 +122,9 @@ class AllowlistAddon:
         if isinstance(verdict, registries.Violation):
             flow.response = http.Response.make(
                 403,
-                f"Blocked by registry policy '{host_rules.source}': {verdict.reason}. "
-                "This is a policy violation, not a pending approval — it will not "
-                "be granted by waiting.",
+                f"Request to {host} is not currently allowed by policy "
+                f"'{host_rules.source}': {verdict.reason}. Request is pending "
+                "human approval. Retry the request after approval is granted.",
                 {"Content-Type": "text/plain"},
             )
             entry = {

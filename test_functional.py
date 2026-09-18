@@ -442,7 +442,7 @@ def test_restricted_post_blocked_with_403(proxy_restricted):
     with pytest.raises(urllib.error.HTTPError) as exc:
         proxy_restricted["opener"].open(req)
     assert exc.value.code == 403
-    assert b"policy violation" in exc.value.read()
+    assert b"not currently allowed by policy" in exc.value.read()
 
 
 def test_restricted_disallowed_query_blocked(proxy_restricted):
@@ -492,7 +492,7 @@ def test_scoped_out_of_scope_path_403(proxy_gitlab_scoped):
         proxy_gitlab_scoped["opener"].open(
             proxy_gitlab_scoped["server_url"] + "/api/v4/projects/other%2Fproject/issues")
     assert exc.value.code == 403
-    assert b"policy violation" in exc.value.read()
+    assert b"not currently allowed by policy" in exc.value.read()
 
     denied = json.loads(mgmt_get(proxy_gitlab_scoped["management_url"], "/denied").read())
     assert denied[-1]["type"] == "policy_violation"
@@ -517,7 +517,7 @@ def test_scoped_write_post_without_write_flag_403(proxy_gitlab_scoped_readonly):
     with pytest.raises(urllib.error.HTTPError) as exc:
         proxy_gitlab_scoped_readonly["opener"].open(req)
     assert exc.value.code == 403
-    assert b"policy violation" in exc.value.read()
+    assert b"not currently allowed by policy" in exc.value.read()
 
 
 def test_scoped_graphql_blocked_without_flag(proxy_github_scoped):
@@ -529,7 +529,7 @@ def test_scoped_graphql_blocked_without_flag(proxy_github_scoped):
     with pytest.raises(urllib.error.HTTPError) as exc:
         proxy_github_scoped["opener"].open(req)
     assert exc.value.code == 403
-    assert b"policy violation" in exc.value.read()
+    assert b"not currently allowed by policy" in exc.value.read()
 
 
 # ── Credential brokering under scoping (the subtle failure mode) ───────────────
