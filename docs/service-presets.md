@@ -253,23 +253,47 @@ repos named in `scope:`.
 
 ## How enforcement works
 
-Request evaluation order in the proxy:
+A host can carry several entries: whatever service presets generate for it,
+then its hand-written `hosts:` entries, in config order, plus — while one is
+active — a temporary allow (TUI/management API) appended as a final
+unrestricted entry. Each entry permits requests on its own terms, and entries
+only ever add access; none narrows another. Request evaluation in the proxy:
 
-1. Host has an unrestricted `hosts:` entry (no `rules:`) → unrestricted pass
-   (the operator's explicit broader grant, and the escape hatch when a preset
-   pattern is too tight). One entry per host in `hosts:` means a host can't
-   be both unrestricted and restricted at once — there's nothing to warn
-   about, since the overlapping state can't be constructed.
-2. Host has an active temporary allow (TUI/management API) → unrestricted pass.
-   Temp-allowing a restricted host deliberately lifts all its restrictions —
-   the operator action you want when a pattern blocks a legitimate workflow.
-3. Host has restricted rules → evaluate. On match, non-allowlisted request
-   headers are scrubbed (names logged, never values) and the request proceeds.
-   On mismatch → **503** with `Retry-After: 5` and a body explaining the
-   violation, identical in shape to the pending-approval response below — a
-   human may grant a temporary allow moments later, so the client should keep
-   retrying rather than treat this as final.
-4. Otherwise → 503, pending human approval (existing flow).
+1. If the request presents the `fake_value` of some entry's swap-mode
+   credential (the credential's header carries exactly that value), those
+   entries are tried first, in config order. This honors the client's
+   explicit ask for authenticated access, so an earlier unauthenticated entry
+   covering the same path can't silently shadow the credentialed one.
+2. Then every other entry, in config order. An unrestricted entry (no
+   `rules:`, or a temporary allow) permits unconditionally — the operator's
+   explicit broader grant, and the escape hatch when a preset pattern blocks a
+   legitimate workflow. A restricted entry permits if its rules match; only
+   the permitting entry's header scrubbing applies (non-allowlisted request
+   headers are dropped, names logged, never values).
+3. The first entry to permit wins, and the request proceeds with *that*
+   entry's credential, if it has one (see "Credentials are bound to entries"
+   below).
+4. If entries exist but none permits → **503** with `Retry-After: 5` and a body
+   explaining the first rejecting entry's violation, identical in shape to the
+   pending-approval response below — a human may grant a temporary allow
+   moments later, so the client should keep retrying rather than treat this as
+   final.
+5. No entries at all → 503, pending human approval (existing flow).
+
+### Credentials are bound to entries
+
+A credential is declared on a `hosts:` entry (`credential:`, see the
+`credentials` example in `config.default.yaml`) or generated onto one by a
+`github`/`gitlab` service, and is brokered only for requests *that entry*
+permits. When the permitting entry has no credential, the header of any
+credential declared on a sibling entry is stripped before forwarding (logged
+as `credential_withheld`, header names only) instead of letting the client's
+fake token — or whatever else it put there — through. So an unauthenticated
+read-only entry and an authenticated scoped one can share a host (the
+`two-entries` example in `config.default.yaml`), and a temporary allow,
+permanent allow, or unrestricted `hosts:` entry on a host with a scoped
+`github`/`gitlab` service opens the host *without* the token: out-of-scope
+requests go upstream unauthenticated, never with the real value.
 
 The client-facing response is deliberately the same for both denial kinds.
 Violations remain distinguishable to *operators*: they appear in the deny log
@@ -278,10 +302,11 @@ npm is exactly what an operator should see — whereas an unconfigured host is
 tagged `type: pending_approval`.
 Allowed registry requests are logged with a `registry: <preset>` field.
 
-Response side: restricted hosts strip all `Set-Cookie` headers by default
-(registries don't need cookies; they are a session/tracking channel into the
-sandbox). A custom `hosts:` entry with `rules:` can override this with
-`allow_response_cookies`.
+Response side: cookie filtering follows the entry that permitted the request.
+Restricted entries strip all `Set-Cookie` headers by default (registries don't
+need cookies; they are a session/tracking channel into the sandbox); a custom
+`hosts:` entry can set its own `allow_response_cookies`. A temporary allow
+keeps the cookie policy of the host's first configured entry.
 
 ### Base request-header allowlist
 
@@ -323,17 +348,13 @@ history for either is the audit trail for policy changes.
   (see "Why `POST /graphql` is denied by default" above). `gh api
   repos/<owner>/<repo>/pulls` and other REST-shaped `gh api` calls against an
   in-scope repo work normally.
-- **Swap-mode credentials** on a restricted host require the credential header
-  to be listed in that host's `request_headers`; otherwise scrubbing removes it
-  before the credential broker sees it. Inject-mode credentials are unaffected
-  (injection happens after scrubbing). Service presets wire this
-  automatically (see "Credential presets" below); a hand-written
-  `credentials:` entry on a restricted `hosts:` entry must list the header
-  itself.
 - If a preset pattern turns out too tight for a legitimate workflow, the
   violation shows up in the TUI; temp-allowing the host is the immediate
-  escape hatch, and a custom `hosts:` entry (which replaces the preset's
-  rules for that host) is the durable fix.
+  escape hatch, and a custom `hosts:` entry (added alongside the preset's
+  entry for that host) is the durable fix. Neither carries a `github`/
+  `gitlab` service's credential: requests only they permit go upstream
+  unauthenticated. A custom entry that needs the token declares its own
+  `credential:`.
 
 ## Custom restricted hosts
 
@@ -350,8 +371,12 @@ CDN-signed URLs.
 
 This is also the escape hatch for `github`/`gitlab`: a `hosts:` entry naming
 `api.github.com` (or a self-hosted GitLab's host) with its own `rules:` list
-replaces whatever the `scope:`-driven preset compiled for that host, for a
-shape the built-in scope templates don't cover.
+adds to what the `scope:`-driven preset compiled for that host, for a shape
+the built-in scope templates don't cover. It gets the token only if it
+declares a `credential:` of its own (header `Authorization` with value
+`token <t>` for GitHub, `PRIVATE-TOKEN` with the bare token for GitLab).
+Because entries only add access, it can't *narrow* a service's access —
+scope the service itself for that.
 
 # Credential presets: brokered API tokens
 
@@ -384,17 +409,16 @@ requests the proxy will forward at all*. For `go`/`npm`/`docker`/`ghcr`/
 rule set applies. For `github`/`gitlab` the credential's host is not
 allowlisted by default the way earlier versions of this feature did it — it
 is compiled into the same restricted rule set `scope:` produces (or, under
-`unrestricted: true`, granted blanket access). `allow_host: false` broadens
-what `unrestricted: true` means: broker the token without granting *any*
-access to its host — e.g. because a hand-written `hosts:` entry already
-covers it. It has no effect on a normally-scoped entry, since scoping never
-grants blanket access to opt out of in the first place. If a preset attaches
-a credential to a restricted host, the expansion automatically adds the
-credential header (`authorization` for `github`, `private-token` for
-`gitlab`) to that host's `request_headers`, so header scrubbing can't strip
-it before the broker runs — without this wiring every scoped `github`/
-`gitlab` request would arrive unauthenticated, since `AllowlistAddon` scrubs
-before `CredentialBrokerAddon` swaps the token in. The rule builders
+`unrestricted: true`, granted blanket access), and the credential is
+attached to that entry. (`allow_host: false`, which used to broker the token
+without granting its host any access, is now a config error: a credential
+fires only for requests its own entry permits, so it would never fire. Put a
+`credential:` on the hand-written `hosts:` entry instead.) Any credential on
+a restricted entry — preset-generated or hand-written — has its header
+(`authorization` for `github`, `private-token` for `gitlab`) added to that
+entry's `request_headers` automatically, so header scrubbing can't strip it
+before the broker runs: `AllowlistAddon` scrubs before
+`CredentialBrokerAddon` swaps the token in. The rule builders
 separately add `content-type` to `request_headers` whenever `write` or
 `graphql` is set, since those routes carry a JSON body.
 

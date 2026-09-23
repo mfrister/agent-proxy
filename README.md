@@ -38,11 +38,11 @@ The CA cert is generated on first run at `~/.mitmproxy/` (or the path set by `--
 
 ## Configuration
 
-**`config.yaml`** — domain allowlist and per-host options. Copy `config.default.yaml` as your starting point: it's the canonical format reference, with a worked, test-covered example of every section (`hosts`, `services`, `credentials`, and the secrets file).
+**`config.yaml`** — domain allowlist and per-host options. Copy `config.default.yaml` as your starting point: it's the canonical format reference, with a worked, test-covered example of every section (`hosts` and their credentials, `services`, and the secrets file).
 
 The options most setups touch:
 
-- **`hosts:`** — a plain hostname (or a `{host: ...}` mapping) is unrestricted. A mapping can add `allow_response_cookies` to filter `Set-Cookie` headers: omit it to pass all through (default), `[]` to strip everything, or a list to allowlist specific cookies. See the `cookies` example in `config.default.yaml`.
+- **`hosts:`** — a plain hostname (or a `{host: ...}` mapping) is unrestricted. A mapping can add `allow_response_cookies` to filter `Set-Cookie` headers: omit it to pass all through (default), `[]` to strip everything, or a list to allowlist specific cookies. See the `cookies` example in `config.default.yaml`. A host may have several entries — e.g. unauthenticated read-only access to everything plus authenticated read/write access to one repo (the `two-entries` example); the first entry that permits a request wins, and entries only ever add access.
 
 ### Service presets
 
@@ -60,11 +60,11 @@ services:
     real_value: "${GITHUB_TOKEN}"     # swaps in the real one on the way out
 ```
 
-`write: true` opts in to issue/PR/comment (or MR/note) writes; `unrestricted: true` is the explicit, logged opt-out from scoping back to blanket host access, and `allow_host: false` brokers a token without granting its host any access at all. See the `services` example in `config.default.yaml` for the full option set (including self-hosted `gitlab` and `graphql`), and [docs/service-presets.md](docs/service-presets.md) for the threat model, restriction design, and known limitations.
+`write: true` opts in to issue/PR/comment (or MR/note) writes; `unrestricted: true` is the explicit, logged opt-out from scoping back to blanket host access. See the `services` example in `config.default.yaml` for the full option set (including self-hosted `gitlab` and `graphql`), and [docs/service-presets.md](docs/service-presets.md) for the threat model, restriction design, and known limitations.
 
 ### Custom credentials
 
-For services without a preset, `credentials:` entries configure the broker directly: **swap mode** (the agent sends a placeholder `fake_value`; the proxy substitutes the real one before forwarding, and blocks any other non-empty value) or **inject mode** (the proxy sets the header unconditionally — omit `fake_value`). See the `credentials` example in `config.default.yaml`, which shows both forms.
+For services without a preset, a `hosts:` entry can carry a `credential:` (header, `real_value`, optional `fake_value`), brokered only for requests that entry permits — when some other entry for the host permits a request, the credential's header is stripped instead of forwarded. Two modes: **swap mode** (the agent sends a placeholder `fake_value`; the proxy substitutes the real one before forwarding, and blocks any other non-empty value) or **inject mode** (the proxy sets the header unconditionally — omit `fake_value`). See the `credentials` example in `config.default.yaml`, which shows both forms.
 
 **Environment variables:**
 
@@ -90,7 +90,7 @@ The port defaults to `$PROXY_MGMT_PORT` (or 8082 if unset).
 The UI polls every 5 seconds and shows two panels:
 
 - **DENIED** — recent blocked connections, deduplicated by host, newest first. Both kinds of denial return 503 with `Retry-After` to the client, so the **Type** column is how the TUI (not the client) tells them apart: `pending` (host not configured at all, awaiting human approval) vs. `violation` (host is configured but the request failed its registry policy). The full URL of the highlighted row — plus the violation reason, if any — is shown below the panels.
-- **ALLOWED** — current allowlist: permanent hosts, temporary allows with live countdown, and restricted hosts with their preset name (dimmed). Temp- or perm-allowing a restricted host lifts its restrictions.
+- **ALLOWED** — current allowlist: permanent hosts, temporary allows with live countdown, and restricted hosts with their preset name (dimmed). Temp- or perm-allowing a restricted host lifts its restrictions, but not onto a credential: out-of-scope requests go upstream without it.
 
 Key bindings:
 

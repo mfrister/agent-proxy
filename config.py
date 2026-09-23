@@ -2,12 +2,11 @@
 Configuration loading and shared proxy state.
 
 See config.default.yaml for the config and secrets file formats, with a
-worked, test-covered example of every section. Enforcement precedence
-(unrestricted hosts entry > temporary allows > restricted rules > pending
-approval) is documented in docs/service-presets.md ("How enforcement
-works"); how header scrubbing and credential wiring interact on a restricted
-host is covered in that same file's "Credential presets" and "Known
-client-side friction" sections.
+worked, test-covered example of every section. How a host's several entries
+are matched, and how a credential is bound to the entry that declares it,
+is documented in docs/service-presets.md ("How enforcement works"); how
+header scrubbing and credential wiring interact on a restricted entry is
+covered in that same file's "Credential presets" section.
 """
 
 import collections
