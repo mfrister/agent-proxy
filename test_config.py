@@ -351,7 +351,7 @@ class TestLoadHosts:
         result = Config.load(str(config)).hosts
         assert result["artifacts.example.com"][0].rules.source == "config"
 
-    def test_custom_entry_replaces_preset(self, tmp_path):
+    def test_custom_entry_added_alongside_preset(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
@@ -362,15 +362,15 @@ class TestLoadHosts:
             "      - methods: [GET]\n"
             "        path: \"/only-this\"\n"
         )
-        result = Config.load(str(config)).hosts
-        assert result["registry.npmjs.org"][0].rules.source == "config"
-        assert len(result["registry.npmjs.org"][0].rules.rules) == 1
+        entries = Config.load(str(config)).hosts["registry.npmjs.org"]
+        assert [e.rules.source for e in entries] == ["npm", "config"]
+        assert len(entries[1].rules.rules) == 1
 
-    def test_hosts_entry_overrides_preset_with_no_warning(self, tmp_path, capsys):
+    def test_unrestricted_hosts_entry_added_alongside_preset_with_no_warning(self, tmp_path, capsys):
         # A hand-written `hosts:` entry for a host a service preset also
-        # restricts replaces the preset's rules entirely (unrestricted, here)
-        # -- and since one dict entry per host makes the old both-sections
-        # overlap state unconstructible, no config_warning is emitted either.
+        # restricts adds a sibling entry after the preset's (config order),
+        # and no config_warning is emitted: several entries per host is a
+        # supported shape, not an overlap to flag.
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
@@ -379,7 +379,9 @@ class TestLoadHosts:
             "  - registry.npmjs.org\n"
         )
         cfg = Config.load(str(config))
-        assert cfg.hosts["registry.npmjs.org"][0].rules is None
+        entries = cfg.hosts["registry.npmjs.org"]
+        assert entries[0].rules.source == "npm"
+        assert entries[1].rules is None
         assert capsys.readouterr().out == ""
 
     def test_host_config_strips_cookies_for_restricted(self, tmp_path):
@@ -628,14 +630,12 @@ class TestScopedServiceExpansion:
         ]})
         assert "api.github.com" not in cfg.hosts
 
-    def test_hosts_entry_restricts_host_preset_left_unrestricted(self):
-        # The reverse (and security-relevant) direction of
-        # test_hosts_entry_overrides_preset_with_no_warning: a hand-written
-        # `hosts:` entry with `rules:` claws back a host a service preset
-        # left unrestricted. This is the plan's documented raw-rules escape
-        # hatch, and it did not actually work before 4ab01ae (old addon.py
-        # checked `allowlist` before `restricted`, so an unrestricted host
-        # could never be reclaimed).
+    def test_hosts_entry_cannot_restrict_host_preset_left_unrestricted(self):
+        # Entries only ever add access: a hand-written `hosts:` entry with
+        # `rules:` sits alongside the unrestricted entry a service preset
+        # produced rather than clawing it back, and the unrestricted entry
+        # still permits everything (see AllowlistAddon). Narrowing a
+        # service's access is done by scoping the service itself.
         from config import Config
         cfg = Config.from_data({
             "services": [
@@ -647,9 +647,9 @@ class TestScopedServiceExpansion:
                 ]},
             ],
         })
-        rules = cfg.hosts["api.github.com"][0].rules
-        assert isinstance(rules, registries.HostRules)
-        assert rules.source == "config"
+        entries = cfg.hosts["api.github.com"]
+        assert entries[0].rules is None
+        assert entries[1].rules.source == "config"
 
     def test_hosts_entry_over_scoped_service_keeps_credential_header(self, capsys):
         # Finding 3: a hand-written `hosts:` entry for a host a *scoped*
@@ -675,7 +675,7 @@ class TestScopedServiceExpansion:
                 ]},
             ],
         })
-        rules = cfg.hosts["api.github.com"][0].rules
+        rules = cfg.hosts["api.github.com"][1].rules
         assert isinstance(rules, registries.HostRules)
         assert rules.source == "config"
         assert "authorization" in rules.request_headers

@@ -244,13 +244,9 @@ class TestRegistryPolicy:
         addon.request(flow)
         assert flow.response.status_code == 503
 
-    def test_unrestricted_host_short_circuits_before_temp_allow_check(self):
-        # An unrestricted `hosts:` entry can no longer coexist with a rule set
-        # on the same host (unified dict, one entry per host) -- but the
-        # ordering that used to demonstrate ("allowlist beats restricted")
-        # still matters: unrestricted must win *before* temp_allows is even
-        # consulted. Prove it by making the temp-allow lookup irrelevant
-        # (expired) and confirming the request still passes.
+    def test_unrestricted_host_passes_without_temp_allow(self):
+        # An unrestricted entry permits on its own: an expired temp allow
+        # for the same host is irrelevant.
         from addon import AllowlistAddon
         addon = AllowlistAddon(make_state(
             hosts={"registry.example.com": None},
@@ -314,6 +310,88 @@ class TestRegistryPolicy:
                          headers={"Authorization": "Bearer tok"})
         addon.request(flow)
         assert flow.request.headers["Authorization"] == "Bearer tok"
+
+
+# ── Several entries on one host ────────────────────────────────────────────────
+
+def _rules(path, source, **extra):
+    import registries
+    return registries.compile_host_rules(
+        {"rules": [{"methods": ["GET"], "path": path}], **extra}, source=source,
+    )
+
+
+class TestMultiEntryMatching:
+    def test_first_permitting_entry_wins_and_is_stamped(self):
+        from addon import AllowlistAddon
+        from config import HostEntry
+        first = HostEntry(rules=_rules("/a", "first"))
+        second = HostEntry(rules=_rules("/b", "second"))
+        addon = AllowlistAddon(make_state(hosts={"h.com": [first, second]}))
+        flow = make_flow("h.com", path="/b")
+        addon.request(flow)
+        assert flow.response is None
+        assert flow.metadata["host_entry"] is second
+        assert flow.metadata["registry"] == "second"
+
+    def test_only_winning_entry_scrubs_headers(self):
+        # The first entry would keep X-Keep, but it doesn't permit the
+        # request, so the second entry's (stricter) header policy applies.
+        from addon import AllowlistAddon
+        from config import HostEntry
+        lax = HostEntry(rules=_rules("/a", "lax", request_headers=["x-keep"]))
+        strict = HostEntry(rules=_rules("/b", "strict"))
+        addon = AllowlistAddon(make_state(hosts={"h.com": [lax, strict]}))
+        flow = make_flow("h.com", path="/b", headers={"X-Keep": "v"})
+        addon.request(flow)
+        assert flow.response is None
+        assert "X-Keep" not in flow.request.headers
+
+    def test_unrestricted_entry_permits_beside_restricted(self):
+        from addon import AllowlistAddon
+        from config import HostEntry
+        restricted = HostEntry(rules=_rules("/a", "scoped"))
+        open_entry = HostEntry()
+        addon = AllowlistAddon(make_state(hosts={"h.com": [restricted, open_entry]}))
+        flow = make_flow("h.com", method="POST", path="/anything", headers={"X-Any": "v"})
+        addon.request(flow)
+        assert flow.response is None
+        assert flow.metadata["host_entry"] is open_entry
+        assert flow.request.headers["X-Any"] == "v"
+
+    def test_denial_reports_first_rejecting_entry(self, capsys):
+        from addon import AllowlistAddon
+        from config import HostEntry
+        state = make_state(hosts={"h.com": [
+            HostEntry(rules=_rules("/a", "first")),
+            HostEntry(rules=_rules("/b", "second")),
+        ]})
+        flow = make_flow("h.com", method="POST", path="/a")
+        AllowlistAddon(state).request(flow)
+        assert flow.response.status_code == 503
+        assert b"policy 'first'" in flow.response.content
+        assert "POST" in state.deny_log[0]["reason"]
+        assert json.loads(capsys.readouterr().out)["policy"] == "first"
+
+    def test_temp_allow_is_an_appended_entry_keeping_cookie_policy(self):
+        from addon import AllowlistAddon
+        from config import HostConfig, HostEntry
+        scoped = HostEntry(rules=_rules("/a", "scoped"),
+                           host_config=HostConfig(allow_response_cookies=[]))
+        addon = AllowlistAddon(make_state(
+            hosts={"h.com": [scoped]},
+            temp_allows={"h.com": time.time() + 60},
+        ))
+        in_scope = make_flow("h.com", path="/a")
+        addon.request(in_scope)
+        assert in_scope.metadata["host_entry"] is scoped
+
+        out_of_scope = make_flow("h.com", method="POST", path="/x")
+        addon.request(out_of_scope)
+        assert out_of_scope.response is None
+        temp = out_of_scope.metadata["host_entry"]
+        assert temp.rules is None
+        assert temp.host_config.allow_response_cookies == []
 
 
 # ── CredentialBrokerAddon ──────────────────────────────────────────────────────
@@ -512,11 +590,17 @@ class TestSighupReload:
 
 # ── Cookie allowlist (response side) ──────────────────────────────────────────
 
-def make_response_flow(host, set_cookie_headers=None):
-    """Return a mock HTTPFlow with response Set-Cookie headers."""
+def make_response_flow(host, set_cookie_headers=None, host_config=None):
+    """Return a mock HTTPFlow with response Set-Cookie headers.
+
+    host_config, if given, is the HostConfig of the entry AllowlistAddon
+    matched; None means no entry was stamped on the flow.
+    """
     from unittest.mock import MagicMock
+    from config import HostEntry
     flow = MagicMock()
     flow.request.pretty_host = host
+    flow.metadata = {} if host_config is None else {"host_entry": HostEntry(host_config=host_config)}
     cookies = list(set_cookie_headers or [])
 
     # Simulate mitmproxy Headers.get_all / pop / add
@@ -545,8 +629,7 @@ def make_response_flow(host, set_cookie_headers=None):
 class TestCookieAllowlist:
     def test_host_absent_passes_all_cookies(self):
         from addon import ResponseCookieFilterAddon
-        state = make_state(host_config={})
-        addon = ResponseCookieFilterAddon(state)
+        addon = ResponseCookieFilterAddon(make_state())
         flow = make_response_flow("other.com", ["session=abc", "tracker=xyz"])
         addon.response(flow)
         assert flow.response._stored == ["session=abc", "tracker=xyz"]
@@ -554,38 +637,35 @@ class TestCookieAllowlist:
     def test_host_config_none_restriction_passes_all(self):
         from addon import ResponseCookieFilterAddon
         from config import HostConfig
-        state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=None)})
-        addon = ResponseCookieFilterAddon(state)
-        flow = make_response_flow("example.com", ["session=abc", "tracker=xyz"])
+        addon = ResponseCookieFilterAddon(make_state())
+        flow = make_response_flow("example.com", ["session=abc", "tracker=xyz"],
+                                  host_config=HostConfig(allow_response_cookies=None))
         addon.response(flow)
         assert flow.response._stored == ["session=abc", "tracker=xyz"]
 
     def test_empty_allowlist_strips_all_cookies(self):
         from addon import ResponseCookieFilterAddon
         from config import HostConfig
-        state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=[])})
-        addon = ResponseCookieFilterAddon(state)
-        flow = make_response_flow("example.com", ["session=abc", "tracker=xyz"])
+        addon = ResponseCookieFilterAddon(make_state())
+        flow = make_response_flow("example.com", ["session=abc", "tracker=xyz"],
+                                  host_config=HostConfig(allow_response_cookies=[]))
         addon.response(flow)
         assert flow.response._stored == []
 
     def test_allowlist_keeps_only_named_cookie(self):
         from addon import ResponseCookieFilterAddon
         from config import HostConfig
-        state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=["csrftoken"])})
-        addon = ResponseCookieFilterAddon(state)
-        flow = make_response_flow("example.com", ["csrftoken=abc123", "session=xyz"])
+        addon = ResponseCookieFilterAddon(make_state())
+        flow = make_response_flow("example.com", ["csrftoken=abc123", "session=xyz"],
+                                  host_config=HostConfig(allow_response_cookies=["csrftoken"]))
         addon.response(flow)
         assert flow.response._stored == ["csrftoken=abc123"]
 
     def test_multiple_set_cookie_headers_filtered(self):
         from addon import ResponseCookieFilterAddon
         from config import HostConfig
-        state = make_state(host_config={"example.com": HostConfig(allow_response_cookies=["csrftoken", "lang"])})
-        addon = ResponseCookieFilterAddon(state)
-        flow = make_response_flow(
-            "example.com",
-            ["csrftoken=abc", "session=xyz", "lang=en", "tracker=1"],
-        )
+        addon = ResponseCookieFilterAddon(make_state())
+        flow = make_response_flow("example.com", ["csrftoken=abc", "session=xyz", "lang=en", "tracker=1"],
+                                  host_config=HostConfig(allow_response_cookies=["csrftoken", "lang"]))
         addon.response(flow)
         assert set(flow.response._stored) == {"csrftoken=abc", "lang=en"}

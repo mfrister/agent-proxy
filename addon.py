@@ -24,7 +24,7 @@ from mitmproxy import http
 from mitmproxy.http import HTTPFlow
 
 import registries
-from config import Config, ProxyState
+from config import Config, HostConfig, HostEntry, ProxyState
 from management_api import create_app
 
 
@@ -62,13 +62,18 @@ def enable_happy_eyeballs(delay: float) -> None:
 
 # ── Addons ─────────────────────────────────────────────────────────────────────
 
-_NOT_CONFIGURED = object()  # sentinel: host has no `hosts:` entry at all
-
-
 class AllowlistAddon:
     """
-    Checks every request against the unified host policy and active temporary
-    allows. Denied requests receive a 503 response and are logged.
+    Checks every request against the host's `hosts:` entries and any active
+    temporary allow. Denied requests receive a 503 response and are logged.
+
+    A host may carry several entries (hand-written and service-generated).
+    They're evaluated in config order, with a live temporary allow appended
+    as a final unrestricted entry, and the first entry that permits the
+    request wins: an unrestricted entry always permits, a restricted one
+    when registries.evaluate allows the request. Only the winning entry's
+    header scrubbing is applied, and the entry is stamped on
+    flow.metadata["host_entry"] for the addons downstream.
     """
 
     def __init__(self, state: ProxyState):
@@ -78,20 +83,47 @@ class AllowlistAddon:
         host = flow.request.pretty_host
         s = self.state
 
-        entries = s.hosts.get(host)
-        host_rules = entries[0].rules if entries else _NOT_CONFIGURED
-        if host_rules is None:  # unrestricted
-            return
-
+        entries = list(s.hosts.get(host, ()))
         with s.temp_lock:
             exp = s.temp_allows.get(host)
-            if exp and time.time() < exp:  # temp-allow is inherently unrestricted
-                return
+            if exp and time.time() < exp:
+                # Temp-allow grants access, not a cookie policy: keep whatever
+                # the host's configured entries filter.
+                entries.append(HostEntry(
+                    host_config=entries[0].host_config if entries else HostConfig(),
+                ))
 
-        if host_rules is not _NOT_CONFIGURED:
-            self._apply_registry_policy(flow, host_rules)
+        if not entries:
+            self._deny_pending(flow)
             return
 
+        rejection = None  # (entry, Violation) of the first entry to reject
+        for entry in entries:
+            if entry.rules is None:
+                flow.metadata["host_entry"] = entry
+                return
+            verdict = registries.evaluate(
+                entry.rules,
+                method=flow.request.method,
+                path_with_query=flow.request.path,
+                headers=flow.request.headers,
+                # raw_content is the buffered body mitmproxy actually forwards;
+                # the client-supplied Content-Length header can lie.
+                body_len=len(flow.request.raw_content or b""),
+                content_type=flow.request.headers.get("content-type"),
+            )
+            if isinstance(verdict, registries.Allowed):
+                self._apply_scrubbing(flow, verdict)
+                flow.metadata["host_entry"] = entry
+                flow.metadata["registry"] = entry.rules.source
+                return
+            if rejection is None:
+                rejection = (entry, verdict)
+
+        self._deny_violation(flow, *rejection)
+
+    def _deny_pending(self, flow: HTTPFlow):
+        host = flow.request.pretty_host
         flow.response = http.Response.make(
             503,
             f"Request to {host} is pending human approval. Retry the request after approval is granted.",
@@ -104,51 +136,40 @@ class AllowlistAddon:
             "method": flow.request.method,
             "type": "pending_approval",
         }
-        with s.deny_lock:
-            s.deny_log.append(entry)
+        with self.state.deny_lock:
+            self.state.deny_log.append(entry)
 
-    def _apply_registry_policy(self, flow: HTTPFlow, host_rules):
+    def _deny_violation(self, flow: HTTPFlow, host_entry: HostEntry, verdict):
         host = flow.request.pretty_host
-        verdict = registries.evaluate(
-            host_rules,
-            method=flow.request.method,
-            path_with_query=flow.request.path,
-            headers=flow.request.headers,
-            # raw_content is the buffered body mitmproxy actually forwards;
-            # the client-supplied Content-Length header can lie.
-            body_len=len(flow.request.raw_content or b""),
-            content_type=flow.request.headers.get("content-type"),
+        source = host_entry.rules.source
+        flow.response = http.Response.make(
+            503,
+            f"Request to {host} is not currently allowed by policy "
+            f"'{source}': {verdict.reason}. Request is pending "
+            "human approval. Retry the request after approval is granted.",
+            {"Content-Type": "text/plain", "Retry-After": "5"},
         )
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "host": host,
+            # Attacker-influenced; truncate so the deny log stays bounded
+            "url": flow.request.pretty_url[:512],
+            "method": flow.request.method,
+            "type": "policy_violation",
+            "reason": verdict.reason,
+        }
+        with self.state.deny_lock:
+            self.state.deny_log.append(entry)
+        print(json.dumps({
+            "event": "registry_policy_violation",
+            "host": host,
+            "method": flow.request.method,
+            "path": flow.request.path[:512],
+            "reason": verdict.reason,
+            "policy": source,
+        }))
 
-        if isinstance(verdict, registries.Violation):
-            flow.response = http.Response.make(
-                503,
-                f"Request to {host} is not currently allowed by policy "
-                f"'{host_rules.source}': {verdict.reason}. Request is pending "
-                "human approval. Retry the request after approval is granted.",
-                {"Content-Type": "text/plain", "Retry-After": "5"},
-            )
-            entry = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "host": host,
-                # Attacker-influenced; truncate so the deny log stays bounded
-                "url": flow.request.pretty_url[:512],
-                "method": flow.request.method,
-                "type": "policy_violation",
-                "reason": verdict.reason,
-            }
-            with self.state.deny_lock:
-                self.state.deny_log.append(entry)
-            print(json.dumps({
-                "event": "registry_policy_violation",
-                "host": host,
-                "method": flow.request.method,
-                "path": flow.request.path[:512],
-                "reason": verdict.reason,
-                "policy": host_rules.source,
-            }))
-            return
-
+    def _apply_scrubbing(self, flow: HTTPFlow, verdict):
         for name in verdict.drop_headers:
             del flow.request.headers[name]
         for name, cap in verdict.clamp_headers:
@@ -157,11 +178,10 @@ class AllowlistAddon:
             # Names only — scrubbed values may contain credentials
             print(json.dumps({
                 "event": "registry_headers_scrubbed",
-                "host": host,
+                "host": flow.request.pretty_host,
                 "dropped": sorted(verdict.drop_headers),
                 "clamped": sorted(name for name, _ in verdict.clamp_headers),
             }))
-        flow.metadata["registry"] = host_rules.source
 
 
 class CredentialBrokerAddon:
@@ -228,17 +248,17 @@ class CredentialBrokerAddon:
 
 
 class ResponseCookieFilterAddon:
-    """Filters Set-Cookie response headers according to each host's config."""
+    """Filters Set-Cookie response headers according to the config of the
+    host entry that permitted the request (see AllowlistAddon)."""
 
     def __init__(self, state: ProxyState):
         self.state = state
 
     def response(self, flow: HTTPFlow):
-        host = flow.request.pretty_host
-        cfg = self.state.host_config.get(host)
-        if cfg is None or cfg.allow_response_cookies is None:
+        host_entry = flow.metadata.get("host_entry")
+        if host_entry is None or host_entry.host_config.allow_response_cookies is None:
             return
-        allowed = set(cfg.allow_response_cookies)
+        allowed = set(host_entry.host_config.allow_response_cookies)
         kept = [
             v for v in flow.response.headers.get_all("set-cookie")
             if v.split("=")[0].strip() in allowed
