@@ -94,7 +94,7 @@ class TestManagementAPI:
     def test_post_allow_permanent_updates_state(self, mgmt):
         r = mgmt.post("/allow/permanent", json={"host": "new.com"})
         assert r.get_json()["ok"] is True
-        assert mgmt._state.hosts.get("new.com") is None and "new.com" in mgmt._state.hosts
+        assert mgmt._state.hosts["new.com"][0].rules is None
 
     def test_post_allow_permanent_clears_temp_entry(self, mgmt):
         state = mgmt._state
@@ -102,7 +102,7 @@ class TestManagementAPI:
             state.temp_allows["new.com"] = time.time() + 60
         r = mgmt.post("/allow/permanent", json={"host": "new.com"})
         assert r.get_json()["ok"] is True
-        assert "new.com" in state.hosts and state.hosts["new.com"] is None
+        assert "new.com" in state.hosts and state.hosts["new.com"][0].rules is None
         with state.temp_lock:
             assert "new.com" not in state.temp_allows
 
@@ -131,11 +131,11 @@ class TestManagementAPI:
                 "        path: \"/only-this\"\n"
             )
         mgmt._state.reload()
-        assert mgmt._state.hosts["restricted.com"] is not None
+        assert mgmt._state.hosts["restricted.com"][0].rules is not None
 
         r = mgmt.post("/allow/permanent", json={"host": "restricted.com"})
         assert r.get_json()["ok"] is True
-        assert mgmt._state.hosts["restricted.com"] is None
+        assert mgmt._state.hosts["restricted.com"][0].rules is None
 
         with open(config_path) as f:
             written = yaml.safe_load(f)
@@ -163,7 +163,7 @@ class TestManagementAPI:
 
         r = mgmt.post("/allow/permanent", json={"host": "cookie.com"})
         assert r.get_json()["ok"] is True
-        assert mgmt._state.hosts["cookie.com"] is None
+        assert mgmt._state.hosts["cookie.com"][0].rules is None
 
         with open(config_path) as f:
             written = yaml.safe_load(f)
@@ -373,7 +373,7 @@ class TestServicesEndpoints:
         cred = mgmt_secrets._state.credentials[0]
         assert cred.real_value == f"token {real}"
         assert cred.fake_value == f"token {svc['fake_value']}"
-        assert mgmt_secrets._state.hosts.get("api.github.com") is None and "api.github.com" in mgmt_secrets._state.hosts
+        assert mgmt_secrets._state.hosts["api.github.com"][0].rules is None
 
         # And GET /services stays redacted.
         listed = mgmt_secrets.get("/services")
@@ -588,7 +588,7 @@ class TestServicesEndpoints:
         svc = r.get_json()["service"]
         assert svc.get("unrestricted") is True
         assert "scope" not in svc
-        assert mgmt_secrets._state.hosts.get("api.github.com") is None
+        assert mgmt_secrets._state.hosts["api.github.com"][0].rules is None
 
     @pytest.mark.parametrize("bad_value", ["no", "false", "0", "", 1, 0])
     def test_put_unrestricted_non_bool_rejected(self, mgmt_secrets, bad_value):

@@ -12,7 +12,7 @@ import pytest
 import yaml
 
 import registries
-from config import Config, Credential
+from config import Config, Credential, HostEntry
 from conftest import make_state
 
 
@@ -82,7 +82,7 @@ class TestConfigLoad:
         cfg = Config.load(str(config))
         assert cfg.management_port == 9000
         assert "example.com" in cfg.hosts
-        assert cfg.hosts["example.com"] is None
+        assert cfg.hosts["example.com"][0].rules is None
 
     def test_secrets_expanded(self, tmp_path):
         from config import Config
@@ -279,7 +279,7 @@ class TestConfigLoad:
         state = make_state(hosts={"old.com": None}, config_path=str(config))
         with pytest.raises(ValueError):
             state.reload()
-        assert state.hosts == {"old.com": None}
+        assert state.hosts == {"old.com": [HostEntry()]}
 
 
 # ── Happy eyeballs delay (config loading) ───────────────────────────────────────
@@ -313,9 +313,9 @@ class TestLoadHosts:
         config = tmp_path / "config.yaml"
         config.write_text("services: [go, npm]\n")
         result = Config.load(str(config)).hosts
-        assert result["proxy.golang.org"].source == "go"
-        assert result["sum.golang.org"].source == "go"
-        assert result["registry.npmjs.org"].source == "npm"
+        assert result["proxy.golang.org"][0].rules.source == "go"
+        assert result["sum.golang.org"][0].rules.source == "go"
+        assert result["registry.npmjs.org"][0].rules.source == "npm"
 
     def test_unknown_preset_raises(self, tmp_path):
         from config import Config
@@ -336,7 +336,7 @@ class TestLoadHosts:
         config = tmp_path / "config.yaml"
         config.write_text("hosts:\n  - host: artifacts.example.com\n")
         result = Config.load(str(config)).hosts
-        assert result["artifacts.example.com"] is None
+        assert result["artifacts.example.com"][0].rules is None
 
     def test_custom_restricted_host(self, tmp_path):
         from config import Config
@@ -349,7 +349,7 @@ class TestLoadHosts:
             "        path: \"/repo/[a-z]{1,10}\"\n"
         )
         result = Config.load(str(config)).hosts
-        assert result["artifacts.example.com"].source == "config"
+        assert result["artifacts.example.com"][0].rules.source == "config"
 
     def test_custom_entry_replaces_preset(self, tmp_path):
         from config import Config
@@ -363,8 +363,8 @@ class TestLoadHosts:
             "        path: \"/only-this\"\n"
         )
         result = Config.load(str(config)).hosts
-        assert result["registry.npmjs.org"].source == "config"
-        assert len(result["registry.npmjs.org"].rules) == 1
+        assert result["registry.npmjs.org"][0].rules.source == "config"
+        assert len(result["registry.npmjs.org"][0].rules.rules) == 1
 
     def test_hosts_entry_overrides_preset_with_no_warning(self, tmp_path, capsys):
         # A hand-written `hosts:` entry for a host a service preset also
@@ -379,7 +379,7 @@ class TestLoadHosts:
             "  - registry.npmjs.org\n"
         )
         cfg = Config.load(str(config))
-        assert cfg.hosts["registry.npmjs.org"] is None
+        assert cfg.hosts["registry.npmjs.org"][0].rules is None
         assert capsys.readouterr().out == ""
 
     def test_host_config_strips_cookies_for_restricted(self, tmp_path):
@@ -394,9 +394,9 @@ class TestLoadHosts:
             "        path: \"/x\"\n"
             "    allow_response_cookies: [csrftoken]\n"
         )
-        result = Config.load(str(config)).host_config
-        assert result["registry.npmjs.org"].allow_response_cookies == []
-        assert result["artifacts.example.com"].allow_response_cookies == ["csrftoken"]
+        result = Config.load(str(config)).hosts
+        assert result["registry.npmjs.org"][0].host_config.allow_response_cookies == []
+        assert result["artifacts.example.com"][0].host_config.allow_response_cookies == ["csrftoken"]
 
 
 # ── Scoped service expansion (github/gitlab: scope, unrestricted, flags) ───────
@@ -415,7 +415,7 @@ class TestScopedServiceExpansion:
         cfg = Config.from_data({"services": [
             {"service": "github", "scope": {"repos": ["myorg/myrepo"]}, **GITHUB_CRED},
         ]})
-        rules = cfg.hosts["api.github.com"]
+        rules = cfg.hosts["api.github.com"][0].rules
         assert isinstance(rules, registries.HostRules)
         assert rules.source == "github"
 
@@ -439,7 +439,7 @@ class TestScopedServiceExpansion:
         cfg = Config.from_data({"services": [
             {"service": "github", "unrestricted": True, **GITHUB_CRED},
         ]})
-        assert cfg.hosts["api.github.com"] is None
+        assert cfg.hosts["api.github.com"][0].rules is None
         events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
         [event] = [e for e in events if e["event"] == "service_unrestricted"]
         assert event["service"] == "github"
@@ -493,7 +493,7 @@ class TestScopedServiceExpansion:
         cfg = Config.from_data({"services": [
             {"service": "github", "scope": {"repos": ["myorg/myrepo"]}, **GITHUB_CRED},
         ]})
-        rules = cfg.hosts["api.github.com"]
+        rules = cfg.hosts["api.github.com"][0].rules
         allowed = registries.evaluate(
             rules, method="GET", path_with_query="/repos/myorg/myrepo",
             headers={}, body_len=0,
@@ -513,7 +513,7 @@ class TestScopedServiceExpansion:
         cfg = Config.from_data({"services": [
             {"service": "github", "scope": {"repos": ["myorg/myrepo"]}, **GITHUB_CRED},
         ]})
-        assert "authorization" in cfg.hosts["api.github.com"].request_headers
+        assert "authorization" in cfg.hosts["api.github.com"][0].rules.request_headers
 
     def test_scope_round_trips_regex_metacharacters_literally(self):
         # '.' in a repo name is a legal GH_REPO character and a regex
@@ -524,7 +524,7 @@ class TestScopedServiceExpansion:
         cfg = Config.from_data({"services": [
             {"service": "github", "scope": {"repos": ["myorg/a.b"]}, **GITHUB_CRED},
         ]})
-        rules = cfg.hosts["api.github.com"]
+        rules = cfg.hosts["api.github.com"][0].rules
         literal = registries.evaluate(
             rules, method="GET", path_with_query="/repos/myorg/a.b",
             headers={}, body_len=0,
@@ -579,7 +579,7 @@ class TestScopedServiceExpansion:
         cfg = Config.from_data({"services": [
             {"service": "github", "unrestricted": True, **GITHUB_CRED},
         ]})
-        assert cfg.hosts["api.github.com"] is None
+        assert cfg.hosts["api.github.com"][0].rules is None
 
     def test_unrestricted_false_still_requires_scope(self):
         from config import Config
@@ -603,7 +603,7 @@ class TestScopedServiceExpansion:
             {"service": "github", "scope": {"repos": ["myorg/myrepo"]},
              "write": True, **GITHUB_CRED},
         ]})
-        rules = cfg.hosts["api.github.com"]
+        rules = cfg.hosts["api.github.com"][0].rules
         allowed = registries.evaluate(
             rules, method="POST", path_with_query="/repos/myorg/myrepo/issues",
             headers={"content-type": "application/json"}, body_len=10,
@@ -647,7 +647,7 @@ class TestScopedServiceExpansion:
                 ]},
             ],
         })
-        rules = cfg.hosts["api.github.com"]
+        rules = cfg.hosts["api.github.com"][0].rules
         assert isinstance(rules, registries.HostRules)
         assert rules.source == "config"
 
@@ -675,7 +675,7 @@ class TestScopedServiceExpansion:
                 ]},
             ],
         })
-        rules = cfg.hosts["api.github.com"]
+        rules = cfg.hosts["api.github.com"][0].rules
         assert isinstance(rules, registries.HostRules)
         assert rules.source == "config"
         assert "authorization" in rules.request_headers
@@ -704,7 +704,7 @@ class TestScopedServiceExpansion:
                 ]},
             ],
         })
-        rules = cfg.hosts["api.example.com"]
+        rules = cfg.hosts["api.example.com"][0].rules
         assert "authorization" not in rules.request_headers
 
 

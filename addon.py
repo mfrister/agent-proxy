@@ -78,7 +78,8 @@ class AllowlistAddon:
         host = flow.request.pretty_host
         s = self.state
 
-        host_rules = s.hosts.get(host, _NOT_CONFIGURED)
+        entries = s.hosts.get(host)
+        host_rules = entries[0].rules if entries else _NOT_CONFIGURED
         if host_rules is None:  # unrestricted
             return
 
@@ -292,7 +293,9 @@ class ManagementApiAddon:
 def setup_sighup(state: ProxyState):
     def handler(signum, frame):
         state.reload()
-        restricted_count = sum(1 for rules in state.hosts.values() if rules is not None)
+        restricted_count = sum(
+            1 for entries in state.hosts.values() for e in entries if e.rules is not None
+        )
         print(json.dumps({
             "event": "sighup_reload",
             "host_count": len(state.hosts),

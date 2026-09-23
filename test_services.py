@@ -66,7 +66,7 @@ class TestExpansion:
             preset="github",
         )]
         assert "api.github.com" in cfg.hosts
-        assert cfg.hosts["api.github.com"] is None
+        assert cfg.hosts["api.github.com"][0].rules is None
 
     def test_gitlab_with_host(self):
         cfg = Config.from_data({"services": [
@@ -80,14 +80,14 @@ class TestExpansion:
             preset="gitlab",
         )]
         assert "gitlab.example.com" in cfg.hosts
-        assert cfg.hosts["gitlab.example.com"] is None
+        assert cfg.hosts["gitlab.example.com"][0].rules is None
 
     def test_registry_service_bare_string(self):
         cfg = Config.from_data({"services": ["npm"]})
-        assert cfg.hosts["registry.npmjs.org"].source == "npm"
+        assert cfg.hosts["registry.npmjs.org"][0].rules.source == "npm"
         assert cfg.credentials == []
         assert not any(v is None for v in cfg.hosts.values())
-        assert cfg.host_config["registry.npmjs.org"].allow_response_cookies == []
+        assert cfg.hosts["registry.npmjs.org"][0].host_config.allow_response_cookies == []
 
     def test_allow_host_false_brokers_without_allowlisting(self):
         cfg = Config.from_data({"services": [
@@ -162,7 +162,7 @@ class TestExpansion:
             cfg = Config.from_data({"services": [
                 {"service": "npm-auth", "fake_value": "f", "real_value": "r"},
             ]})
-        rules = cfg.hosts["registry.npmjs.org"]
+        rules = cfg.hosts["registry.npmjs.org"][0].rules
         assert "authorization" in rules.request_headers
         # The catalog's own npm preset is untouched (frozen dataclass replaced,
         # not mutated).

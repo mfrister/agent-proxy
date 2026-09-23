@@ -462,8 +462,8 @@ class TestSighupReload:
         os.kill(os.getpid(), signal.SIGHUP)
         time.sleep(0.05)
 
-        assert "new.com" in state.hosts and state.hosts["new.com"] is None
-        assert "original.com" in state.hosts and state.hosts["original.com"] is None
+        assert "new.com" in state.hosts and state.hosts["new.com"][0].rules is None
+        assert "original.com" in state.hosts and state.hosts["original.com"][0].rules is None
 
     def test_sighup_reloads_credentials(self, tmp_path):
         from addon import setup_sighup
@@ -507,7 +507,7 @@ class TestSighupReload:
         os.kill(os.getpid(), signal.SIGHUP)
         time.sleep(0.05)
 
-        assert state.hosts["proxy.golang.org"] is not None
+        assert state.hosts["proxy.golang.org"][0].rules is not None
 
 
 # ── Cookie allowlist (response side) ──────────────────────────────────────────
