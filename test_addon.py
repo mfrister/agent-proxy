@@ -396,12 +396,25 @@ class TestMultiEntryMatching:
 
 # ── CredentialBrokerAddon ──────────────────────────────────────────────────────
 
+def make_broker(*entries, host="api.example.com"):
+    """A CredentialBrokerAddon whose state has `entries` for `host`."""
+    from addon import CredentialBrokerAddon
+    return CredentialBrokerAddon(make_state(hosts={host: list(entries)}))
+
+
+def matched_flow(entry, host="api.example.com", **kwargs):
+    """A flow as AllowlistAddon leaves it after `entry` permitted it."""
+    flow = make_flow(host, **kwargs)
+    flow.metadata["host_entry"] = entry
+    return flow
+
+
 class TestCredentialBrokerAddon:
     def test_fake_swapped_for_real(self, capsys):
-        from addon import CredentialBrokerAddon
-        addon = CredentialBrokerAddon(make_state(credentials=[CRED]))
-        flow = make_flow("api.example.com", headers={"Authorization": "Bearer sk-fake"})
-        addon.request(flow)
+        from config import HostEntry
+        entry = HostEntry(credential=CRED)
+        flow = matched_flow(entry, headers={"Authorization": "Bearer sk-fake"})
+        make_broker(entry).request(flow)
         assert flow.request.headers["Authorization"] == "Bearer sk-real"
         assert flow.response is None
         entry = json.loads(capsys.readouterr().out)
@@ -411,54 +424,56 @@ class TestCredentialBrokerAddon:
         assert entry["host"] == "api.example.com"
 
     def test_no_header_passes_through(self, capsys):
-        from addon import CredentialBrokerAddon
-        addon = CredentialBrokerAddon(make_state(credentials=[CRED]))
-        flow = make_flow("api.example.com", headers={})
-        addon.request(flow)
+        from config import HostEntry
+        entry = HostEntry(credential=CRED)
+        flow = matched_flow(entry, headers={})
+        make_broker(entry).request(flow)
         assert flow.response is None
         assert capsys.readouterr().out == ""
 
     def test_unexpected_value_blocks(self):
-        from addon import CredentialBrokerAddon
-        addon = CredentialBrokerAddon(make_state(credentials=[CRED]))
-        flow = make_flow("api.example.com", headers={"Authorization": "Bearer injected"})
-        addon.request(flow)
+        from config import HostEntry
+        entry = HostEntry(credential=CRED)
+        flow = matched_flow(entry, headers={"Authorization": "Bearer injected"})
+        make_broker(entry).request(flow)
         assert flow.response is not None
         assert flow.response.status_code == 403
 
     def test_non_matching_host_unchanged(self):
-        from addon import CredentialBrokerAddon
-        addon = CredentialBrokerAddon(make_state(credentials=[CRED]))
-        flow = make_flow("other.com", headers={"Authorization": "Bearer anything"})
-        addon.request(flow)
+        from config import HostEntry
+        broker = make_broker(HostEntry(credential=CRED))
+        flow = matched_flow(HostEntry(), host="other.com",
+                            headers={"Authorization": "Bearer anything"})
+        broker.request(flow)
         assert flow.response is None
+        assert flow.request.headers["Authorization"] == "Bearer anything"
 
     def test_real_value_not_in_log(self, capsys):
-        from addon import CredentialBrokerAddon
-        addon = CredentialBrokerAddon(make_state(credentials=[CRED]))
-        flow = make_flow("api.example.com", headers={"Authorization": "Bearer injected"})
-        addon.request(flow)
+        from config import HostEntry
+        entry = HostEntry(credential=CRED)
+        flow = matched_flow(entry, headers={"Authorization": "Bearer injected"})
+        make_broker(entry).request(flow)
         captured = capsys.readouterr().out
         assert "sk-real" not in captured
 
     def test_skips_already_denied_flow(self):
-        from addon import CredentialBrokerAddon
+        from config import HostEntry
         from mitmproxy import http
-        addon = CredentialBrokerAddon(make_state(credentials=[CRED]))
-        flow = make_flow("api.example.com", headers={"Authorization": "Bearer injected"})
+        entry = HostEntry(credential=CRED)
+        flow = matched_flow(entry, headers={"Authorization": "Bearer injected"})
         # Simulate AllowlistAddon already set a 503
         flow.response = http.Response.make(503, "pending human approval")
-        addon.request(flow)
+        make_broker(entry).request(flow)
         # Should not overwrite the existing response
         assert flow.response.status_code == 503
         assert b"pending human approval" in flow.response.content
 
     def test_inject_mode_sets_header_when_absent(self, capsys):
-        from addon import CredentialBrokerAddon
-        inject_cred = Credential(host="api.example.com", header="Cookie", real_value="session=abc123")
-        addon = CredentialBrokerAddon(make_state(credentials=[inject_cred]))
-        flow = make_flow("api.example.com", headers={})
-        addon.request(flow)
+        from config import HostEntry
+        entry = HostEntry(credential=Credential(
+            host="api.example.com", header="Cookie", real_value="session=abc123"))
+        flow = matched_flow(entry, headers={})
+        make_broker(entry).request(flow)
         assert flow.request.headers["Cookie"] == "session=abc123"
         assert flow.response is None
         entry = json.loads(capsys.readouterr().out)
@@ -466,11 +481,11 @@ class TestCredentialBrokerAddon:
         assert entry["mode"] == "inject"
 
     def test_inject_mode_overwrites_existing_header(self, capsys):
-        from addon import CredentialBrokerAddon
-        inject_cred = Credential(host="api.example.com", header="Cookie", real_value="session=abc123")
-        addon = CredentialBrokerAddon(make_state(credentials=[inject_cred]))
-        flow = make_flow("api.example.com", headers={"Cookie": "old=value"})
-        addon.request(flow)
+        from config import HostEntry
+        entry = HostEntry(credential=Credential(
+            host="api.example.com", header="Cookie", real_value="session=abc123"))
+        flow = matched_flow(entry, headers={"Cookie": "old=value"})
+        make_broker(entry).request(flow)
         assert flow.request.headers["Cookie"] == "session=abc123"
         assert flow.response is None
         entry = json.loads(capsys.readouterr().out)
@@ -478,13 +493,150 @@ class TestCredentialBrokerAddon:
         assert entry["mode"] == "inject"
 
     def test_inject_mode_does_not_affect_other_hosts(self):
-        from addon import CredentialBrokerAddon
-        inject_cred = Credential(host="api.example.com", header="Cookie", real_value="session=abc123")
-        addon = CredentialBrokerAddon(make_state(credentials=[inject_cred]))
-        flow = make_flow("other.com", headers={})
-        addon.request(flow)
+        from config import HostEntry
+        broker = make_broker(HostEntry(credential=Credential(
+            host="api.example.com", header="Cookie", real_value="session=abc123")))
+        flow = matched_flow(HostEntry(), host="other.com", headers={})
+        broker.request(flow)
         assert "Cookie" not in flow.request.headers
         assert flow.response is None
+
+    def test_sibling_entry_credential_withheld_and_stripped(self, capsys):
+        # The request was permitted by an entry without a credential: the
+        # sibling's credential isn't brokered, and its header is stripped
+        # rather than forwarding the client's fake token.
+        from config import HostEntry
+        credentialed, plain = HostEntry(credential=CRED), HostEntry()
+        flow = matched_flow(plain, headers={"Authorization": "Bearer sk-fake"})
+        make_broker(credentialed, plain).request(flow)
+        assert flow.response is None
+        assert "Authorization" not in flow.request.headers
+        out = capsys.readouterr().out
+        event = json.loads(out)
+        assert event["event"] == "credential_withheld"
+        assert event["headers"] == ["Authorization"]
+        assert "sk-fake" not in out and "sk-real" not in out
+
+    def test_matched_credential_header_not_stripped_by_sibling(self):
+        # Two credentialed entries sharing a header: the matched one's
+        # header is brokered, not withheld on account of the sibling.
+        from config import HostEntry
+        other = HostEntry(credential=Credential(
+            host="api.example.com", header="authorization",
+            fake_value="Bearer other-fake", real_value="Bearer other-real"))
+        entry = HostEntry(credential=CRED)
+        flow = matched_flow(entry, headers={"Authorization": "Bearer sk-fake"})
+        make_broker(other, entry).request(flow)
+        assert flow.request.headers["Authorization"] == "Bearer sk-real"
+
+
+# ── Allowlist + broker together: credentials bound to entries ─────────────────
+
+def run_pipeline(state, flow):
+    from addon import AllowlistAddon, CredentialBrokerAddon
+    AllowlistAddon(state).request(flow)
+    CredentialBrokerAddon(state).request(flow)
+    return flow
+
+
+GH_FAKE = "token ghp_fake"
+GH_REAL = "token ghp_real"
+
+
+def scoped_github_config(**extra):
+    from config import Config
+    return Config.from_data({
+        "services": [{
+            "service": "github", "scope": {"repos": ["myorg/myrepo"]},
+            "fake_value": "ghp_fake", "real_value": "ghp_real",
+        }],
+        **extra,
+    })
+
+
+def state_from(cfg, **overrides):
+    from config import ProxyState
+    state = ProxyState(config_path="config.yaml", **overrides)
+    state.apply(cfg)
+    return state
+
+
+class TestEntryBoundCredentials:
+    IN_SCOPE = "/repos/myorg/myrepo/issues"
+    OUT_OF_SCOPE = "/repos/otherorg/secret/issues"
+
+    def test_credentialed_entry_listed_second_still_brokers_in_scope(self):
+        # Ordering footgun: an earlier unauthenticated entry that also permits
+        # the in-scope path must not shadow the credentialed one when the
+        # client presents the fake token.
+        from config import Config
+        cfg = Config.from_data({"hosts": [
+            {"host": "api.example.com", "rules": [
+                {"methods": ["GET"], "path": "/repos/[a-z/]{1,64}"},
+            ]},
+            {"host": "api.example.com", "rules": [
+                {"methods": ["GET", "POST"], "path": "/repos/myorg/myrepo/[a-z]{1,32}"},
+            ], "credential": {"header": "Authorization",
+                              "fake_value": GH_FAKE, "real_value": GH_REAL}},
+        ]})
+        state = state_from(cfg)
+
+        in_scope = run_pipeline(state, make_flow(
+            "api.example.com", path="/repos/myorg/myrepo/issues",
+            headers={"Authorization": GH_FAKE}))
+        assert in_scope.response is None
+        assert in_scope.request.headers["Authorization"] == GH_REAL
+
+        out_of_scope = run_pipeline(state, make_flow(
+            "api.example.com", path="/repos/otherorg/public",
+            headers={"Authorization": GH_FAKE}))
+        assert out_of_scope.response is None
+        assert "Authorization" not in out_of_scope.request.headers
+
+    def test_credentialed_entry_scope_still_enforced_when_presented(self):
+        # Presenting the fake only reorders; a request neither entry permits
+        # is still denied, with the credentialed entry's reason.
+        from config import Config
+        cfg = Config.from_data({"hosts": [
+            {"host": "api.example.com", "rules": [{"methods": ["GET"], "path": "/public"}]},
+            {"host": "api.example.com", "rules": [{"methods": ["GET"], "path": "/private"}],
+             "credential": {"header": "Authorization",
+                            "fake_value": GH_FAKE, "real_value": GH_REAL}},
+        ]})
+        state = state_from(cfg)
+        flow = run_pipeline(state, make_flow(
+            "api.example.com", method="POST", path="/private",
+            headers={"Authorization": GH_FAKE}))
+        assert flow.response.status_code == 503
+        assert "POST" in state.deny_log[0]["reason"]
+
+    def _assert_out_of_scope_withheld(self, state):
+        in_scope = run_pipeline(state, make_flow(
+            "api.github.com", path=self.IN_SCOPE, headers={"Authorization": GH_FAKE}))
+        assert in_scope.response is None
+        assert in_scope.request.headers["Authorization"] == GH_REAL
+
+        out_of_scope = run_pipeline(state, make_flow(
+            "api.github.com", path=self.OUT_OF_SCOPE, headers={"Authorization": GH_FAKE}))
+        assert out_of_scope.response is None  # allowlisted some other way
+        assert "Authorization" not in out_of_scope.request.headers
+
+    def test_unrestricted_hosts_entry_does_not_leak_scoped_credential(self):
+        self._assert_out_of_scope_withheld(state_from(
+            scoped_github_config(hosts=["api.github.com"])))
+
+    def test_temp_allow_does_not_leak_scoped_credential(self):
+        self._assert_out_of_scope_withheld(state_from(
+            scoped_github_config(),
+            temp_allows={"api.github.com": time.time() + 60},
+        ))
+
+    def test_out_of_scope_without_other_route_denied(self):
+        state = state_from(scoped_github_config())
+        flow = run_pipeline(state, make_flow(
+            "api.github.com", path=self.OUT_OF_SCOPE, headers={"Authorization": GH_FAKE}))
+        assert flow.response.status_code == 503
+        assert flow.request.headers["Authorization"] == GH_FAKE  # never forwarded
 
 
 # ── LoggingAddon ───────────────────────────────────────────────────────────────
@@ -547,29 +699,26 @@ class TestSighupReload:
         from addon import setup_sighup
 
         config = tmp_path / "config.yaml"
-        config.write_text(
-            "credentials:\n"
+        yaml_template = (
+            "hosts:\n"
             "  - host: api.example.com\n"
-            "    header: Authorization\n"
-            "    real_value: old-value\n"
+            "    credential:\n"
+            "      header: Authorization\n"
+            "      real_value: {}\n"
         )
+        config.write_text(yaml_template.format("old-value"))
 
-        state = make_state(
-            credentials=[Credential(host="api.example.com", header="Authorization", real_value="old-value")],
-            config_path=str(config),
-        )
+        state = make_state(config_path=str(config))
+        state.reload()
+        assert state.credentials[0].real_value == "old-value"
         setup_sighup(state)
 
-        config.write_text(
-            "credentials:\n"
-            "  - host: api.example.com\n"
-            "    header: Authorization\n"
-            "    real_value: new-value\n"
-        )
+        config.write_text(yaml_template.format("new-value"))
         os.kill(os.getpid(), signal.SIGHUP)
         time.sleep(0.05)
 
         assert state.credentials[0].real_value == "new-value"
+        assert state.hosts["api.example.com"][0].credential.real_value == "new-value"
 
     def test_sighup_reloads_restricted(self, tmp_path):
         from addon import setup_sighup

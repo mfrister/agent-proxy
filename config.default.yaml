@@ -6,19 +6,23 @@
 #   MY_API_KEY: "Bearer sk-real-key-here"
 #   OTHER_SECRET: "some-value"
 #
-# Credentials support ${KEY} references resolved from that file. Two modes:
-# swap (agent sends a fake value, the proxy swaps in the real one -- set
-# fake_value) and inject (the proxy sets the header unconditionally -- omit
-# fake_value):
+# A hosts entry may carry a credential, brokered only for requests that
+# entry permits. Its real_value/fake_value support ${KEY} references resolved
+# from that file. Two modes: swap (agent sends a fake value, the proxy swaps
+# in the real one -- set fake_value) and inject (the proxy sets the header
+# unconditionally -- omit fake_value). On a restricted entry the credential's
+# header is added to that entry's request_headers automatically.
 # >>> example: credentials
-#   credentials:
+#   hosts:
 #     - host: api.openai.com
-#       header: Authorization
-#       fake_value: "Bearer sk-fake"       # swap mode: agent sends fake, proxy swaps real
-#       real_value: "${OPENAI_API_KEY}"
+#       credential:
+#         header: Authorization
+#         fake_value: "Bearer sk-fake"     # swap mode: agent sends fake, proxy swaps real
+#         real_value: "${OPENAI_API_KEY}"
 #     - host: internal.example.com
-#       header: Cookie
-#       real_value: "session=abc123"       # inject mode: omit fake_value
+#       credential:
+#         header: Cookie
+#         real_value: "session=abc123"     # inject mode: omit fake_value
 # <<<
 
 # management_port: 8082   # port for the management API (default: 8082)
@@ -123,7 +127,6 @@ hosts:
 #     write: true                            # allow issue/MR/note writes
 #     fake_value: "glpat-00000000000000fake"
 #     real_value: "${GITLAB_TOKEN}"
-#     # allow_host: false                    # broker the token but don't allowlist the host
 # <<<
 #   # - service: github                      # the explicit, logged opt-out from scoping
 #   #   unrestricted: true                   # -- blanket api.github.com access, no rule engine

@@ -173,11 +173,10 @@ def proxy(tmp_path_factory):
     config_text = (
         "hosts:\n"
         "  - host: 127.0.0.1\n"
-        "credentials:\n"
-        "  - host: 127.0.0.1\n"
-        "    header: X-Api-Key\n"
-        "    fake_value: fake-key\n"
-        "    real_value: real-key\n"
+        "    credential:\n"
+        "      header: X-Api-Key\n"
+        "      fake_value: fake-key\n"
+        "      real_value: real-key\n"
     )
     with _proxy_context(
         tmp_path_factory.mktemp("functional"),
@@ -272,11 +271,10 @@ def proxy_secrets(tmp_path):
         f"secrets_file: {secrets}\n"
         "hosts:\n"
         "  - host: 127.0.0.1\n"
-        "credentials:\n"
-        "  - host: 127.0.0.1\n"
-        "    header: X-Api-Key\n"
-        "    fake_value: fake-key\n"
-        '    real_value: "${REAL_API_KEY}"\n'
+        "    credential:\n"
+        "      header: X-Api-Key\n"
+        "      fake_value: fake-key\n"
+        '      real_value: "${REAL_API_KEY}"\n'
     )
     with _proxy_context(tmp_path, EchoHandler, config_text) as ctx:
         yield ctx
@@ -347,6 +345,18 @@ def proxy_gitlab_scoped_readonly(tmp_path_factory):
         tmp_path_factory.mktemp("functional_gitlab_readonly"),
         EchoHandler,
         GITLAB_SCOPE_READONLY_CONFIG,
+    ) as ctx:
+        yield ctx
+
+
+@pytest.fixture(scope="module")
+def proxy_gitlab_scoped_plus_unrestricted(tmp_path_factory):
+    """A scoped, credentialed `gitlab` service and an unrestricted hand-written
+    entry on the same host: two entries, only one carrying the credential."""
+    with _proxy_context(
+        tmp_path_factory.mktemp("functional_gitlab_two_entries"),
+        EchoHandler,
+        GITLAB_SCOPE_READONLY_CONFIG + "hosts:\n  - 127.0.0.1\n",
     ) as ctx:
         yield ctx
 
@@ -570,3 +580,25 @@ def test_scoped_credential_never_reaches_upstream_on_denied_request(proxy_gitlab
     # token (which only CredentialBrokerAddon, downstream of the deny, knows)
     # had no channel to leak through.
     assert len(EchoHandler.received) == before
+
+
+def test_two_entries_one_host_credential_bound_to_scoped_entry(
+        proxy_gitlab_scoped_plus_unrestricted):
+    """In scope, the scoped entry permits and brokers the real token; out of
+    scope, the unrestricted entry permits but the credential is withheld and
+    the fake header stripped -- neither token reaches upstream."""
+    ctx = proxy_gitlab_scoped_plus_unrestricted
+    in_scope = urllib.request.Request(
+        ctx["server_url"] + "/api/v4/projects/acme%2Fwebapp/issues",
+        headers={"PRIVATE-TOKEN": "glpat-fake-token"},
+    )
+    data = json.loads(ctx["opener"].open(in_scope).read())
+    assert data["headers"].get("private-token") == "real-glpat-secret"
+
+    out_of_scope = urllib.request.Request(
+        ctx["server_url"] + "/api/v4/projects/other%2Fproject/issues",
+        headers={"PRIVATE-TOKEN": "glpat-fake-token"},
+    )
+    data = json.loads(ctx["opener"].open(out_of_scope).read())
+    assert data["path"] == "/api/v4/projects/other%2Fproject/issues"
+    assert "private-token" not in data["headers"]
