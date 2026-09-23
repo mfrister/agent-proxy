@@ -91,11 +91,12 @@ class TestConfigLoad:
         config = tmp_path / "config.yaml"
         config.write_text(
             f"secrets_file: {secrets}\n"
-            "credentials:\n"
+            "hosts:\n"
             "  - host: api.example.com\n"
-            "    header: Authorization\n"
-            "    fake_value: fake\n"
-            "    real_value: \"${MY_KEY}\"\n"
+            "    credential:\n"
+            "      header: Authorization\n"
+            "      fake_value: fake\n"
+            "      real_value: \"${MY_KEY}\"\n"
         )
         cfg = Config.load(str(config))
         assert cfg.credentials[0].real_value == "real-value"
@@ -107,10 +108,11 @@ class TestConfigLoad:
         config = tmp_path / "config.yaml"
         config.write_text(
             f"secrets_file: {secrets}\n"
-            "credentials:\n"
+            "hosts:\n"
             "  - host: api.example.com\n"
-            "    header: Authorization\n"
-            "    real_value: \"${MISSING_KEY}\"\n"
+            "    credential:\n"
+            "      header: Authorization\n"
+            "      real_value: \"${MISSING_KEY}\"\n"
         )
         with pytest.raises(KeyError, match="MISSING_KEY"):
             Config.load(str(config))
@@ -129,10 +131,11 @@ class TestConfigLoad:
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
-            "credentials:\n"
+            "hosts:\n"
             "  - host: api.example.com\n"
-            "    header: Authorization\n"
-            "    real_value: plain-value\n"
+            "    credential:\n"
+            "      header: Authorization\n"
+            "      real_value: plain-value\n"
         )
         cfg = Config.load(str(config))
         assert cfg.credentials[0].real_value == "plain-value"
@@ -144,13 +147,15 @@ class TestConfigLoad:
         config = tmp_path / "config.yaml"
         config.write_text(
             f"secrets_file: {secrets}\n"
-            "credentials:\n"
+            "hosts:\n"
             "  - host: a.com\n"
-            "    header: Authorization\n"
-            "    real_value: \"${KEY_A}\"\n"
+            "    credential:\n"
+            "      header: Authorization\n"
+            "      real_value: \"${KEY_A}\"\n"
             "  - host: b.com\n"
-            "    header: Authorization\n"
-            "    real_value: \"${KEY_B}\"\n"
+            "    credential:\n"
+            "      header: Authorization\n"
+            "      real_value: \"${KEY_B}\"\n"
         )
         cfg = Config.load(str(config))
         assert cfg.credentials[0].real_value == "value-a"
@@ -185,11 +190,12 @@ class TestConfigLoad:
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
-            "credentials:\n"
+            "hosts:\n"
             "  - host: api.example.com\n"
-            "    header: Authorization\n"
-            "    fake_value: fake\n"
-            "    real_value: real\n"
+            "    credential:\n"
+            "      header: Authorization\n"
+            "      fake_value: fake\n"
+            "      real_value: real\n"
         )
         cfg = Config.load(str(config))
         assert cfg.credentials == [Credential(
@@ -207,12 +213,68 @@ class TestConfigLoad:
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
-            "credentials:\n"
+            "hosts:\n"
             "  - host: api.example.com\n"
-            "    real_value: real\n"
+            "    credential:\n"
+            "      real_value: real\n"
         )
-        with pytest.raises(ValueError, match="header"):
+        with pytest.raises(ValueError, match=r"hosts\[0\]\.credential missing .*header"):
             Config.load(str(config))
+
+    @pytest.mark.parametrize("credential,match", [
+        ("x", "must be a mapping"),
+        ({"header": "Authorization", "real_value": "r", "host": "other.com"},
+         "unknown key.*host"),
+    ])
+    def test_inline_credential_invalid_raises(self, credential, match):
+        from config import Config
+        with pytest.raises(ValueError, match=match):
+            Config.from_data({"hosts": [{"host": "api.example.com", "credential": credential}]})
+
+    def test_inline_credentials_plural_key_raises(self):
+        from config import Config
+        with pytest.raises(ValueError, match="did you mean 'credential'"):
+            Config.from_data({"hosts": [{"host": "api.example.com", "credentials": {}}]})
+
+    def test_top_level_credentials_rejected_with_migration_hint(self):
+        # Not silently ignored: a dropped credential would send every
+        # request upstream unauthenticated with no policy error to explain it.
+        from config import Config
+        with pytest.raises(ValueError, match="credentials moved onto hosts entries.*credential:"):
+            Config.from_data({"credentials": [
+                {"host": "api.example.com", "header": "Authorization", "real_value": "r"},
+            ]})
+
+    def test_inline_credential_header_survives_its_entry_scrubbing(self):
+        from config import Config
+        cfg = Config.from_data({"hosts": [{
+            "host": "api.example.com",
+            "rules": [{"methods": ["GET"], "path": "/data"}],
+            "credential": {"header": "X-Api-Key", "real_value": "r", "fake_value": "f"},
+        }]})
+        [entry] = cfg.hosts["api.example.com"]
+        assert "x-api-key" in entry.rules.request_headers
+        assert entry.credential == Credential(
+            host="api.example.com", header="X-Api-Key", real_value="r", fake_value="f",
+        )
+
+    def test_secret_in_non_credential_hosts_field_not_expanded(self, tmp_path):
+        # ${KEY} expansion on hosts entries is confined to credential
+        # real_value/fake_value, same as on services entries.
+        from config import Config
+        secrets = tmp_path / "secrets.yaml"
+        secrets.write_text("KEY: real-secret\n")
+        cfg = Config.from_data({
+            "secrets_file": str(secrets),
+            "hosts": [{
+                "host": "api.example.com",
+                "allow_response_cookies": ["${KEY}"],
+                "credential": {"header": "Authorization", "real_value": "${KEY}"},
+            }],
+        })
+        [entry] = cfg.hosts["api.example.com"]
+        assert entry.credential.real_value == "real-secret"
+        assert entry.host_config.allow_response_cookies == ["${KEY}"]
 
     def test_management_port_from_config(self, tmp_path):
         from config import Config
@@ -231,7 +293,6 @@ class TestConfigLoad:
         config = tmp_path / "config.yaml"
         config.write_text(
             "hosts:\n"
-            "credentials:\n"
             "services:\n"
         )
         cfg = Config.load(str(config))
@@ -622,13 +683,23 @@ class TestScopedServiceExpansion:
                  **GITHUB_CRED},
             ]})
 
-    def test_allow_host_false_still_works(self):
+    def test_allow_host_false_rejected_with_migration_hint(self):
+        # A credential only fires for requests its own entry permits, so a
+        # service that brokers without an entry would be a silent no-op.
+        from config import Config
+        with pytest.raises(ValueError, match="allow_host: false.*'credential:'"):
+            Config.from_data({"services": [
+                {"service": "github", "unrestricted": True, "allow_host": False,
+                 **GITHUB_CRED},
+            ]})
+
+    def test_allow_host_true_accepted(self):
         from config import Config
         cfg = Config.from_data({"services": [
-            {"service": "github", "unrestricted": True, "allow_host": False,
+            {"service": "github", "unrestricted": True, "allow_host": True,
              **GITHUB_CRED},
         ]})
-        assert "api.github.com" not in cfg.hosts
+        assert cfg.hosts["api.github.com"][0].credential is not None
 
     def test_hosts_entry_cannot_restrict_host_preset_left_unrestricted(self):
         # Entries only ever add access: a hand-written `hosts:` entry with
@@ -651,19 +722,13 @@ class TestScopedServiceExpansion:
         assert entries[0].rules is None
         assert entries[1].rules.source == "config"
 
-    def test_hosts_entry_over_scoped_service_keeps_credential_header(self, capsys):
-        # Finding 3: a hand-written `hosts:` entry for a host a *scoped*
-        # (not unrestricted) service preset also touches replaces the
-        # preset's compiled rules wholesale, including the request_headers
-        # merge that keeps `authorization` alive through AllowlistAddon's
-        # header scrubbing. Without re-wiring it, CredentialBrokerAddon
-        # (which runs after AllowlistAddon) never sees the header to swap
-        # in the real token, and the request goes upstream unauthenticated
-        # -- silently, since that looks like an ordinary 200, not a
-        # policy_violation or a pending approval. The existing override test
-        # above uses `unrestricted: true`, which never reaches this branch
-        # (preset.hosts is empty for github, so there's no compiled
-        # request_headers to lose in the first place).
+    def test_hosts_entry_beside_scoped_service_gets_no_credential(self, capsys):
+        # A hand-written `hosts:` entry for a host a scoped, credentialed
+        # service also covers is a sibling entry: the credential stays bound
+        # to the service's entry (whose rules keep its header alive), and the
+        # hand-written entry neither carries it nor has its header wired in.
+        # Requests that only the hand-written entry permits go upstream
+        # without the credential (see CredentialBrokerAddon).
         from config import Config
         cfg = Config.from_data({
             "services": [
@@ -671,41 +736,32 @@ class TestScopedServiceExpansion:
             ],
             "hosts": [
                 {"host": "api.github.com", "rules": [
-                    {"methods": ["GET"], "path": "/repos/myorg/myrepo/releases"},
+                    {"methods": ["GET"], "path": "/repos/otherorg/public"},
                 ]},
             ],
         })
-        rules = cfg.hosts["api.github.com"][1].rules
-        assert isinstance(rules, registries.HostRules)
-        assert rules.source == "config"
-        assert "authorization" in rules.request_headers
+        service_entry, hand_written = cfg.hosts["api.github.com"]
+        assert service_entry.credential.preset == "github"
+        assert "authorization" in service_entry.rules.request_headers
+        assert hand_written.credential is None
+        assert "authorization" not in hand_written.rules.request_headers
+        assert capsys.readouterr().out == ""
 
-        events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-        [event] = [e for e in events if e["event"] == "hosts_entry_rewires_credential_header"]
-        assert event["host"] == "api.github.com"
-        assert event["headers"] == ["authorization"]
-
-    def test_hosts_entry_over_hand_written_credential_does_not_auto_wire(self):
-        # The auto-wire is deliberately scoped to service-preset-generated
-        # credentials (Credential.preset is not None). A hand-written
-        # `credentials:` entry on a restricted `hosts:` entry is documented
-        # to need its header listed by the operator -- this must stay that
-        # way, or a raw credentials entry would start silently getting a
-        # header allowlisted for it that the operator never asked for.
+    def test_hand_written_credential_header_wired_into_its_own_entry_only(self):
         from config import Config
         cfg = Config.from_data({
-            "credentials": [
-                {"host": "api.example.com", "header": "Authorization",
-                 "real_value": "tok"},
-            ],
             "hosts": [
                 {"host": "api.example.com", "rules": [
-                    {"methods": ["GET"], "path": "/data"},
+                    {"methods": ["GET"], "path": "/public"},
                 ]},
+                {"host": "api.example.com", "rules": [
+                    {"methods": ["GET"], "path": "/data"},
+                ], "credential": {"header": "Authorization", "real_value": "tok"}},
             ],
         })
-        rules = cfg.hosts["api.example.com"][0].rules
-        assert "authorization" not in rules.request_headers
+        public, private = cfg.hosts["api.example.com"]
+        assert "authorization" not in public.rules.request_headers
+        assert "authorization" in private.rules.request_headers
 
 
 # ── config.default.yaml examples ─────────────────────────────────────────────

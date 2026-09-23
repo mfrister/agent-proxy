@@ -86,16 +86,16 @@ class TestExpansion:
         cfg = Config.from_data({"services": ["npm"]})
         assert cfg.hosts["registry.npmjs.org"][0].rules.source == "npm"
         assert cfg.credentials == []
-        assert not any(v is None for v in cfg.hosts.values())
+        assert all(e.rules is not None for entries in cfg.hosts.values() for e in entries)
         assert cfg.hosts["registry.npmjs.org"][0].host_config.allow_response_cookies == []
 
-    def test_allow_host_false_brokers_without_allowlisting(self):
+    def test_credential_attached_to_its_hosts_entry(self):
         cfg = Config.from_data({"services": [
             {"service": "github", "fake_value": "ghp_fake",
-             "real_value": "ghp_real", "allow_host": False, "unrestricted": True},
+             "real_value": "ghp_real", "unrestricted": True},
         ]})
-        assert cfg.credentials[0].host == "api.github.com"
-        assert "api.github.com" not in cfg.hosts
+        [entry] = cfg.hosts["api.github.com"]
+        assert entry.credential is cfg.credentials[0]
 
     def test_gitlab_without_host_raises(self):
         with pytest.raises(ValueError, match="requires a 'host'"):

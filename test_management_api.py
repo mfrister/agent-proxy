@@ -472,9 +472,9 @@ class TestServicesEndpoints:
         config_path = mgmt_secrets._state.config_path
         with open(config_path) as f:
             data = yaml.safe_load(f)
-        data["credentials"] = [{
-            "host": "other.example.com", "header": "Authorization",
-            "real_value": "${CRED_GITHUB}",
+        data["hosts"] = [{
+            "host": "other.example.com",
+            "credential": {"header": "Authorization", "real_value": "${CRED_GITHUB}"},
         }]
         with open(config_path, "w") as f:
             yaml.safe_dump(data, f)

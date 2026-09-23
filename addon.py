@@ -68,12 +68,17 @@ class AllowlistAddon:
     temporary allow. Denied requests receive a 503 response and are logged.
 
     A host may carry several entries (hand-written and service-generated).
-    They're evaluated in config order, with a live temporary allow appended
-    as a final unrestricted entry, and the first entry that permits the
-    request wins: an unrestricted entry always permits, a restricted one
-    when registries.evaluate allows the request. Only the winning entry's
-    header scrubbing is applied, and the entry is stamped on
-    flow.metadata["host_entry"] for the addons downstream.
+    Entries whose swap-mode credential the request presents (the header
+    carries that credential's fake_value) are evaluated first, so a client
+    asking for authenticated access isn't shadowed by an earlier
+    unauthenticated entry; then the rest, in config order, with a live
+    temporary allow appended as a final unrestricted entry. The first entry
+    that permits the request wins: an unrestricted entry always permits, a
+    restricted one when registries.evaluate allows the request. Only the
+    winning entry's header scrubbing is applied, and the entry is stamped on
+    flow.metadata["host_entry"] for CredentialBrokerAddon and
+    ResponseCookieFilterAddon. A denial reports the first entry that rejected
+    the request.
     """
 
     def __init__(self, state: ProxyState):
@@ -97,8 +102,16 @@ class AllowlistAddon:
             self._deny_pending(flow)
             return
 
+        headers = flow.request.headers
+        presented = [
+            e for e in entries
+            if e.credential is not None and e.credential.fake_value is not None
+            and headers.get(e.credential.header) == e.credential.fake_value
+        ]
+        rest = [e for e in entries if not any(e is p for p in presented)]
+
         rejection = None  # (entry, Violation) of the first entry to reject
-        for entry in entries:
+        for entry in presented + rest:
             if entry.rules is None:
                 flow.metadata["host_entry"] = entry
                 return
@@ -186,7 +199,9 @@ class AllowlistAddon:
 
 class CredentialBrokerAddon:
     """
-    For configured hosts, handles two credential modes:
+    Brokers the credential of the host entry that permitted the request
+    (flow.metadata["host_entry"], stamped by AllowlistAddon), in one of two
+    modes:
 
     Swap mode (fake_value present): replaces the agent's placeholder value with
     the real credential. Blocks if an unexpected non-empty value is seen (prompt
@@ -195,6 +210,11 @@ class CredentialBrokerAddon:
     Inject mode (no fake_value): unconditionally sets the header to real_value,
     regardless of what the agent sent. Useful for cookies or other credentials
     the agent should never need to supply itself.
+
+    A credential declared on some other entry for the host is withheld: its
+    header is stripped rather than forwarded, since an unrestricted entry does
+    no header scrubbing of its own and would otherwise pass the fake token (or
+    anything else the client put there) upstream.
 
     Real credentials are never logged.
     """
@@ -208,43 +228,69 @@ class CredentialBrokerAddon:
             return
 
         host = flow.request.pretty_host
-        for cred in self.state.credentials:
-            if cred.host != host:
-                continue
+        host_entry = flow.metadata.get("host_entry")
+        cred = host_entry.credential if host_entry is not None else None
+        self._strip_withheld(flow, cred)
+        if cred is None:
+            return
 
-            if cred.fake_value is None:
-                # Inject mode: set the header unconditionally
-                flow.request.headers[cred.header] = cred.real_value
-                print(json.dumps({
-                    "event": "credential_injected",
-                    "host": host,
-                    "header": cred.header,
-                    "mode": "inject",
-                }))
-            else:
-                current = flow.request.headers.get(cred.header, "")
-                if current == cred.fake_value:
-                    flow.request.headers[cred.header] = cred.real_value
-                    print(json.dumps({
-                        "event": "credential_injected",
-                        "host": host,
-                        "header": cred.header,
-                        "mode": "swap",
-                    }))
-                elif current:
-                    # Non-empty value that isn't the expected fake — block and alert
-                    flow.response = http.Response.make(
-                        403,
-                        f"Credential mismatch on {host}: unexpected value in {cred.header}",
-                        {"Content-Type": "text/plain"},
-                    )
-                    # Log fake (confirms expected identity) but never real value
-                    print(json.dumps({
-                        "event": "credential_mismatch",
-                        "host": host,
-                        "header": cred.header,
-                        "expected_fake": cred.fake_value,
-                    }))
+        if cred.fake_value is None:
+            # Inject mode: set the header unconditionally
+            flow.request.headers[cred.header] = cred.real_value
+            print(json.dumps({
+                "event": "credential_injected",
+                "host": host,
+                "header": cred.header,
+                "mode": "inject",
+            }))
+            return
+
+        current = flow.request.headers.get(cred.header, "")
+        if current == cred.fake_value:
+            flow.request.headers[cred.header] = cred.real_value
+            print(json.dumps({
+                "event": "credential_injected",
+                "host": host,
+                "header": cred.header,
+                "mode": "swap",
+            }))
+        elif current:
+            # Non-empty value that isn't the expected fake — block and alert
+            flow.response = http.Response.make(
+                403,
+                f"Credential mismatch on {host}: unexpected value in {cred.header}",
+                {"Content-Type": "text/plain"},
+            )
+            # Log fake (confirms expected identity) but never real value
+            print(json.dumps({
+                "event": "credential_mismatch",
+                "host": host,
+                "header": cred.header,
+                "expected_fake": cred.fake_value,
+            }))
+
+    def _strip_withheld(self, flow: HTTPFlow, cred):
+        """Drop headers carrying a credential of another entry for this host."""
+        host = flow.request.pretty_host
+        keep = cred.header.lower() if cred is not None else None
+        withheld = {
+            e.credential.header for e in self.state.hosts.get(host, ())
+            if e.credential is not None and e.credential.header.lower() != keep
+        }
+        stripped = sorted(h for h in withheld if h in flow.request.headers)
+        for name in stripped:
+            del flow.request.headers[name]
+        if stripped:
+            # Names only — the stripped value is the client's (fake) token
+            print(json.dumps({
+                "event": "credential_withheld",
+                "host": host,
+                "headers": stripped,
+                "message": (
+                    f"{host}: request permitted by an entry without this "
+                    f"credential; stripped {stripped} instead of brokering"
+                ),
+            }))
 
 
 class ResponseCookieFilterAddon:
