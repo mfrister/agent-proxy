@@ -373,49 +373,39 @@ class Config:
                     preset_hosts[resolved_host] = None
 
                 allow_cred_host = require_bool(entry, "allow_host", True)
-                # Later `services` entries can overwrite an earlier one's host
-                # here (last write wins), unlike the old separate allowlist/
-                # restricted split where "unrestricted once added" always won.
-                # Harmless today -- no two shipped presets share a host, and
-                # scoping is equal-or-more-restrictive than the old default --
-                # but a future preset pair sharing a host would make entry order
-                # significant; order such entries deliberately.
                 for host, rules in preset_hosts.items():
                     if rules is not None:
-                        hosts[host] = [HostEntry(
+                        # A swap-mode credential on a restricted host only
+                        # works if its header survives that host's header
+                        # scrubbing; wire it in so combined presets are
+                        # correct by construction.
+                        if spec is not None and host == cred_host:
+                            rules = dataclasses.replace(
+                                rules,
+                                request_headers=rules.request_headers | {spec.header.lower()},
+                            )
+                        hosts.setdefault(host, []).append(HostEntry(
                             rules=rules, host_config=HostConfig(allow_response_cookies=[]),
-                        )]
+                        ))
                     elif host != cred_host or allow_cred_host:
-                        hosts[host] = [HostEntry()]
-
-                # A swap-mode credential on a restricted host only works if its
-                # header survives that host's header scrubbing; wire it in so
-                # combined presets are correct by construction. This now really
-                # fires for scoped github/gitlab entries, since their hosts are
-                # compiled HostRules instead of always None.
-                cred_entry = hosts.get(cred_host, [HostEntry()])[0]
-                if spec is not None and cred_entry.rules is not None:
-                    hosts[cred_host] = [dataclasses.replace(cred_entry, rules=dataclasses.replace(
-                        cred_entry.rules,
-                        request_headers=cred_entry.rules.request_headers | {spec.header.lower()},
-                    ))]
+                        hosts.setdefault(host, []).append(HostEntry())
 
             # Hand-written `hosts:` entries compile with the same engine and are
-            # applied last, so one naming a host a service preset also covers
-            # replaces whatever the preset produced for that host — restricted or
-            # not, in either direction.
+            # appended after the preset-generated ones. One naming a host a
+            # service preset also covers adds a sibling entry rather than
+            # replacing the preset's; see AllowlistAddon for how a host's
+            # entries are matched.
             for item in host_entries:
                 if isinstance(item, str):
-                    hosts[item] = [HostEntry()]
+                    hosts.setdefault(item, []).append(HostEntry())
                     continue
                 host = item["host"]
                 if "rules" in item:
                     rules = registries.compile_host_rules(item, source="config")
                     # A hand-written entry for a host a credentialed service
-                    # preset also touches replaces that preset's compiled rules
-                    # entirely -- including the request_headers merge above that
-                    # keeps the credential header alive through AllowlistAddon's
-                    # scrubbing. Left alone, CredentialBrokerAddon (which runs
+                    # preset also touches doesn't carry the request_headers
+                    # merge above that keeps the credential header alive
+                    # through AllowlistAddon's scrubbing. Left alone, CredentialBrokerAddon (which runs
                     # after AllowlistAddon) never sees the header to swap, and
                     # the request goes upstream unauthenticated -- silently, since
                     # that looks like a normal 200, not a policy_violation or a
@@ -437,19 +427,19 @@ class Config:
                             "host": host,
                             "headers": sorted(preset_headers),
                             "message": (
-                                f"{host}: hand-written hosts: entry replaced a "
-                                f"credentialed service preset's rules; re-added "
+                                f"{host}: hand-written hosts: entry shares a host "
+                                f"with a credentialed service preset; added "
                                 f"{sorted(preset_headers)} to request_headers so "
                                 f"the credential still reaches upstream"
                             ),
                         }))
-                    hosts[host] = [HostEntry(rules=rules, host_config=HostConfig(
+                    hosts.setdefault(host, []).append(HostEntry(rules=rules, host_config=HostConfig(
                         allow_response_cookies=item.get("allow_response_cookies", [])
-                    ))]
+                    )))
                 else:
-                    hosts[host] = [HostEntry(host_config=HostConfig(
+                    hosts.setdefault(host, []).append(HostEntry(host_config=HostConfig(
                         allow_response_cookies=item.get("allow_response_cookies")
-                    ))]
+                    )))
 
             return cls(
                 hosts=hosts,
@@ -466,7 +456,6 @@ class ProxyState:
     config_path: str  # path to config YAML, used by reload()
     hosts: dict[str, list[HostEntry]] = field(default_factory=dict)
     credentials: list[Credential] = field(default_factory=list)
-    host_config: dict[str, HostConfig] = field(default_factory=dict)
     management_port: int = 8082
     temp_allows: dict[str, float] = field(default_factory=dict)  # host -> expires_at (epoch)
     temp_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -482,7 +471,6 @@ class ProxyState:
         the API server is already bound; the port is set once at construction.
         """
         self.hosts = dict(config.hosts)
-        self.host_config = {host: entries[0].host_config for host, entries in config.hosts.items()}
         self.credentials = list(config.credentials)
 
     def reload(self) -> None:
