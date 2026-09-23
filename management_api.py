@@ -103,15 +103,16 @@ def create_app(state: ProxyState) -> Flask:
             }
         permanent = []
         restricted = {}
-        for host, rules in state.hosts.items():
-            if rules is None:
-                permanent.append(host)
-            else:
-                restricted.setdefault(rules.source or "config", []).append(host)
+        for host, entries in state.hosts.items():
+            for entry in entries:
+                if entry.rules is None:
+                    permanent.append(host)
+                else:
+                    restricted.setdefault(entry.rules.source or "config", []).append(host)
         return jsonify({
-            "permanent": sorted(permanent),
+            "permanent": sorted(set(permanent)),
             "temporary": active_temps,
-            "restricted": {k: sorted(v) for k, v in restricted.items()},
+            "restricted": {k: sorted(set(v)) for k, v in restricted.items()},
         })
 
     @app.post("/allow/temp")
