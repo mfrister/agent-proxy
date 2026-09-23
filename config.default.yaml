@@ -72,6 +72,34 @@ hosts:
   #     allow_response_cookies: []         # default for a restricted entry: strip all
   # <<<
 
+  # A host may have several entries, each permitting requests on its own
+  # terms (entries only add access). A credential is brokered only for
+  # requests its own entry permits; when another entry permits a request,
+  # the credential's header is stripped instead. Entries whose fake_value the
+  # request presents are tried first, so the order below doesn't matter.
+  # Here: unauthenticated read-only access to everything, plus authenticated
+  # read/write access to one repo. Full matching order: docs/service-presets.md
+  # ("How enforcement works").
+  #
+  # >>> example: two-entries
+  # hosts:
+  #   - host: api.github.com             # unauthenticated, read-only, all paths
+  #     rules:
+  #       - methods: [GET, HEAD]
+  #         path: "/[A-Za-z0-9._/-]{0,512}"
+  #   - host: api.github.com             # authenticated, scoped, read/write
+  #     rules:
+  #       - methods: [GET, HEAD, POST, PATCH]
+  #         path: "/repos/myorg/myrepo(/[A-Za-z0-9._/-]{1,256})?"
+  #         allow_body: true
+  #         max_body_bytes: 65536
+  #     request_headers: [content-type]
+  #     credential:
+  #       header: Authorization
+  #       fake_value: "token ghp_0000000000000000000000000000000000fake"
+  #       real_value: "token ${GITHUB_TOKEN}"
+  # <<<
+
 # Service presets. Bare names enable read-only package-registry rule sets
 # (restricted hosts): each allows the GET/HEAD traffic its ecosystem needs —
 # pinned hosts, anchored URL patterns, query-param and request-header
