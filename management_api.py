@@ -137,24 +137,29 @@ def create_app(state: ProxyState) -> Flask:
         def entry_host(item):
             return item if isinstance(item, str) else item.get("host")
 
-        existing = next((item for item in hosts if entry_host(item) == host), None)
-        if existing is not None and not (isinstance(existing, dict) and "rules" in existing):
+        same_host = [item for item in hosts if entry_host(item) == host]
+        if any(not (isinstance(item, dict) and "rules" in item) for item in same_host):
             # Already unrestricted; drop any lingering temp entry so it doesn't
             # keep showing as temporarily-allowed alongside the permanent one.
             with state.temp_lock:
                 state.temp_allows.pop(host, None)
             return jsonify({"ok": True})
 
-        # A host currently carrying `rules:` gets that entry replaced by the
-        # unrestricted form -- the durable version of the temp-allow escape
-        # hatch. A host with no entry at all is simply appended. Only `rules`
-        # is dropped: `allow_response_cookies` is a cookie-filtering choice
-        # independent of access, and silently discarding it here would leave
-        # the host with "all cookies pass" instead of what the operator set.
+        # Append an unrestricted entry -- the durable version of the
+        # temp-allow escape hatch -- alongside whatever entries the host
+        # already has. Those stay: a sibling may carry a credential, which
+        # keeps being brokered for the requests its own rules permit (and
+        # withheld for the rest). The new entry inherits the host's
+        # `allow_response_cookies`, a cookie-filtering choice independent of
+        # access; leaving it off would mean "all cookies pass" instead of
+        # what the operator set.
         promoted = {"host": host}
-        if isinstance(existing, dict) and "allow_response_cookies" in existing:
-            promoted["allow_response_cookies"] = existing["allow_response_cookies"]
-        new_hosts = [item for item in hosts if entry_host(item) != host] + [promoted]
+        cookies_from = next(
+            (item for item in same_host if "allow_response_cookies" in item), None
+        )
+        if cookies_from is not None:
+            promoted["allow_response_cookies"] = cookies_from["allow_response_cookies"]
+        new_hosts = hosts + [promoted]
         new_data = {**data, "hosts": new_hosts}
         try:
             # Validate against the full config (credentials, service presets,

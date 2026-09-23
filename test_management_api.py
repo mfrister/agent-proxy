@@ -116,9 +116,9 @@ class TestManagementAPI:
             assert "existing.com" not in state.temp_allows
 
     def test_post_allow_permanent_promotes_restricted_host(self, mgmt):
-        # A host currently covered by a `rules:` entry gets that entry
-        # replaced by the unrestricted form -- the durable version of the
-        # temp-allow escape hatch.
+        # A host currently covered by a `rules:` entry gets an unrestricted
+        # entry appended -- the durable version of the temp-allow escape
+        # hatch -- with the restricted entry kept alongside it.
         config_path = mgmt._state.config_path
         with open(config_path) as f:
             data = f.read()
@@ -135,18 +135,64 @@ class TestManagementAPI:
 
         r = mgmt.post("/allow/permanent", json={"host": "restricted.com"})
         assert r.get_json()["ok"] is True
-        assert mgmt._state.hosts["restricted.com"][0].rules is None
+        restricted, promoted = mgmt._state.hosts["restricted.com"]
+        assert restricted.rules is not None
+        assert promoted.rules is None
 
         with open(config_path) as f:
             written = yaml.safe_load(f)
         entries = written["hosts"]
         matching = [h for h in entries if isinstance(h, dict) and h.get("host") == "restricted.com"]
-        assert len(matching) == 1
-        assert "rules" not in matching[0]
+        assert len(matching) == 2
+        assert "rules" in matching[0]
+        assert matching[1] == {"host": "restricted.com"}
+
+    def test_post_allow_permanent_preserves_credentialed_sibling(self, mgmt):
+        # The scoped, credentialed entry must survive promotion: rewriting
+        # the host as a single unrestricted entry would silently drop the
+        # credential along with its scope.
+        config_path = mgmt._state.config_path
+        with open(config_path) as f:
+            data = yaml.safe_load(f)
+        data["hosts"].append({
+            "host": "api.example.com",
+            "rules": [{"methods": ["GET"], "path": "/private"}],
+            "credential": {"header": "Authorization", "fake_value": "f", "real_value": "r"},
+        })
+        with open(config_path, "w") as f:
+            yaml.safe_dump(data, f)
+        mgmt._state.reload()
+
+        r = mgmt.post("/allow/permanent", json={"host": "api.example.com"})
+        assert r.get_json()["ok"] is True
+        scoped, promoted = mgmt._state.hosts["api.example.com"]
+        assert scoped.credential.real_value == "r"
+        assert promoted.rules is None and promoted.credential is None
+
+        with open(config_path) as f:
+            written = yaml.safe_load(f)
+        [kept] = [h for h in written["hosts"]
+                  if isinstance(h, dict) and "credential" in h]
+        assert kept["credential"]["real_value"] == "r"
+
+    def test_allowlist_lists_host_in_both_buckets(self, mgmt):
+        config_path = mgmt._state.config_path
+        with open(config_path) as f:
+            data = yaml.safe_load(f)
+        data["hosts"] += [
+            {"host": "both.com", "rules": [{"methods": ["GET"], "path": "/x"}]},
+            "both.com",
+        ]
+        with open(config_path, "w") as f:
+            yaml.safe_dump(data, f)
+        mgmt._state.reload()
+        view = mgmt.get("/allowlist").get_json()
+        assert view["permanent"].count("both.com") == 1
+        assert view["restricted"]["config"] == ["both.com"]
 
     def test_post_allow_permanent_preserves_allow_response_cookies(self, mgmt):
-        # Promotion must drop `rules:` but keep `allow_response_cookies:` --
-        # dropping it silently falls back to "all cookies pass".
+        # The appended unrestricted entry must inherit `allow_response_cookies:`
+        # -- leaving it off silently falls back to "all cookies pass".
         config_path = mgmt._state.config_path
         with open(config_path) as f:
             data = f.read()
@@ -163,11 +209,13 @@ class TestManagementAPI:
 
         r = mgmt.post("/allow/permanent", json={"host": "cookie.com"})
         assert r.get_json()["ok"] is True
-        assert mgmt._state.hosts["cookie.com"][0].rules is None
+        promoted = mgmt._state.hosts["cookie.com"][-1]
+        assert promoted.rules is None
+        assert promoted.host_config.allow_response_cookies == ["csrftoken"]
 
         with open(config_path) as f:
             written = yaml.safe_load(f)
-        entry = next(h for h in written["hosts"] if isinstance(h, dict) and h.get("host") == "cookie.com")
+        entry = [h for h in written["hosts"] if isinstance(h, dict) and h.get("host") == "cookie.com"][-1]
         assert "rules" not in entry
         assert entry["allow_response_cookies"] == ["csrftoken"]
 
