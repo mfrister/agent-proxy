@@ -401,6 +401,85 @@ class TestScopedGitLabRules:
         result = _gitlab_eval(scope, {"write": True}, method, path)
         assert isinstance(result, registries.Violation)
 
+    # Query encoded the way glab sends it: client-go's url.Values.Encode,
+    # sorted keys, ',' as %2C.
+    GLAB_ISSUE_LIST = ("/api/v4/projects/team%2Fbackend/issues?in=title%2Cdescription"
+                       "&order_by=created_at&page=1&per_page=30&sort=desc&state=opened")
+
+    def test_glab_default_issue_list_allowed(self):
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(scope, {}, "GET", self.GLAB_ISSUE_LIST)
+        assert isinstance(result, registries.Allowed)
+
+    @pytest.mark.parametrize("param", [
+        "search=login+fails+on+%2Fapi",
+        "labels=bug%2Cpriority%3A%3Ahigh%2Cneeds+review",
+        "not%5Blabels%5D=wontfix",
+        "milestone=Release+2.0",
+        "milestone=None",
+        "confidential=true",
+        "issue_type=incident",
+        "iteration_id=42",
+        "assignee_id=17",
+        "assignee_id=None",
+        "assignee_id=Any",
+        "not%5Bassignee_id%5D=17",
+        "author_id=17",
+        "not%5Bauthor_id%5D=17",
+        "created_after=2026-10-01T00%3A00%3A00Z",
+        "created_before=2026-10-01T00%3A00%3A00%2B02%3A00",
+        "updated_after=2026-10-01T00%3A00%3A00.123Z",
+        "updated_before=2026-10-01T00%3A00%3A00Z",
+    ])
+    def test_glab_issue_list_filters_allowed(self, param):
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(scope, {}, "GET", f"{self.GLAB_ISSUE_LIST}&{param}")
+        assert isinstance(result, registries.Allowed)
+
+    @pytest.mark.parametrize("param", [
+        "scope=all",                                # not a glab issue list flag
+        "iids%5B%5D=1",
+        "order_by=id%3B",
+        "sort=random",
+        "in=title%2Cnotes",
+        "assignee_id=someone",
+        "created_after=yesterday",
+        "search=" + "a" * 256,                      # over the length bound
+        "search=%00",                               # outside the character class
+        "labels=" + "%2C".join(["l"] * 21),         # over 20 labels
+    ])
+    def test_glab_issue_list_bad_params_denied(self, param):
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(scope, {}, "GET", f"{self.GLAB_ISSUE_LIST}&{param}")
+        assert isinstance(result, registries.Violation)
+
+    def test_issue_notes_list_allowed(self):
+        # glab issue view --comments
+        scope = {"projects": ["team/backend"]}
+        path = "/api/v4/projects/team%2Fbackend/issues/7/notes?page=2&per_page=20&sort=asc"
+        result = _gitlab_eval(scope, {}, "GET", path)
+        assert isinstance(result, registries.Allowed)
+
+    def test_issue_notes_post_still_needs_write(self):
+        scope = {"projects": ["team/backend"]}
+        path = "/api/v4/projects/team%2Fbackend/issues/7/notes"
+        result = _gitlab_eval(scope, {}, "POST", path, body_len=10,
+                              content_type="application/json")
+        assert isinstance(result, registries.Violation)
+
+    def test_project_fetch_with_glab_create_flags_allowed(self):
+        # glab issue create fetches the project before posting anything.
+        scope = {"projects": ["team/backend"]}
+        path = "/api/v4/projects/team%2Fbackend?license=true&with_custom_attributes=true"
+        result = _gitlab_eval(scope, {}, "GET", path)
+        assert isinstance(result, registries.Allowed)
+
+    def test_project_fetch_other_query_denied(self):
+        scope = {"projects": ["team/backend"]}
+        path = "/api/v4/projects/team%2Fbackend?license=yes"
+        result = _gitlab_eval(scope, {}, "GET", path)
+        assert isinstance(result, registries.Violation)
+
     def test_write_gates_post_to_issues(self):
         scope = {"projects": ["team/backend"]}
         path = "/api/v4/projects/team%2Fbackend/issues"
