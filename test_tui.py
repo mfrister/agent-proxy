@@ -145,3 +145,22 @@ def test_host_actions_ignore_temp_service_row(proxy):
     run_tui(proxy, script)
     with open(proxy.config_path) as f:
         assert "hosts" not in yaml.safe_load(f)
+
+
+def test_denials_still_shown_when_service_state_unavailable(proxy, monkeypatch):
+    # GET /services failing (e.g. an API error) degrades to the deny log's
+    # own view of disabled services, instead of the whole screen reporting
+    # the proxy as disconnected.
+    import management_api
+
+    def boom(entry):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(management_api, "_redacted_view", boom)
+
+    async def script(app, pilot):
+        [(host, status, *_)] = left_rows(app)
+        assert (host, status) == ("registry.npmjs.org", "pending ·svc")
+        status_bar = str(app.query_one("#status-bar").render())
+        assert "service state unavailable" in status_bar
+        assert "disconnected" not in status_bar
+    run_tui(proxy, script)
