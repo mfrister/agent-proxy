@@ -160,3 +160,19 @@ hosts:
 #   #   unrestricted: true                   # -- blanket api.github.com access, no rule engine
 #   #   fake_value: "ghp_0000000000000000000000000000000000fake"
 #   #   real_value: "${GITHUB_TOKEN}"
+#
+# Any services entry can carry `enabled: false`: it stays configured (scope,
+# flags, token) and is validated on every load, but grants nothing until it
+# is enabled again -- or temporarily enabled for 1m/10m/2h from the TUI's
+# services view (POST /services/temp-enable), which lasts until it expires
+# or the proxy restarts.
+#
+# >>> example: disabled-service
+# services:
+#   - service: github
+#     enabled: false
+#     scope:
+#       repos: [myorg/myrepo]
+#     fake_value: "ghp_0000000000000000000000000000000000fake"
+#     real_value: "${GITHUB_TOKEN}"
+# <<<
