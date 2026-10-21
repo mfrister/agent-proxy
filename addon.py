@@ -16,7 +16,6 @@ import json
 import os
 import signal
 import sys
-import threading
 import time
 from datetime import datetime, timezone
 
@@ -26,7 +25,7 @@ from mitmproxy.net.http import url
 
 import registries
 from config import Config, HostConfig, HostEntry, ProxyState
-from management_api import create_app
+from management_api import ManagementServer
 
 
 # ── Destination ────────────────────────────────────────────────────────────────
@@ -447,18 +446,37 @@ class LoggingAddon:
 
 
 class ManagementApiAddon:
-    """Starts the management API in a background thread once mitmproxy is running."""
+    """Serves the management API on its Unix socket once mitmproxy is running.
+
+    A failure to bind is logged, not raised: the proxy keeps enforcing its
+    loaded policy, it just can't be managed until restarted.
+    """
 
     def __init__(self, state: ProxyState):
         self.state = state
+        self.server = None
 
     def running(self):
-        threading.Thread(
-            target=lambda: create_app(self.state).run(
-                host="127.0.0.1", port=self.state.management_port, use_reloader=False
-            ),
-            daemon=True,
-        ).start()
+        server = ManagementServer(self.state)
+        try:
+            server.start()
+        except Exception as e:
+            print(json.dumps({
+                "event": "management_api_error",
+                "socket": self.state.management_socket,
+                "message": f"management API not started: {e}",
+            }))
+            return
+        self.server = server
+        print(json.dumps({
+            "event": "management_api_listening",
+            "socket": self.state.management_socket,
+        }))
+
+    def done(self):
+        if self.server is not None:
+            self.server.stop()
+            self.server = None
 
 
 # ── SIGHUP reload ──────────────────────────────────────────────────────────────
@@ -491,7 +509,7 @@ class SandboxProxy:
     def load(self, loader):
         config_path = os.environ.get("PROXY_CONFIG", "config.yaml")
         config = Config.load(config_path)
-        state = ProxyState(config_path=config_path, management_port=config.management_port)
+        state = ProxyState(config_path=config_path, management_socket=config.management_socket)
         state.apply(config)
         setup_sighup(state)
         self.state = state

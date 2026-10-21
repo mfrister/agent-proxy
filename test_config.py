@@ -66,7 +66,6 @@ class TestConfigLoad:
         cfg = Config.load(str(tmp_path / "nonexistent.yaml"))
         assert cfg.hosts == {}
         assert cfg.credentials == []
-        assert cfg.management_port == 8082
         event = json.loads(capsys.readouterr().out)
         assert event["event"] == "config_warning"
         assert "not found" in event["message"]
@@ -75,12 +74,12 @@ class TestConfigLoad:
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
-            "management_port: 9000\n"
+            "management_socket: /run/ap/mgmt.sock\n"
             "hosts:\n"
             "  - host: example.com\n"
         )
         cfg = Config.load(str(config))
-        assert cfg.management_port == 9000
+        assert cfg.management_socket == "/run/ap/mgmt.sock"
         assert "example.com" in cfg.hosts
         assert cfg.hosts["example.com"][0].rules is None
 
@@ -289,17 +288,49 @@ class TestConfigLoad:
         assert entry.credential.real_value == "real-secret"
         assert entry.host_config.allow_response_cookies == ["${KEY}"]
 
-    def test_management_port_from_config(self, tmp_path):
+    def test_management_port_rejected(self, tmp_path):
+        """The TCP management API is gone (the sandbox could reach it), so an
+        old config naming a port is an error pointing at management_socket,
+        not silently ignored."""
         from config import Config
         config = tmp_path / "config.yaml"
-        config.write_text("management_port: 9999\n")
-        assert Config.load(str(config)).management_port == 9999
+        config.write_text("management_port: 8082\n")
+        with pytest.raises(ValueError, match="management_socket"):
+            Config.load(str(config))
 
-    def test_management_port_default(self, tmp_path):
-        from config import Config
+    def test_management_socket_default(self, tmp_path):
+        from config import Config, default_management_socket
         config = tmp_path / "config.yaml"
         config.write_text("hosts: []\n")
-        assert Config.load(str(config)).management_port == 8082
+        assert Config.load(str(config)).management_socket == default_management_socket()
+
+    def test_management_socket_default_prefers_xdg_runtime_dir(self, monkeypatch):
+        from config import default_management_socket
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+        assert default_management_socket() == "/run/user/1000/agent-proxy/mgmt.sock"
+
+    def test_management_socket_default_without_xdg_runtime_dir(self, monkeypatch):
+        """macOS has no XDG_RUNTIME_DIR: fall back to a per-user dir in the
+        temp dir ($TMPDIR, per-user on macOS), not the Lima-mounted home."""
+        import os
+        import tempfile
+        from config import default_management_socket
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        assert default_management_socket() == os.path.join(
+            tempfile.gettempdir(), f"agent-proxy-{os.getuid()}", "mgmt.sock")
+
+    def test_management_socket_tilde_expanded(self, tmp_path, monkeypatch):
+        from config import Config
+        monkeypatch.setenv("HOME", "/home/someone")
+        config = tmp_path / "config.yaml"
+        config.write_text("management_socket: ~/run/mgmt.sock\n")
+        assert Config.load(str(config)).management_socket == "/home/someone/run/mgmt.sock"
+
+    @pytest.mark.parametrize("value", ["run/mgmt.sock", 8082, ""])
+    def test_management_socket_must_be_absolute_path(self, tmp_path, value):
+        from config import Config
+        with pytest.raises(ValueError, match="management_socket"):
+            Config.from_data({"management_socket": value})
 
     def test_null_sections_treated_as_empty(self, tmp_path):
         from config import Config

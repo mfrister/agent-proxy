@@ -11,10 +11,12 @@ Run with:  uv run pytest test_functional.py -v
 import json
 import os
 import pathlib
+import shutil
 import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -22,6 +24,7 @@ import urllib.request
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import httpx
 import pytest
 
 HERE = pathlib.Path(__file__).parent
@@ -144,9 +147,11 @@ def _proxy_context(tmp, handler_class, config_text, server_tls=None, extra_args=
         server.socket = tls.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    management_port = free_port()
+    # Short private dir: AF_UNIX paths are capped at ~104 bytes, which a
+    # pytest tmp_path can exceed.
+    management_socket = os.path.join(tempfile.mkdtemp(prefix="ap-"), "mgmt.sock")
     config = tmp / "config.yaml"
-    config.write_text(config_text + f"\nmanagement_port: {management_port}\n")
+    config.write_text(config_text + f"\nmanagement_socket: {management_socket}\n")
 
     proxy_port = free_port()
     proc = subprocess.Popen(
@@ -180,12 +185,14 @@ def _proxy_context(tmp, handler_class, config_text, server_tls=None, extra_args=
             "server_port": server_port,
             "proxy_port": proxy_port,
             "ca_cert": tmp / "mitmproxy-ca-cert.pem",
-            "management_url": f"http://127.0.0.1:{management_port}",
+            "management_socket": management_socket,
+            "pid": proc.pid,
         }
     finally:
         proc.terminate()
         proc.wait()
         server.shutdown()
+        shutil.rmtree(os.path.dirname(management_socket), ignore_errors=True)
 
 
 @pytest.fixture(scope="module")
@@ -248,38 +255,29 @@ def proxy_restricted_fn(tmp_path):
         yield ctx
 
 
-def mgmt_post(management_url: str, path: str, payload: dict):
-    """POST to the management API directly (bypassing the proxy), with retries
-    because the Flask thread may start slightly after the proxy port opens."""
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    req = urllib.request.Request(
-        management_url + path,
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-    )
+def mgmt_request(management_socket: str, method: str, path: str, **kwargs) -> httpx.Response:
+    """Call the management API over its Unix socket, with retries because the
+    API thread may start slightly after the proxy port opens."""
+    transport = httpx.HTTPTransport(uds=management_socket)
     deadline = time.time() + 10
-    while True:
-        try:
-            return opener.open(req)
-        except (urllib.error.URLError, ConnectionError):
-            if time.time() > deadline:
-                raise
-            time.sleep(0.2)
+    with httpx.Client(transport=transport, base_url="http://agent-proxy", timeout=5) as client:
+        while True:
+            try:
+                return client.request(method, path, **kwargs)
+            except httpx.TransportError:
+                if time.time() > deadline:
+                    raise
+                time.sleep(0.2)
 
 
-def mgmt_get(management_url: str, path: str):
-    """GET from the management API directly (bypassing the proxy), with the
-    same retry-until-up behaviour as mgmt_post."""
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    req = urllib.request.Request(management_url + path)
-    deadline = time.time() + 10
-    while True:
-        try:
-            return opener.open(req)
-        except (urllib.error.URLError, ConnectionError):
-            if time.time() > deadline:
-                raise
-            time.sleep(0.2)
+def mgmt_post(management_socket: str, path: str, payload: dict) -> httpx.Response:
+    """POST JSON to the management API (see mgmt_request)."""
+    return mgmt_request(management_socket, "POST", path, json=payload).raise_for_status()
+
+
+def mgmt_get(management_socket: str, path: str) -> httpx.Response:
+    """GET from the management API (see mgmt_request)."""
+    return mgmt_request(management_socket, "GET", path).raise_for_status()
 
 
 @pytest.fixture
@@ -601,7 +599,7 @@ def test_temp_allow_lifts_restrictions(proxy_restricted_fn):
         proxy_restricted_fn["opener"].open(url)
     assert exc.value.code == 503
 
-    mgmt_post(proxy_restricted_fn["management_url"], "/allow/temp",
+    mgmt_post(proxy_restricted_fn["management_socket"], "/allow/temp",
               {"host": "127.0.0.1", "duration_seconds": 60})
 
     resp = proxy_restricted_fn["opener"].open(url)
@@ -633,7 +631,7 @@ def test_scoped_out_of_scope_path_503(proxy_gitlab_scoped):
     assert exc.value.code == 503
     assert b"not currently allowed by policy" in exc.value.read()
 
-    denied = json.loads(mgmt_get(proxy_gitlab_scoped["management_url"], "/denied").read())
+    denied = json.loads(mgmt_get(proxy_gitlab_scoped["management_socket"], "/denied").read())
     assert denied[-1]["type"] == "policy_violation"
 
 
@@ -807,3 +805,56 @@ def test_matching_host_via_connect_reaches_server(proxy):
     data = json.loads(resp.partition(b"\r\n\r\n")[2])
     assert data["path"] == "/tunnel"
     assert data["headers"]["x-api-key"] == "real-key"
+
+
+# ── Management API exposure ──────────────────────────────────────────────────
+#
+# The API can change the proxy's own policy, so it must be unreachable from
+# the sandbox (Lima forwards host.lima.internal to the host's loopback) and
+# from browsers: it listens only on a private Unix socket, never on TCP.
+
+def _listening_tcp_ports(pid: int) -> set[int]:
+    """TCP ports process `pid` is listening on (Linux /proc)."""
+    inodes = set()
+    for fd in pathlib.Path(f"/proc/{pid}/fd").iterdir():
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if target.startswith("socket:["):
+            inodes.add(target[len("socket:["):-1])
+    ports = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        with open(table) as f:
+            next(f)
+            for line in f:
+                fields = line.split()
+                if fields[3] == "0A" and fields[9] in inodes:  # 0A: LISTEN
+                    ports.add(int(fields[1].rsplit(":", 1)[1], 16))
+    return ports
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+def test_management_api_not_listening_on_tcp(proxy):
+    mgmt_get(proxy["management_socket"], "/allowlist")  # wait until it's up
+    proxy_port = int(proxy["opener"].handlers[0].proxies["http"].rsplit(":", 1)[1])
+    assert _listening_tcp_ports(proxy["pid"]) == {proxy_port}
+
+
+def test_management_socket_is_private(proxy):
+    sock = proxy["management_socket"]
+    mgmt_get(sock, "/allowlist")
+    assert os.stat(sock).st_mode & 0o777 == 0o600
+    assert os.stat(os.path.dirname(sock)).st_mode & 0o777 == 0o700
+
+
+def test_management_rejects_non_json_post(proxy):
+    """A cross-site form or no-preflight fetch can only send text/plain,
+    form-encoded or multipart bodies; none of them may change policy."""
+    r = mgmt_request(proxy["management_socket"], "POST", "/allow/permanent",
+                     content=b'{"host": "attacker.example"}',
+                     headers={"Content-Type": "text/plain"})
+    assert r.status_code == 415
+    assert r.json()["ok"] is False
+    allowlist = mgmt_get(proxy["management_socket"], "/allowlist").json()
+    assert "attacker.example" not in allowlist["permanent"]
