@@ -102,6 +102,12 @@ def create_app(state: ProxyState) -> Flask:
             active_temps = {
                 h: exp for h, exp in state.temp_allows.items() if now < exp
             }
+            active_services = [
+                {"service": name, **({"host": host} if host else {}), "expires": exp}
+                for (name, host), exp in sorted(
+                    state.temp_services.items(), key=lambda kv: (kv[0][0], kv[0][1] or ""))
+                if now < exp
+            ]
         permanent = []
         restricted = {}
         for host, entries in state.hosts.items():
@@ -113,6 +119,7 @@ def create_app(state: ProxyState) -> Flask:
         return jsonify({
             "permanent": sorted(set(permanent)),
             "temporary": active_temps,
+            "temporary_services": active_services,
             "restricted": {k: sorted(set(v)) for k, v in restricted.items()},
         })
 
@@ -237,10 +244,51 @@ def create_app(state: ProxyState) -> Flask:
             catalog.append(item)
         return jsonify(catalog)
 
+    def _temp_enabled_until(key) -> float | None:
+        with state.temp_lock:
+            exp = state.temp_services.get(key)
+        return exp if exp is not None and time.time() < exp else None
+
+    def _clear_temp_enable(key) -> None:
+        with state.temp_lock:
+            state.temp_services.pop(key, None)
+
     @app.get("/services")
     def get_services():
         data = _read_config()
-        return jsonify([_redacted_view(e) for e in data.get("services") or []])
+        views = []
+        for entry in data.get("services") or []:
+            view = _redacted_view(entry)
+            until = None if view["enabled"] else _temp_enabled_until(_service_key(entry))
+            if until is not None:
+                view["temp_enabled_until"] = until
+            views.append(view)
+        return jsonify(views)
+
+    @app.post("/services/temp-enable")
+    def temp_enable_service():
+        """Enable a disabled service for duration_seconds, in memory only --
+        a restart (or any explicit PUT enabled / DELETE) ends it."""
+        body = flask_request.get_json(force=True)
+        key = (body.get("service"), body.get("host"))
+        try:
+            duration = float(body.get("duration_seconds", 300))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "duration_seconds must be a number"}), 400
+        if not duration > 0:
+            return jsonify({"ok": False, "error": "duration_seconds must be positive"}), 400
+
+        entry = next((e for e in _read_config().get("services") or []
+                      if _service_key(e) == key), None)
+        if entry is None:
+            return jsonify({"ok": False, "error": "service not configured"}), 404
+        if _redacted_view(entry)["enabled"]:
+            return jsonify({"ok": False, "error": "service is already enabled"}), 409
+
+        expires = time.time() + duration
+        with state.temp_lock:
+            state.temp_services[key] = expires
+        return jsonify({"ok": True, "expires": expires})
 
     @app.post("/services")
     def add_service():
@@ -473,6 +521,9 @@ def create_app(state: ProxyState) -> Flask:
         with open(state.config_path, "w") as f:
             yaml.safe_dump(new_data, f)
         state.apply(config)
+        if "enabled" in body:
+            # An explicit toggle supersedes any temporary enable.
+            _clear_temp_enable((name, host))
         return jsonify({"ok": True, "service": _redacted_view(new_entry)})
 
     @app.delete("/services")
@@ -496,6 +547,7 @@ def create_app(state: ProxyState) -> Flask:
         with open(state.config_path, "w") as f:
             yaml.safe_dump(new_data, f)
         state.apply(config)
+        _clear_temp_enable((name, host))
 
         # The entry is gone from the config; scrub its secret, unless another
         # entry (service or hand-written credential) still references the key.

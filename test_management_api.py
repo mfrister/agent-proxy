@@ -757,3 +757,100 @@ class TestServiceToggle:
         r = mgmt.post("/services", json={"service": "npm", "enabled": "false"})
         assert r.status_code == 400
         assert _config_services(mgmt) is None
+
+
+class TestServiceTempEnable:
+    def _disabled_npm(self, client):
+        client.post("/services", json={"service": "npm", "enabled": False})
+
+    def test_temp_enable_sets_expiry_without_touching_config(self, mgmt):
+        self._disabled_npm(mgmt)
+        before = time.time()
+        r = mgmt.post("/services/temp-enable",
+                      json={"service": "npm", "duration_seconds": 600})
+        assert r.status_code == 200
+        exp = mgmt._state.temp_services[("npm", None)]
+        assert before + 600 <= exp <= time.time() + 600
+        assert r.get_json()["expires"] == exp
+        assert _config_services(mgmt) == [{"service": "npm", "enabled": False}]
+
+    def test_temp_enable_again_resets_expiry(self, mgmt):
+        self._disabled_npm(mgmt)
+        mgmt.post("/services/temp-enable", json={"service": "npm", "duration_seconds": 7200})
+        mgmt.post("/services/temp-enable", json={"service": "npm", "duration_seconds": 60})
+        assert mgmt._state.temp_services[("npm", None)] <= time.time() + 60
+
+    def test_temp_enable_keyed_by_host(self, mgmt_secrets):
+        mgmt_secrets.post("/services", json={
+            "service": "gitlab", "host": "gl.example.com", "real_value": "t",
+            "unrestricted": True, "enabled": False,
+        })
+        r = mgmt_secrets.post("/services/temp-enable", json={
+            "service": "gitlab", "host": "gl.example.com", "duration_seconds": 60,
+        })
+        assert r.status_code == 200
+        assert ("gitlab", "gl.example.com") in mgmt_secrets._state.temp_services
+
+    def test_temp_enable_unconfigured_404(self, mgmt):
+        r = mgmt.post("/services/temp-enable", json={"service": "npm", "duration_seconds": 60})
+        assert r.status_code == 404
+
+    def test_temp_enable_already_enabled_409(self, mgmt):
+        mgmt.post("/services", json={"service": "npm"})
+        r = mgmt.post("/services/temp-enable", json={"service": "npm", "duration_seconds": 60})
+        assert r.status_code == 409
+        assert mgmt._state.temp_services == {}
+
+    @pytest.mark.parametrize("bad", ["soon", None, 0, -5])
+    def test_temp_enable_bad_duration_400(self, mgmt, bad):
+        self._disabled_npm(mgmt)
+        r = mgmt.post("/services/temp-enable", json={"service": "npm", "duration_seconds": bad})
+        assert r.status_code == 400
+        assert mgmt._state.temp_services == {}
+
+    def test_services_list_shows_active_temp_enable_only(self, mgmt):
+        self._disabled_npm(mgmt)
+        [row] = mgmt.get("/services").get_json()
+        assert "temp_enabled_until" not in row
+        mgmt.post("/services/temp-enable", json={"service": "npm", "duration_seconds": 60})
+        [row] = mgmt.get("/services").get_json()
+        assert row["temp_enabled_until"] == mgmt._state.temp_services[("npm", None)]
+        mgmt._state.temp_services[("npm", None)] = time.time() - 1
+        [row] = mgmt.get("/services").get_json()
+        assert "temp_enabled_until" not in row
+
+    def test_allowlist_lists_active_temp_services(self, mgmt):
+        self._disabled_npm(mgmt)
+        mgmt.post("/services/temp-enable", json={"service": "npm", "duration_seconds": 60})
+        mgmt._state.temp_services[("go", None)] = time.time() - 1
+        data = mgmt.get("/allowlist").get_json()
+        assert data["temporary_services"] == [
+            {"service": "npm", "expires": mgmt._state.temp_services[("npm", None)]},
+        ]
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_put_enabled_clears_temp_enable(self, mgmt, enabled):
+        self._disabled_npm(mgmt)
+        mgmt.post("/services/temp-enable", json={"service": "npm", "duration_seconds": 60})
+        mgmt.put("/services", json={"service": "npm", "enabled": enabled})
+        assert mgmt._state.temp_services == {}
+
+    def test_delete_clears_temp_enable(self, mgmt):
+        self._disabled_npm(mgmt)
+        mgmt.post("/services/temp-enable", json={"service": "npm", "duration_seconds": 60})
+        mgmt.delete("/services", json={"service": "npm"})
+        assert mgmt._state.temp_services == {}
+
+    def test_temp_enable_permits_requests_through_addon(self, mgmt):
+        from addon import AllowlistAddon
+        from test_addon import make_flow
+        self._disabled_npm(mgmt)
+        addon = AllowlistAddon(mgmt._state)
+        denied = make_flow("registry.npmjs.org", path="/left-pad")
+        addon.request(denied)
+        assert denied.response.status_code == 503
+
+        mgmt.post("/services/temp-enable", json={"service": "npm", "duration_seconds": 60})
+        allowed = make_flow("registry.npmjs.org", path="/left-pad")
+        addon.request(allowed)
+        assert allowed.response is None
