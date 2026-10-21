@@ -25,5 +25,6 @@ testpaths = [
     "test_management_api.py",
     "test_registries.py",
     "test_services.py",
+    "test_tui.py",
     "test_functional.py",
 ]

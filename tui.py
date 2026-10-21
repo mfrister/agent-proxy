@@ -61,6 +61,19 @@ def _service_label(svc: dict) -> str:
     return svc["service"] + (f" ({svc['host']})" if svc.get("host") else "")
 
 
+def _service_key(svc: dict) -> tuple:
+    return svc["service"], svc.get("host")
+
+
+def _service_status(svc: dict) -> str:
+    """Short label for an enabled GET /services row: "npm", or "npm 9m 59s"
+    while only temporarily enabled."""
+    label = _service_label(svc)
+    if svc["enabled"]:
+        return label
+    return f"{label} {_fmt_expires(svc['temp_enabled_until'])}"
+
+
 class DurationBar(Static):
     """Shows the three duration options with the active one highlighted,
     followed by the screen's key hints."""
@@ -91,6 +104,8 @@ class UrlBar(Static):
     reason: reactive[str] = reactive("")
     # Disabled services that would have permitted the request
     services: reactive[str] = reactive("")
+    # Of those, the ones enabled since (label plus "temp, …left" / "permanent")
+    enabled: reactive[str] = reactive("")
 
     def render(self) -> str:
         if not self.url:
@@ -100,6 +115,8 @@ class UrlBar(Static):
             line += f"  [red]✗ {escape(self.reason)}[/red]"
         if self.services:
             line += f"  [cyan]disabled service: {escape(self.services)} (e=enable)[/cyan]"
+        if self.enabled:
+            line += f"  [green]enabled: {escape(self.enabled)}[/green]"
         return line
 
 
@@ -779,10 +796,14 @@ class ProxyMonitor(App[None]):
         self.base_url = f"http://127.0.0.1:{mgmt_port}"
         # Raw denied rows (deduplicated, newest-first)
         self._denied_rows: list[dict] = []
-        # Left-pane rows: denied entries followed by temp-allowed entries, each
-        # tagged with a "category" ("denied" or "temp"). Indexed 1:1 by the left
+        # Left-pane rows: denied entries followed by temp-allowed hosts and
+        # temporarily enabled services, each tagged with a "category"
+        # ("denied", "temp" or "temp-service"). Indexed 1:1 by the left
         # table's cursor row for selection and the url-bar.
         self._left_rows: list[dict] = []
+        # (service, host) -> GET /services row: live enabled state, which a
+        # deny log entry's disabled_services (a snapshot) may be behind.
+        self._services: dict[tuple, dict] = {}
         # Guards against overlapping fetches (fetch timeout > poll interval)
         self._refreshing = False
         self._consecutive_failures = 0
@@ -848,12 +869,14 @@ class ProxyMonitor(App[None]):
     async def _do_refresh(self) -> None:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                denied_r, allow_r = await asyncio.gather(
+                denied_r, allow_r, services_r = await asyncio.gather(
                     client.get(f"{self.base_url}/denied"),
                     client.get(f"{self.base_url}/allowlist"),
+                    client.get(f"{self.base_url}/services"),
                 )
             denied_data: list[dict] = denied_r.json()
             allowlist: dict = allow_r.json()
+            services: list[dict] = services_r.json()
         except Exception as exc:
             self._consecutive_failures += 1
             self._skip_ticks = min(2 ** (self._consecutive_failures - 1), 30)
@@ -879,12 +902,19 @@ class ProxyMonitor(App[None]):
                 seen[host] = entry
         self._denied_rows = sorted(seen.values(), key=lambda e: e["timestamp"], reverse=True)
 
-        # Combined left pane: denied rows (newest-first) then temp-allowed rows.
+        self._services = {_service_key(row): row for row in services}
+
+        # Combined left pane: denied rows (newest-first), then temp-allowed
+        # hosts, then temporarily enabled services.
         temp = allowlist.get("temporary", {})
-        self._left_rows = [{**e, "category": "denied"} for e in self._denied_rows]
+        self._left_rows = [self._denied_row(e) for e in self._denied_rows]
         self._left_rows += [
             {"category": "temp", "host": host, "expires": expires}
             for host, expires in sorted(temp.items())
+        ]
+        self._left_rows += [
+            {"category": "temp-service", "service": row, "expires": row["temp_enabled_until"]}
+            for row in services if not row["enabled"] and "temp_enabled_until" in row
         ]
 
         self._update_denied_table()
@@ -896,6 +926,21 @@ class ProxyMonitor(App[None]):
             f"  {self.base_url}  |  Last updated: {now}  |  Polling every 1s"
         )
 
+    def _denied_row(self, entry: dict) -> dict:
+        """A deny log entry as a left-pane row, its disabled_services split
+        by their live state: "pending_services" (still off -- what `e`
+        offers) and "resolved_services" (enabled since)."""
+        pending, resolved = [], []
+        for svc in entry.get("disabled_services", ()):
+            live = self._services.get(_service_key(svc))
+            if live is not None and (live["enabled"] or "temp_enabled_until" in live):
+                resolved.append(live)
+            elif live is not None:
+                pending.append(svc)
+            # else: removed since -- nothing to offer or show
+        return {**entry, "category": "denied",
+                "pending_services": pending, "resolved_services": resolved}
+
     def _update_denied_table(self) -> None:
         dt = self.query_one("#denied-table", DataTable)
         current_row = dt.cursor_row
@@ -905,22 +950,35 @@ class ProxyMonitor(App[None]):
                 status_cell = Text("temp", style="green")
                 method = ""
                 time_cell = _fmt_expires(row["expires"])
+            elif row["category"] == "temp-service":
+                status_cell = Text("temp svc", style="green")
+                method = ""
+                time_cell = _fmt_expires(row["expires"])
+            elif row["resolved_services"]:
+                status_cell = Text(
+                    "→ " + ", ".join(_service_status(svc) for svc in row["resolved_services"]),
+                    style="green",
+                )
+                method = row.get("method", "")
+                time_cell = _fmt_time(row.get("timestamp", ""))
             else:
                 # Entries without a type predate typed deny logging → pending
                 if row.get("type") == "policy_violation":
                     status_cell = Text("violation", style="bold red")
                 else:
                     status_cell = Text("pending", style="yellow")
-                if row.get("disabled_services"):
+                if row["pending_services"]:
                     status_cell.append(" ·svc", style="cyan")
                 method = row.get("method", "")
                 time_cell = _fmt_time(row.get("timestamp", ""))
+            name = (_service_label(row["service"]) if row["category"] == "temp-service"
+                    else row.get("host", ""))
             dt.add_row(
-                row.get("host", ""),
+                name,
                 status_cell,
                 method,
                 time_cell,
-                key=f"{row['category']}:{row.get('host', '')}",
+                key=f"{row['category']}:{name}",
             )
         if current_row < len(self._left_rows):
             dt.move_cursor(row=current_row)
@@ -945,21 +1003,31 @@ class ProxyMonitor(App[None]):
             url_bar.url = ""
             url_bar.reason = ""
             url_bar.services = ""
+            url_bar.enabled = ""
             return
         dt = self.query_one("#denied-table", DataTable)
         row_idx = dt.cursor_row
         if 0 <= row_idx < len(self._left_rows):
             row = self._left_rows[row_idx]
-            # Temp-allowed rows have no request URL/reason to show.
-            url_bar.url = "" if row["category"] == "temp" else row.get("url", "")
-            url_bar.reason = "" if row["category"] == "temp" else row.get("reason", "")
+            # Temp rows have no request URL/reason to show.
+            denied = row["category"] == "denied"
+            url_bar.url = row.get("url", "") if denied else ""
+            url_bar.reason = row.get("reason", "") if denied else ""
             url_bar.services = ", ".join(
-                _service_label(svc) for svc in row.get("disabled_services", ())
+                _service_label(svc) for svc in row.get("pending_services", ())
+            )
+            url_bar.enabled = ", ".join(
+                _service_label(svc) + (
+                    " (permanent)" if svc["enabled"]
+                    else f" (temp, {_fmt_expires(svc['temp_enabled_until'])} left)"
+                )
+                for svc in row.get("resolved_services", ())
             )
         else:
             url_bar.url = ""
             url_bar.reason = ""
             url_bar.services = ""
+            url_bar.enabled = ""
 
     def on_data_table_cursor_moved(self, event: DataTable.CursorMoved) -> None:
         if event.data_table.id == "denied-table":
@@ -1001,13 +1069,15 @@ class ProxyMonitor(App[None]):
         self.push_screen(ServicesScreen(self.base_url, duration_idx=bar.duration_idx))
 
     def _selected_left_host(self) -> str | None:
-        """Host of the selected left-pane row (denied or temp-allowed)."""
+        """Host of the selected left-pane row (denied or temp-allowed); None
+        for a temporarily enabled service, which grants a service, not a host."""
         if self._focused_pane() != "denied" or not self._left_rows:
             return None
         dt = self.query_one("#denied-table", DataTable)
         row_idx = dt.cursor_row
         if 0 <= row_idx < len(self._left_rows):
-            return self._left_rows[row_idx].get("host")
+            row = self._left_rows[row_idx]
+            return None if row["category"] == "temp-service" else row.get("host")
         return None
 
     async def action_temp_allow(self) -> None:
@@ -1038,7 +1108,7 @@ class ProxyMonitor(App[None]):
         row_idx = self.query_one("#denied-table", DataTable).cursor_row
         if not 0 <= row_idx < len(self._left_rows):
             return
-        services = self._left_rows[row_idx].get("disabled_services") or []
+        services = self._left_rows[row_idx].get("pending_services") or []
         if not services:
             self.notify("No disabled service would permit this request", severity="warning")
             return
