@@ -71,13 +71,15 @@ class AllowlistAddon:
     Entries whose swap-mode credential the request presents (the header
     carries that credential's fake_value) are evaluated first, so a client
     asking for authenticated access isn't shadowed by an earlier
-    unauthenticated entry; then the rest, in config order, with a live
-    temporary allow appended as a final unrestricted entry. The first entry
+    unauthenticated entry; then the rest, in config order, followed by the
+    entries of any temporarily enabled (otherwise dormant) service, with a
+    live temporary allow appended as a final unrestricted entry. The first entry
     that permits the request wins: an unrestricted entry always permits, a
     restricted one when registries.evaluate allows the request. Only the
     winning entry's header scrubbing is applied, and the entry is stamped on
     flow.metadata["host_entry"] for CredentialBrokerAddon and
-    ResponseCookieFilterAddon. A denial reports the first entry that rejected
+    ResponseCookieFilterAddon, and the full list considered on
+    flow.metadata["host_entries"]. A denial reports the first entry that rejected
     the request.
     """
 
@@ -90,8 +92,12 @@ class AllowlistAddon:
 
         entries = list(s.hosts.get(host, ()))
         with s.temp_lock:
+            now = time.time()
+            for key, exp in s.temp_services.items():
+                if now < exp:
+                    entries.extend(s.dormant_services.get(key, {}).get(host, ()))
             exp = s.temp_allows.get(host)
-            if exp and time.time() < exp:
+            if exp and now < exp:
                 # Temp-allow grants access, not a cookie policy: keep whatever
                 # the host's configured entries filter.
                 entries.append(HostEntry(
@@ -101,6 +107,7 @@ class AllowlistAddon:
         if not entries:
             self._deny_pending(flow)
             return
+        flow.metadata["host_entries"] = entries
 
         headers = flow.request.headers
         presented = [
@@ -273,8 +280,11 @@ class CredentialBrokerAddon:
         """Drop headers carrying a credential of another entry for this host."""
         host = flow.request.pretty_host
         keep = cred.header.lower() if cred is not None else None
+        # The entries AllowlistAddon considered, temporarily enabled services
+        # included; state.hosts when it didn't stamp them.
+        entries = flow.metadata.get("host_entries", self.state.hosts.get(host, ()))
         withheld = {
-            e.credential.header for e in self.state.hosts.get(host, ())
+            e.credential.header for e in entries
             if e.credential is not None and e.credential.header.lower() != keep
         }
         stripped = sorted(h for h in withheld if h in flow.request.headers)

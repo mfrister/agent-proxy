@@ -639,6 +639,69 @@ class TestEntryBoundCredentials:
         assert flow.request.headers["Authorization"] == GH_FAKE  # never forwarded
 
 
+def dormant_github_config(**extra):
+    from config import Config
+    return Config.from_data({
+        "services": [{
+            "service": "github", "enabled": False, "scope": {"repos": ["myorg/myrepo"]},
+            "fake_value": "ghp_fake", "real_value": "ghp_real",
+        }],
+        **extra,
+    })
+
+
+class TestTemporarilyEnabledServices:
+    IN_SCOPE = "/repos/myorg/myrepo/issues"
+    OUT_OF_SCOPE = "/repos/otherorg/secret/issues"
+
+    def test_disabled_service_denies(self):
+        state = state_from(dormant_github_config())
+        flow = run_pipeline(state, make_flow(
+            "api.github.com", path=self.IN_SCOPE, headers={"Authorization": GH_FAKE}))
+        assert flow.response.status_code == 503
+        assert flow.request.headers["Authorization"] == GH_FAKE
+
+    def test_temp_enabled_service_permits_and_brokers(self):
+        state = state_from(dormant_github_config(),
+                           temp_services={("github", None): time.time() + 60})
+        flow = run_pipeline(state, make_flow(
+            "api.github.com", path=self.IN_SCOPE, headers={"Authorization": GH_FAKE}))
+        assert flow.response is None
+        assert flow.request.headers["Authorization"] == GH_REAL
+        assert flow.metadata["registry"] == "github"
+
+    def test_temp_enabled_service_keeps_its_scope(self):
+        state = state_from(dormant_github_config(),
+                           temp_services={("github", None): time.time() + 60})
+        flow = run_pipeline(state, make_flow(
+            "api.github.com", path=self.OUT_OF_SCOPE, headers={"Authorization": GH_FAKE}))
+        assert flow.response.status_code == 503
+
+    def test_expired_temp_enable_denies(self):
+        state = state_from(dormant_github_config(),
+                           temp_services={("github", None): time.time() - 1})
+        flow = run_pipeline(state, make_flow(
+            "api.github.com", path=self.IN_SCOPE, headers={"Authorization": GH_FAKE}))
+        assert flow.response.status_code == 503
+
+    def test_temp_enabled_credential_withheld_when_sibling_wins(self):
+        state = state_from(dormant_github_config(hosts=["api.github.com"]),
+                           temp_services={("github", None): time.time() + 60})
+        flow = run_pipeline(state, make_flow(
+            "api.github.com", path=self.OUT_OF_SCOPE, headers={"Authorization": GH_FAKE}))
+        assert flow.response is None
+        assert "Authorization" not in flow.request.headers
+
+    def test_dormant_credential_not_withheld_while_disabled(self):
+        # A disabled service takes no part in matching: the fake token is
+        # just client input to the hand-written unrestricted entry.
+        state = state_from(dormant_github_config(hosts=["api.github.com"]))
+        flow = run_pipeline(state, make_flow(
+            "api.github.com", path=self.IN_SCOPE, headers={"Authorization": GH_FAKE}))
+        assert flow.response is None
+        assert flow.request.headers["Authorization"] == GH_FAKE
+
+
 # ── LoggingAddon ───────────────────────────────────────────────────────────────
 
 class TestLoggingAddon:
