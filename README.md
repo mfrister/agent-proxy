@@ -87,27 +87,35 @@ The port defaults to `$PROXY_MGMT_PORT` (or 8082 if unset).
 
 ![TUI screenshot](docs/tui-screenshot.svg)
 
-The UI polls every 5 seconds and shows two panels:
+The main screen is for triage, the services view for configuration. Each screen's bottom bar lists its keys and the duration selected for temporary grants.
 
-- **DENIED** — recent blocked connections, deduplicated by host, newest first. Both kinds of denial return 503 with `Retry-After` to the client, so the **Type** column is how the TUI (not the client) tells them apart: `pending` (host not configured at all, awaiting human approval) vs. `violation` (host is configured but the request failed its registry policy). The full URL of the highlighted row — plus the violation reason, if any — is shown below the panels. A denial a disabled service would have permitted is marked `·svc`; once that service is enabled (`e`, or from the services view) the row shows `→ <service>` instead, with the remaining time while it's only temporary. Temporarily enabled services are also listed below the denied rows as `temp svc`, with a countdown.
-- **ALLOWED** — current allowlist: permanent hosts, temporary allows with live countdown, and restricted hosts with their preset name (dimmed). Temp- or perm-allowing a restricted host lifts its restrictions, but not onto a credential: out-of-scope requests go upstream without it.
+**Main screen** — two panels:
 
-Key bindings:
+- **Left: what's blocked, and what's open for now.** Recent denials, one row per host, newest first, followed by active temporary grants (hosts and services) with their remaining time. A denial is either *pending* (the host isn't configured) or a *violation* (it is, but the request is outside its rules). The client gets the same 503 either way, so this is the only place the difference shows. The bar below the panels shows the selected request's URL and violation reason. A denial that a disabled service would have permitted is marked and names that service; once the service is enabled, the row says so instead.
+- **Right: the configured allowlist.** Unrestricted hosts, and restricted hosts with the preset (or `config`) restricting them.
 
 | Key | Action |
 |---|---|
-| `↑` / `↓` or `k` / `j` | Navigate rows |
-| `Tab` | Switch focus between panels |
-| `1` / `2` / `3` | Select duration: 1m / 10m / 2h |
-| `d` | Cycle through durations |
-| `t` | Temporarily allow the selected denied host |
-| `p` | Permanently allow the selected denied host |
-| `e` | Temporarily enable the disabled service that would permit the selected denied request (rows marked `·svc`; a picker appears if several would) |
+| `t` / `p` | Temporarily / permanently allow the selected denied host |
+| `e` | Temporarily enable the disabled service that would have permitted the selected denial — narrower than allowing the whole host |
+| `1` `2` `3` / `d` | Select / cycle the duration for `t` and `e` |
 | `s` | Open the services view |
-| `r` | Force refresh |
-| `q` | Quit |
+| `Tab`, `↑`/`↓` or `k`/`j` | Switch panel, move |
+| `r` / `q` | Refresh / quit |
 
-The **services view** (`s`) manages service presets: `a` adds one (pick the service; for self-hosted services enter the host; scoped API presets prompt for each scope param — a blank answer for all of them asks for explicit confirmation before granting unrestricted access — and then for each opt-in flag; for credential services the fake token is auto-generated and the real token is entered once, masked, and stored in `secrets_file` — it is never shown again), `e` edits a scoped service's scope/flags without touching its token, `o` rotates a real token in place, `x` removes a service along with its stored secret. `space` toggles the selected service on or off (its config is kept while off), and `t` enables a disabled one temporarily for the selected duration (`1`/`2`/`3` or `d`, as on the main screen); the **Status** column shows `on`, `off` or the remaining time. Temporary enables live in memory only and end on restart. The table's **Scope** column shows the configured scope and flags, with `unrestricted`/unscoped flags highlighted so the blanket-access choice stays visible.
+Allowing a restricted host with `t` or `p` lifts its restrictions, but not onto its credential: out-of-scope requests go upstream without it.
+
+**Services view** — the configured service presets, each shown as on, off or temporarily enabled. Its **Scope** column highlights `unrestricted` and unscoped flags, so blanket access stays visible.
+
+| Key | Action |
+|---|---|
+| `a` | Add a service, prompting for whatever the preset needs (host, token, scope, flags). Leaving the scope blank requires confirming unrestricted access. The fake token is generated and shown; the real one is entered once, masked, and never shown again |
+| `e` | Edit scope and flags (the token is untouched) |
+| `o` | Rotate the real token (the fake token stays the same) |
+| `space` | Turn the service on or off; its config is kept while it's off |
+| `t` | Temporarily enable a disabled service for the selected duration (`1` `2` `3` / `d`). Kept in memory only, so a restart ends it |
+| `x` | Remove the service and its stored secret |
+| `r` / `Esc` | Refresh / back |
 
 ## Management API
 
