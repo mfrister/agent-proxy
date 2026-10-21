@@ -89,7 +89,7 @@ The port defaults to `$PROXY_MGMT_PORT` (or 8082 if unset).
 
 The UI polls every 5 seconds and shows two panels:
 
-- **DENIED** — recent blocked connections, deduplicated by host, newest first. Both kinds of denial return 503 with `Retry-After` to the client, so the **Type** column is how the TUI (not the client) tells them apart: `pending` (host not configured at all, awaiting human approval) vs. `violation` (host is configured but the request failed its registry policy). The full URL of the highlighted row — plus the violation reason, if any — is shown below the panels.
+- **DENIED** — recent blocked connections, deduplicated by host, newest first. Both kinds of denial return 503 with `Retry-After` to the client, so the **Type** column is how the TUI (not the client) tells them apart: `pending` (host not configured at all, awaiting human approval) vs. `violation` (host is configured but the request failed its registry policy). The full URL of the highlighted row — plus the violation reason, if any — is shown below the panels. A denial a disabled service would have permitted is marked `·svc`; once that service is enabled (`e`, or from the services view) the row shows `→ <service>` instead, with the remaining time while it's only temporary. Temporarily enabled services are also listed below the denied rows as `temp svc`, with a countdown.
 - **ALLOWED** — current allowlist: permanent hosts, temporary allows with live countdown, and restricted hosts with their preset name (dimmed). Temp- or perm-allowing a restricted host lifts its restrictions, but not onto a credential: out-of-scope requests go upstream without it.
 
 Key bindings:
