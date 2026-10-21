@@ -273,10 +273,23 @@ class Config:
         raw = copy.deepcopy(data)
         secrets = {}
         secrets_path = data.get("secrets_file")
+        secrets_missing = False
         if secrets_path:
-            with open(secrets_path) as f:
-                secrets = yaml.safe_load(f) or {}
-        data = _expand_secret_fields(data, secrets)
+            try:
+                with open(secrets_path) as f:
+                    secrets = yaml.safe_load(f) or {}
+            except FileNotFoundError:
+                # Fine until something references it: the management API
+                # creates the file when it stores the first token.
+                secrets_missing = True
+        try:
+            data = _expand_secret_fields(data, secrets)
+        except KeyError as e:
+            if secrets_missing:
+                raise FileNotFoundError(
+                    f"secrets_file not found: {secrets_path} ({e.args[0]})"
+                ) from None
+            raise
 
         try:
             if "allowed_registries" in data:
