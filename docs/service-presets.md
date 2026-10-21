@@ -233,6 +233,15 @@ are auditable after the fact.
    scoping bounds *which* repos are reachable, not what gets written into
    them, and a public repo — or a private one with external collaborators —
    is a readable sink an attacker only has to watch.
+6. **Free-text query values on the `gitlab` preset.** Without `write: true`,
+   `glab issue list`'s `search`, `milestone`, `labels` and `not[labels]`
+   filters and the milestone `title` lookup still accept short free text:
+   up to 255 printable-ASCII characters per value (up to 20 labels per list),
+   bounded overall by the 4096-character URL limit. The other read-only
+   rules only accept ref-, path- and id-shaped values. These values reach the
+   GitLab instance's request logs, so a read-only scope is not a zero-write
+   channel to whoever can read those logs. Every such request is logged with
+   its full query.
 
 Out of scope entirely (unchanged trust model): prompt injection via *response*
 content, and compromise of a registry itself.
