@@ -57,6 +57,10 @@ def _fmt_expires(epoch: float) -> str:
     return f"{m}m {s}s"
 
 
+def _service_label(svc: dict) -> str:
+    return svc["service"] + (f" ({svc['host']})" if svc.get("host") else "")
+
+
 class DurationBar(Static):
     """Shows the three duration options with the active one highlighted,
     followed by the screen's key hints."""
@@ -85,6 +89,8 @@ class UrlBar(Static):
 
     url: reactive[str] = reactive("")
     reason: reactive[str] = reactive("")
+    # Disabled services that would have permitted the request
+    services: reactive[str] = reactive("")
 
     def render(self) -> str:
         if not self.url:
@@ -92,6 +98,8 @@ class UrlBar(Static):
         line = f"[dim]URL:[/dim] {escape(self.url)}"
         if self.reason:
             line += f"  [red]✗ {escape(self.reason)}[/red]"
+        if self.services:
+            line += f"  [cyan]disabled service: {escape(self.services)} (e=enable)[/cyan]"
         return line
 
 
@@ -156,6 +164,62 @@ class PickServiceScreen(ModalScreen[dict | None]):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         # DataTable emits this on Enter (and click) for the cursor row.
         self.dismiss(self._catalog[event.cursor_row])
+
+
+class PickDisabledServiceScreen(ModalScreen[dict | None]):
+    """Pick which of a denied request's disabled services to enable."""
+
+    CSS = """
+    PickDisabledServiceScreen {
+        align: center middle;
+    }
+    #pick-dialog {
+        width: 60;
+        height: auto;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #pick-table {
+        height: auto;
+        max-height: 20;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("j", "cursor_down", "Down", show=False),
+    ]
+
+    def __init__(self, services: list[dict], duration: str) -> None:
+        super().__init__()
+        self._services = services
+        self._duration = duration
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pick-dialog"):
+            yield Label(f"Enable for {self._duration} — Enter to select, Esc to cancel")
+            yield DataTable(id="pick-table", cursor_type="row", zebra_stripes=True)
+
+    def on_mount(self) -> None:
+        table = self.query_one("#pick-table", DataTable)
+        table.add_columns("Service")
+        for svc in self._services:
+            table.add_row(_service_label(svc))
+        table.focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cursor_up(self) -> None:
+        self.query_one("#pick-table", DataTable).action_cursor_up()
+
+    def action_cursor_down(self) -> None:
+        self.query_one("#pick-table", DataTable).action_cursor_down()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        self.dismiss(self._services[event.cursor_row])
 
 
 class TextPromptScreen(ModalScreen[str | None]):
@@ -704,6 +768,7 @@ class ProxyMonitor(App[None]):
         Binding("d", "cycle_duration", "Cycle duration", show=False),
         Binding("t", "temp_allow", "Temp allow", show=False),
         Binding("p", "perm_allow", "Perm allow", show=False),
+        Binding("e", "enable_service", "Enable service", show=False),
         Binding("s", "services", "Services", show=False),
         Binding("k", "move_up", "Up", show=False),
         Binding("j", "move_down", "Down", show=False),
@@ -734,7 +799,7 @@ class ProxyMonitor(App[None]):
                 yield DataTable(id="allowed-table", cursor_type="row", zebra_stripes=True)
         yield UrlBar(id="url-bar")
         yield DurationBar(
-            "[dim]t[/dim]=temp  [dim]p[/dim]=perm  "
+            "[dim]t[/dim]=temp  [dim]p[/dim]=perm  [dim]e[/dim]=enable service  "
             "[dim]s[/dim]=services  [dim]r[/dim]=refresh  [dim]q[/dim]=quit",
             id="dur-bar",
         )
@@ -846,6 +911,8 @@ class ProxyMonitor(App[None]):
                     status_cell = Text("violation", style="bold red")
                 else:
                     status_cell = Text("pending", style="yellow")
+                if row.get("disabled_services"):
+                    status_cell.append(" ·svc", style="cyan")
                 method = row.get("method", "")
                 time_cell = _fmt_time(row.get("timestamp", ""))
             dt.add_row(
@@ -877,6 +944,7 @@ class ProxyMonitor(App[None]):
         if self._focused_pane() != "denied" or not self._left_rows:
             url_bar.url = ""
             url_bar.reason = ""
+            url_bar.services = ""
             return
         dt = self.query_one("#denied-table", DataTable)
         row_idx = dt.cursor_row
@@ -885,9 +953,13 @@ class ProxyMonitor(App[None]):
             # Temp-allowed rows have no request URL/reason to show.
             url_bar.url = "" if row["category"] == "temp" else row.get("url", "")
             url_bar.reason = "" if row["category"] == "temp" else row.get("reason", "")
+            url_bar.services = ", ".join(
+                _service_label(svc) for svc in row.get("disabled_services", ())
+            )
         else:
             url_bar.url = ""
             url_bar.reason = ""
+            url_bar.services = ""
 
     def on_data_table_cursor_moved(self, event: DataTable.CursorMoved) -> None:
         if event.data_table.id == "denied-table":
@@ -955,6 +1027,36 @@ class ProxyMonitor(App[None]):
         except Exception as exc:
             self.notify(f"Error: {exc}", severity="error", timeout=5)
             return
+        await self._refresh_data()
+
+    @work
+    async def action_enable_service(self) -> None:
+        """Temporarily enable a disabled service that would have permitted
+        the selected denied request -- narrower than temp-allowing the host."""
+        if self._focused_pane() != "denied" or not self._left_rows:
+            return
+        row_idx = self.query_one("#denied-table", DataTable).cursor_row
+        if not 0 <= row_idx < len(self._left_rows):
+            return
+        services = self._left_rows[row_idx].get("disabled_services") or []
+        if not services:
+            self.notify("No disabled service would permit this request", severity="warning")
+            return
+        label, seconds = DURATIONS[self.query_one("#dur-bar", DurationBar).duration_idx]
+        svc = services[0]
+        if len(services) > 1:
+            svc = await self.push_screen_wait(PickDisabledServiceScreen(services, label))
+            if svc is None:
+                return
+        try:
+            await _api_request(
+                self.base_url, "POST", "/services/temp-enable",
+                {**svc, "duration_seconds": seconds},
+            )
+        except Exception as exc:
+            self.notify(f"Error: {exc}", severity="error", timeout=8)
+            return
+        self.notify(f"Temporarily enabled {_service_label(svc)} for {label}")
         await self._refresh_data()
 
     async def action_perm_allow(self) -> None:
