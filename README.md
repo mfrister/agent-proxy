@@ -60,7 +60,7 @@ services:
     real_value: "${GITHUB_TOKEN}"     # swaps in the real one on the way out
 ```
 
-`write: true` opts in to issue/PR/comment (or MR/note) writes; `unrestricted: true` is the explicit, logged opt-out from scoping back to blanket host access. See the `services` example in `config.default.yaml` for the full option set (including self-hosted `gitlab` and `graphql`), and [docs/service-presets.md](docs/service-presets.md) for the threat model, restriction design, and known limitations.
+`write: true` opts in to issue/PR/comment (or MR/note) writes; `unrestricted: true` is the explicit, logged opt-out from scoping back to blanket host access; `enabled: false` keeps an entry configured but inactive, so it can be switched back on — permanently or temporarily — from the TUI or management API. See the `services` example in `config.default.yaml` for the full option set (including self-hosted `gitlab` and `graphql`), and [docs/service-presets.md](docs/service-presets.md) for the threat model, restriction design, and known limitations.
 
 ### Custom credentials
 
@@ -106,7 +106,7 @@ Key bindings:
 | `r` | Force refresh |
 | `q` | Quit |
 
-The **services view** (`s`) manages service presets: `a` adds one (pick the service; for self-hosted services enter the host; scoped API presets prompt for each scope param — a blank answer for all of them asks for explicit confirmation before granting unrestricted access — and then for each opt-in flag; for credential services the fake token is auto-generated and the real token is entered once, masked, and stored in `secrets_file` — it is never shown again), `e` edits a scoped service's scope/flags without touching its token, `o` rotates a real token in place, `x` removes a service along with its stored secret. The table's **Scope** column shows the configured scope and flags, with `unrestricted`/unscoped flags highlighted so the blanket-access choice stays visible.
+The **services view** (`s`) manages service presets: `a` adds one (pick the service; for self-hosted services enter the host; scoped API presets prompt for each scope param — a blank answer for all of them asks for explicit confirmation before granting unrestricted access — and then for each opt-in flag; for credential services the fake token is auto-generated and the real token is entered once, masked, and stored in `secrets_file` — it is never shown again), `e` edits a scoped service's scope/flags without touching its token, `o` rotates a real token in place, `x` removes a service along with its stored secret. `space` toggles the selected service on or off (its config is kept while off), and `t` enables a disabled one temporarily for the selected duration (`1`/`2`/`3` or `d`, as on the main screen); the **Status** column shows `on`, `off` or the remaining time. Temporary enables live in memory only and end on restart. The table's **Scope** column shows the configured scope and flags, with `unrestricted`/unscoped flags highlighted so the blanket-access choice stays visible.
 
 ## Management API
 
@@ -114,14 +114,15 @@ Runs on `127.0.0.1:8082` (not proxied).
 
 | Method | Path | Body | Description |
 |---|---|---|---|
-| GET | `/allowlist` | — | Permanent + active temporary allows |
+| GET | `/allowlist` | — | Permanent + active temporary allows, and active temporarily enabled services (`temporary_services`) |
 | GET | `/denied` | — | Recent denied requests |
 | POST | `/allow/temp` | `{"host": "…", "duration_seconds": 60}` | Add TTL-based allow; `duration_seconds` defaults to 300 |
 | POST | `/allow/permanent` | `{"host": "…"}` | Append to current config file and reload |
 | GET | `/services/available` | — | Service preset catalog (name, needs_token, host_param, scope_params, scope_flags, header, fake prefix) |
-| GET | `/services` | — | Configured services, redacted (never real tokens) |
-| POST | `/services` | `{"service": "github", "host"?: "…", "scope"?: {…}, "unrestricted"?: true, "real_value"?: "…", <flags>}` | Add a service: generates the fake token, stores the real one in `secrets_file`, writes a `${KEY}` ref to config.yaml |
-| PUT | `/services` | `{"service": "…", "host"?: "…", "real_value"?: "…", "scope"?: {…}, "unrestricted"?: true, <flags>}` | Rotate the real token and/or edit scope/flags in place (at least one field required) |
+| GET | `/services` | — | Configured services, redacted (never real tokens), with `enabled` and, while active, `temp_enabled_until` |
+| POST | `/services` | `{"service": "github", "host"?: "…", "scope"?: {…}, "unrestricted"?: true, "enabled"?: false, "real_value"?: "…", <flags>}` | Add a service: generates the fake token, stores the real one in `secrets_file`, writes a `${KEY}` ref to config.yaml |
+| PUT | `/services` | `{"service": "…", "host"?: "…", "real_value"?: "…", "scope"?: {…}, "unrestricted"?: true, "enabled"?: false, <flags>}` | Rotate the real token, edit scope/flags and/or toggle `enabled` in place (at least one field required); toggling ends any temporary enable |
+| POST | `/services/temp-enable` | `{"service": "…", "host"?: "…", "duration_seconds": 600}` | Temporarily enable a disabled service (in memory; 409 if already enabled); repeating resets the expiry |
 | DELETE | `/services` | `{"service": "…", "host"?: "…"}` | Remove the service and its stored secret |
 
 Real credentials are write-only: accepted on POST/PUT `/services`, persisted to `secrets_file`, and never returned by any endpoint.

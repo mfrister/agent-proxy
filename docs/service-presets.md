@@ -34,6 +34,12 @@ services:
     real_value: "${GITLAB_TOKEN}"
 ```
 
+An entry with `enabled: false` is validated and expanded the same way but
+grants nothing: its config (scope, flags, token reference) stays put until
+it's switched back on, or temporarily enabled from the TUI or
+`POST /services/temp-enable` — an in-memory grant that ends on expiry,
+restart, or an explicit toggle.
+
 Presets are descriptors (`services.py`), expanded at config load into the
 proxy's existing primitives — the unified `hosts:` policy (unrestricted or
 rule-restricted) and credential broker entries. The two enforcement engines
@@ -262,10 +268,11 @@ repos named in `scope:`.
 
 ## How enforcement works
 
-A host can carry several entries: whatever service presets generate for it,
-then its hand-written `hosts:` entries, in config order, plus — while one is
-active — a temporary allow (TUI/management API) appended as a final
-unrestricted entry. Each entry permits requests on its own terms, and entries
+A host can carry several entries: whatever enabled service presets generate
+for it, then its hand-written `hosts:` entries, in config order, then the
+entries of any temporarily enabled service, plus — while one is active — a
+temporary allow (TUI/management API) appended as a final unrestricted
+entry. Each entry permits requests on its own terms, and entries
 only ever add access; none narrows another. Request evaluation in the proxy:
 
 1. If the request presents the `fake_value` of some entry's swap-mode
