@@ -18,14 +18,31 @@ from conftest import make_restricted, make_state
 
 # ── Test helpers ───────────────────────────────────────────────────────────────
 
-def make_flow(host, method="GET", path="/", headers=None, body=b""):
-    """Return a mock HTTPFlow with the given request properties."""
+def make_flow(host, method="GET", path="/", headers=None, body=b"",
+              port=80, scheme="http", host_header=None, authority=""):
+    """Return a mock HTTPFlow with the given request properties.
+
+    host is the real destination (request.host); the Host header defaults to
+    match it. pretty_host/pretty_url deliberately return a spoofed value so
+    any addon still consulting them fails tests.
+    """
+    from mitmproxy.http import Headers
+
     flow = MagicMock()
-    flow.request.pretty_host = host
-    flow.request.pretty_url = f"http://{host}{path}"
+    flow.request.host = host
+    flow.request.port = port
+    flow.request.scheme = scheme
+    flow.request.authority = authority
+    flow.request.is_http2 = bool(authority)
+    flow.request.is_http3 = False
+    flow.request.pretty_host = "pretty-host-must-not-be-used.invalid"
+    flow.request.pretty_url = "http://pretty-host-must-not-be-used.invalid/"
+    flow.request.url = f"{scheme}://{host}:{port}{path}"
     flow.request.method = method
     flow.request.path = path
-    flow.request.headers = dict(headers or {})
+    if host_header is None:
+        host_header = host if port == {"http": 80, "https": 443}[scheme] else f"{host}:{port}"
+    flow.request.headers = Headers(host=host_header, **(headers or {}))
     flow.request.raw_content = body
     flow.response = None
     flow.metadata = {}
@@ -394,6 +411,101 @@ class TestMultiEntryMatching:
         assert temp.host_config.allow_response_cookies == []
 
 
+# ── Host header vs. real destination ─────────────────────────────────────────
+
+class TestHostHeaderMismatch:
+    def _run(self, flow, allowlist=("good.com",)):
+        from addon import AllowlistAddon
+        state = make_state(hosts={h: None for h in allowlist})
+        AllowlistAddon(state).request(flow)
+        return state
+
+    def test_spoofed_host_to_unlisted_destination_blocked(self, capsys):
+        # Real destination 127.0.0.1, Host claims the allowed good.com
+        flow = make_flow("127.0.0.1", port=8080, host_header="good.com")
+        state = self._run(flow)
+        assert flow.response.status_code == 403
+        assert "Retry-After" not in flow.response.headers
+        entry = state.deny_log[-1]
+        assert entry["type"] == "policy_violation"
+        assert entry["host"] == "127.0.0.1"
+        log = json.loads(capsys.readouterr().out)
+        assert log["event"] == "host_header_mismatch"
+        assert log["claimed_host"] == "good.com"
+
+    def test_spoofed_host_blocked_even_if_both_allowed(self):
+        flow = make_flow("good.com", host_header="other.com")
+        self._run(flow, allowlist=("good.com", "other.com"))
+        assert flow.response.status_code == 403
+
+    def test_policy_uses_destination_not_host_header(self):
+        # Even with the Host check bypassed, the decision must follow .host
+        from unittest.mock import patch
+        flow = make_flow("127.0.0.1", host_header="good.com")
+        with patch("addon.host_header_mismatch", return_value=None):
+            self._run(flow)
+        assert flow.response.status_code == 503
+        assert b"127.0.0.1" in flow.response.content
+
+    def test_matching_host_passes(self):
+        flow = make_flow("good.com")
+        self._run(flow)
+        assert flow.response is None
+
+    def test_host_comparison_case_insensitive(self):
+        flow = make_flow("good.com", host_header="GOOD.com")
+        self._run(flow)
+        assert flow.response is None
+
+    def test_explicit_default_port_passes(self):
+        flow = make_flow("good.com", port=443, scheme="https", host_header="good.com:443")
+        self._run(flow)
+        assert flow.response is None
+
+    def test_non_default_port_must_be_stated(self):
+        flow = make_flow("good.com", port=8443, scheme="https", host_header="good.com")
+        self._run(flow)
+        assert flow.response.status_code == 403
+
+    def test_port_mismatch_blocked(self):
+        flow = make_flow("good.com", port=8080, host_header="good.com:9090")
+        self._run(flow)
+        assert flow.response.status_code == 403
+
+    def test_ipv6_literal_matches(self):
+        flow = make_flow("::1", port=8080, host_header="[::1]:8080")
+        self._run(flow, allowlist=("::1",))
+        assert flow.response is None
+
+    def test_malformed_host_blocked(self):
+        flow = make_flow("good.com", host_header="good.com:notaport")
+        self._run(flow)
+        assert flow.response.status_code == 403
+
+    def test_duplicate_host_header_blocked(self):
+        flow = make_flow("good.com")
+        flow.request.headers.add("Host", "evil.com")
+        self._run(flow)
+        assert flow.response.status_code == 403
+
+    def test_missing_host_header_uses_destination(self):
+        flow = make_flow("good.com")
+        del flow.request.headers["Host"]
+        self._run(flow)
+        assert flow.response is None
+
+    def test_http2_authority_mismatch_blocked(self):
+        flow = make_flow("127.0.0.1", port=443, scheme="https",
+                         host_header="127.0.0.1", authority="good.com")
+        self._run(flow)
+        assert flow.response.status_code == 403
+
+    def test_http2_authority_match_passes(self):
+        flow = make_flow("good.com", port=443, scheme="https", authority="good.com")
+        self._run(flow)
+        assert flow.response is None
+
+
 # ── CredentialBrokerAddon ──────────────────────────────────────────────────────
 
 def make_broker(*entries, host="api.example.com"):
@@ -491,6 +603,28 @@ class TestCredentialBrokerAddon:
         entry = json.loads(capsys.readouterr().out)
         assert entry["event"] == "credential_injected"
         assert entry["mode"] == "inject"
+
+    @pytest.mark.parametrize("host_check", [True, False])
+    def test_spoofed_host_never_gets_credential(self, capsys, host_check):
+        # Allowlist + broker as wired in mitmproxy: a request to 127.0.0.1
+        # claiming Host: api.example.com must not get api.example.com's
+        # credential -- whether stopped by the Host check or, with that
+        # check disabled, by the destination-keyed allowlist lookup.
+        from contextlib import nullcontext
+        from unittest.mock import patch
+        from addon import AllowlistAddon, CredentialBrokerAddon
+        from config import HostEntry
+        state = make_state(hosts={"api.example.com": [HostEntry(credential=Credential(
+            host="api.example.com", header="Cookie", real_value="session=abc123"))]})
+        flow = make_flow("127.0.0.1", host_header="api.example.com")
+        bypass = nullcontext() if host_check else patch(
+            "addon.host_header_mismatch", return_value=None)
+        with bypass:
+            AllowlistAddon(state).request(flow)
+            CredentialBrokerAddon(state).request(flow)
+        assert flow.response.status_code == (403 if host_check else 503)
+        assert "Cookie" not in flow.request.headers
+        assert "abc123" not in capsys.readouterr().out
 
     def test_inject_mode_does_not_affect_other_hosts(self):
         from config import HostEntry
@@ -876,7 +1010,8 @@ def make_response_flow(host, set_cookie_headers=None, host_config=None):
     from unittest.mock import MagicMock
     from config import HostEntry
     flow = MagicMock()
-    flow.request.pretty_host = host
+    flow.request.host = host
+    flow.request.pretty_host = "pretty-host-must-not-be-used.invalid"
     flow.metadata = {} if host_config is None else {"host_entry": HostEntry(host_config=host_config)}
     cookies = list(set_cookie_headers or [])
 
