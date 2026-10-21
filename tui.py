@@ -803,7 +803,8 @@ class ProxyMonitor(App[None]):
         self._left_rows: list[dict] = []
         # (service, host) -> GET /services row: live enabled state, which a
         # deny log entry's disabled_services (a snapshot) may be behind.
-        self._services: dict[tuple, dict] = {}
+        # None while /services can't be fetched.
+        self._services: dict[tuple, dict] | None = {}
         # Guards against overlapping fetches (fetch timeout > poll interval)
         self._refreshing = False
         self._consecutive_failures = 0
@@ -873,10 +874,13 @@ class ProxyMonitor(App[None]):
                     client.get(f"{self.base_url}/denied"),
                     client.get(f"{self.base_url}/allowlist"),
                     client.get(f"{self.base_url}/services"),
+                    return_exceptions=True,
                 )
+            for r in (denied_r, allow_r):
+                if isinstance(r, Exception):
+                    raise r
             denied_data: list[dict] = denied_r.json()
             allowlist: dict = allow_r.json()
-            services: list[dict] = services_r.json()
         except Exception as exc:
             self._consecutive_failures += 1
             self._skip_ticks = min(2 ** (self._consecutive_failures - 1), 30)
@@ -902,7 +906,18 @@ class ProxyMonitor(App[None]):
                 seen[host] = entry
         self._denied_rows = sorted(seen.values(), key=lambda e: e["timestamp"], reverse=True)
 
-        self._services = {_service_key(row): row for row in services}
+        # Live service state is a refinement, not a requirement: without it
+        # denied rows still show (and `e` still offers) the services their
+        # deny log entry named.
+        try:
+            if isinstance(services_r, Exception):
+                raise services_r
+            services_r.raise_for_status()
+            services: list[dict] = services_r.json()
+            self._services = {_service_key(row): row for row in services}
+        except Exception:
+            services = []
+            self._services = None
 
         # Combined left pane: denied rows (newest-first), then temp-allowed
         # hosts, then temporarily enabled services.
@@ -922,14 +937,20 @@ class ProxyMonitor(App[None]):
         self._update_url_bar()
 
         now = datetime.now().strftime("%H:%M:%S")
+        services_note = ("" if self._services is not None
+                         else "  |  [yellow]service state unavailable[/yellow]")
         self.query_one("#status-bar", Static).update(
-            f"  {self.base_url}  |  Last updated: {now}  |  Polling every 1s"
+            f"  {self.base_url}  |  Last updated: {now}  |  Polling every 1s{services_note}"
         )
 
     def _denied_row(self, entry: dict) -> dict:
         """A deny log entry as a left-pane row, its disabled_services split
         by their live state: "pending_services" (still off -- what `e`
         offers) and "resolved_services" (enabled since)."""
+        if self._services is None:
+            return {**entry, "category": "denied",
+                    "pending_services": list(entry.get("disabled_services", ())),
+                    "resolved_services": []}
         pending, resolved = [], []
         for svc in entry.get("disabled_services", ()):
             live = self._services.get(_service_key(svc))
