@@ -119,10 +119,9 @@ def test_resolved_row_reverts_when_temp_enable_expires(proxy):
 
 def test_permanently_enabled_service_resolves_row(proxy):
     async def script(app, pilot):
-        proxy.apply(Config.from_data({"services": ["npm"]}))
-        # GET /services reads config.yaml, so persist the toggle there too.
         with open(proxy.config_path, "w") as f:
             f.write("services:\n  - npm\n")
+        proxy.reload()
         await refresh(app, pilot)
         [(_, status, *_)] = left_rows(app)
         assert status == "→ npm"

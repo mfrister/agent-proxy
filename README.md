@@ -136,7 +136,7 @@ Runs on `127.0.0.1:8082` (not proxied).
 
 Real credentials are write-only: accepted on POST/PUT `/services`, persisted to `secrets_file`, and never returned by any endpoint.
 
-Reload allowlist without restart: `kill -HUP <pid>`
+Endpoints report and edit the config the proxy has loaded, not whatever `config.yaml` currently holds. Reload a hand-edited `config.yaml` without restarting with `kill -HUP <pid>`; until then, API writes are refused with 409 rather than overwriting the edit.
 
 ## Tests
 
