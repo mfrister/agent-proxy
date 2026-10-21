@@ -330,7 +330,7 @@ leaked push credential cannot be exercised through the proxy.
 | `pypi` | `pypi.org`, `files.pythonhosted.org` | Simple index (PEP 503), JSON API, and package files. |
 | `crates` | `index.crates.io`, `crates.io`, `static.crates.io` | Sparse index, the API download endpoint, and `.crate` files. |
 | `github` | `api.github.com`, scoped to `scope.repos`/`scope.orgs` | Repo metadata, contents, commits, branches, pulls, issues, and git refs/trees/blobs (read-only). `write: true` adds issue/PR/comment POST/PATCH; `graphql: true` adds unscoped `POST /graphql`. |
-| `gitlab` | the entry's `host:`, scoped to `scope.projects`/`scope.groups` | The `/api/v4/projects/{id}` equivalent of the above: files, commits, branches, merge requests, issues (with `glab issue list`'s filter parameters) and issue comments, repository tree/blobs (read-only), plus the token's own user (`GET /api/v4/user`, which `glab auth login`/`auth status` need). `write: true` adds issue/MR/note POST/PUT, issue subscribe/unsubscribe, and issue time tracking. |
+| `gitlab` | the entry's `host:`, scoped to `scope.projects`/`scope.groups` | The `/api/v4/projects/{id}` equivalent of the above: files, commits, branches, merge requests, issues (with `glab issue list`'s filter parameters) and issue comments, milestone lookup by title, repository tree/blobs (read-only), plus the token's own user (`GET /api/v4/user`, which `glab auth login`/`auth status` need). `write: true` adds issue/MR/note POST/PUT, issue subscribe/unsubscribe, and issue time tracking. |
 
 Rule definitions live in `registries.py` (`PRESETS`) for registry presets and
 in `services.py` (`_github_rules`, `_gitlab_rules`) for the API presets; git
