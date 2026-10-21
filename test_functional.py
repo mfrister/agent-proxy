@@ -125,6 +125,65 @@ class _ForceProxyHandler(urllib.request.ProxyHandler):
                     os.environ[k] = v
 
 
+class RawTcpServer:
+    """Plain TCP listener that records every accepted connection and the bytes
+    it receives, echoing them back. Lets tests prove whether the proxy opened
+    an upstream connection or relayed non-HTTP bytes."""
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen()
+        self.port = self.sock.getsockname()[1]
+        self.accepted = 0
+        self.received = b""
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            self.accepted += 1
+            threading.Thread(target=self._echo, args=(conn,), daemon=True).start()
+
+    def _echo(self, conn):
+        with conn:
+            while data := conn.recv(4096):
+                self.received += data
+                conn.sendall(data)
+
+    def close(self):
+        self.sock.close()
+
+
+def raw_connect(proxy_port: int, target: str) -> tuple[socket.socket, bytes]:
+    """Send a CONNECT for target through the proxy; return the socket and the
+    proxy's response head."""
+    sock = socket.create_connection(("127.0.0.1", proxy_port), timeout=5)
+    sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        head += chunk
+    return sock, head
+
+
+def recv_all(sock: socket.socket, timeout: float = 1.0) -> bytes:
+    """Read until EOF or timeout; a reset counts as EOF."""
+    sock.settimeout(timeout)
+    data = b""
+    try:
+        while chunk := sock.recv(4096):
+            data += chunk
+    except (TimeoutError, ConnectionError):
+        pass
+    return data
+
+
 def agent_opener(proxy_url: str) -> urllib.request.OpenerDirector:
     """urllib opener that forces all HTTP through proxy_url regardless of no_proxy."""
     return urllib.request.build_opener(
@@ -858,3 +917,80 @@ def test_management_rejects_non_json_post(proxy):
     assert r.json()["ok"] is False
     allowlist = mgmt_get(proxy["management_socket"], "/allowlist").json()
     assert "attacker.example" not in allowlist["permanent"]
+
+
+# ── CONNECT tunnel policy tests ────────────────────────────────────────────────
+
+@pytest.fixture
+def raw_server():
+    server = RawTcpServer()
+    yield server
+    server.close()
+
+
+# A CONNECT to a disallowed host still opens the tunnel: clients don't show
+# the body of a refused CONNECT, so the denial is answered on the request
+# inside it, where the agent can read "pending human approval". Lazy
+# connections keep that from reaching upstream (or DNS) before policy runs.
+
+def _get(host: str) -> bytes:
+    return f"GET /x HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode()
+
+
+def test_connect_to_disallowed_host_denied_inside_tunnel(proxy, raw_server):
+    # "localhost" is not on the allowlist (only 127.0.0.1 is), but resolves
+    # to the raw server — so any upstream connect would show up as an accept.
+    target = f"localhost:{raw_server.port}"
+    sock, head = raw_connect(proxy["proxy_port"], target)
+    with sock:
+        assert head.startswith(b"HTTP/1.1 200")
+        sock.sendall(_get(target))
+        resp = _recv_response(sock)
+    assert _status(resp) == 503, resp
+    assert b"pending human approval" in resp
+    time.sleep(0.5)
+    assert raw_server.accepted == 0
+    denied = mgmt_get(proxy["management_socket"], "/denied").json()
+    assert any(e["host"] == "localhost" and e["type"] == "pending_approval" for e in denied)
+
+
+def test_connect_tls_to_disallowed_host_denied_inside_tunnel(proxy, raw_server):
+    target = f"localhost:{raw_server.port}"
+    tls = ssl.create_default_context(cafile=str(proxy["ca_cert"]))
+    sock, head = raw_connect(proxy["proxy_port"], target)
+    assert head.startswith(b"HTTP/1.1 200")
+    with tls.wrap_socket(sock, server_hostname="localhost") as tls_sock:
+        tls_sock.sendall(_get(target))
+        resp = _recv_response(tls_sock)
+    assert _status(resp) == 503, resp
+    assert b"pending human approval" in resp
+    time.sleep(0.5)
+    assert raw_server.accepted == 0
+
+
+def test_connect_to_unresolvable_host_denied_without_dns(proxy):
+    # An eager connection would fail the CONNECT with a DNS error (502)
+    # before policy ran; lazily, the denial is the only answer.
+    target = "nonexistent.invalid:443"
+    tls = ssl.create_default_context(cafile=str(proxy["ca_cert"]))
+    sock, head = raw_connect(proxy["proxy_port"], target)
+    assert head.startswith(b"HTTP/1.1 200")
+    with tls.wrap_socket(sock, server_hostname="nonexistent.invalid") as tls_sock:
+        tls_sock.sendall(_get("nonexistent.invalid"))
+        resp = _recv_response(tls_sock)
+    assert _status(resp) == 503, resp
+    assert b"pending human approval" in resp
+
+
+def test_raw_bytes_after_connect_not_relayed(proxy, raw_server):
+    sock, head = raw_connect(proxy["proxy_port"], f"127.0.0.1:{raw_server.port}")
+    with sock:
+        # Allowed host: the tunnel itself is established...
+        assert head.startswith(b"HTTP/1.1 200")
+        # ...but non-HTTP, non-TLS bytes must not be forwarded as raw TCP
+        sock.sendall(b"SSH-2.0-exfil secret-data\r\n")
+        reply = recv_all(sock)
+    time.sleep(0.5)
+    assert b"secret-data" not in reply
+    assert raw_server.received == b""
+    assert raw_server.accepted == 0
