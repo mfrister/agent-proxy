@@ -1081,3 +1081,18 @@ class TestCookieAllowlist:
                                   host_config=HostConfig(allow_response_cookies=["csrftoken", "lang"]))
         addon.response(flow)
         assert set(flow.response._stored) == {"csrftoken=abc", "lang=en"}
+
+
+# ── mitmproxy options ─────────────────────────────────────────────────────────
+
+class TestSafeOptions:
+    def test_unsafe_mitmproxy_options_overridden(self):
+        from mitmproxy.options import Options
+        from addon import apply_safe_options
+        opts = Options()
+        # Normally registered by mitmproxy's nextlayer/proxyserver addons
+        opts.add_option("rawtcp", bool, True, "")
+        opts.add_option("connection_strategy", str, "eager", "", choices=("eager", "lazy"))
+        apply_safe_options(opts)
+        assert opts.rawtcp is False
+        assert opts.connection_strategy == "lazy"

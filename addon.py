@@ -19,7 +19,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from mitmproxy import http
+from mitmproxy import ctx, http
 from mitmproxy.http import HTTPFlow
 from mitmproxy.net.http import url
 
@@ -498,6 +498,31 @@ def setup_sighup(state: ProxyState):
 
 # ── mitmproxy entry point ──────────────────────────────────────────────────────
 
+# mitmproxy options whose defaults are unsafe for an egress allowlist:
+#   rawtcp: non-HTTP bytes inside a CONNECT tunnel would be relayed as raw TCP,
+#     bypassing every request hook.
+#   connection_strategy: "eager" opens an upstream connection (and DNS lookup)
+#     for every CONNECT before any policy has run. Lazily, a CONNECT to any
+#     host opens the tunnel and the policy answers the request inside it --
+#     where the client shows the "pending human approval" body, which it
+#     wouldn't for a refused CONNECT.
+# Both are read per connection, so setting them from load() takes effect.
+# listen_host (default: all interfaces) is deliberately absent: mitmproxy binds
+# its listener before scripts load and doesn't rebind on a listen_host change,
+# so it has to be passed on the command line (--listen-host 127.0.0.1).
+SAFE_OPTIONS = {
+    "rawtcp": False,
+    "connection_strategy": "lazy",
+}
+
+
+def apply_safe_options(options) -> None:
+    """Force SAFE_OPTIONS, overriding mitmproxy's defaults and any --set."""
+    changed = {k: v for k, v in SAFE_OPTIONS.items() if getattr(options, k) != v}
+    if changed:
+        options.update(**changed)
+
+
 class SandboxProxy:
     """
     Entry-point addon. Builds the proxy state from PROXY_CONFIG when mitmproxy
@@ -512,6 +537,7 @@ class SandboxProxy:
         state = ProxyState(config_path=config_path, management_socket=config.management_socket)
         state.apply(config)
         setup_sighup(state)
+        apply_safe_options(ctx.options)
         self.state = state
         self.addons = [
             AllowlistAddon(state),
