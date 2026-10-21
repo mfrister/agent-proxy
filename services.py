@@ -269,7 +269,8 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
 
     rules = [
         # The token's own user: glab calls this on `auth login`/`auth status`
-        # and for assignee lookups. Fixed path, no query, GET/HEAD only, and
+        # and to resolve `--assignee=@me` (lookups by username go to the
+        # denied /users). Fixed path, no query, GET/HEAD only, and
         # it returns the token owner rather than any project data.
         registries._r("/api/v4/user"),
         # glab issue create fetches the project with these flags first.
