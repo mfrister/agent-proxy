@@ -63,6 +63,7 @@ def _redacted_view(entry) -> dict:
             view["fake_value"] = entry["fake_value"]
     else:
         view["kind"] = "registry"
+    view["enabled"] = not (isinstance(entry, dict) and entry.get("enabled") is False)
     # scope/unrestricted/flags carry no secrets -- surface them as stored
     # (raw, unescaped) so the TUI/API caller can show and re-edit them.
     if preset is not None and preset.scope_params and isinstance(entry, dict):
@@ -252,6 +253,11 @@ def create_app(state: ProxyState) -> Flask:
         if host and not preset.host_param:
             return jsonify({"ok": False, "error": f"{name} does not take a host"}), 400
 
+        try:
+            enabled = require_bool(body, "enabled", True)
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+
         data = _read_config()
         entries = list(data.get("services") or [])
         if any(_service_key(e) == (name, host) for e in entries):
@@ -331,6 +337,11 @@ def create_app(state: ProxyState) -> Flask:
                 if flag.name in body:
                     new_entry[flag.name] = body[flag.name]
 
+        if not enabled:
+            if isinstance(new_entry, str):
+                new_entry = {"service": new_entry}
+            new_entry["enabled"] = False
+
         new_data = {**data, "services": entries + [new_entry]}
         try:
             config = Config.from_data(new_data)
@@ -347,8 +358,9 @@ def create_app(state: ProxyState) -> Flask:
 
     @app.put("/services")
     def edit_service():
-        """Rotate a service's token and/or edit its scope -- one verb, since
-        both are "change a field on an existing entry, validate, persist".
+        """Rotate a service's token, edit its scope and/or toggle `enabled`
+        -- one verb, since all are "change a field on an existing entry,
+        validate, persist".
         Editing scope never touches real_value/fake_value and rotating the
         token never touches scope: each field below is only written into
         new_entry when the caller actually supplied it.
@@ -357,11 +369,13 @@ def create_app(state: ProxyState) -> Flask:
         name, host = body.get("service"), body.get("host")
         preset = services_module.SERVICE_PRESETS.get(name)
         flag_names = {f.name for f in preset.scope_flags} if preset else set()
-        provided = [k for k in ("real_value", "scope", "unrestricted", *flag_names) if k in body]
+        provided = [k for k in ("real_value", "scope", "unrestricted", "enabled", *flag_names)
+                    if k in body]
         if not provided:
             return jsonify({
                 "ok": False,
-                "error": "at least one of real_value, scope, unrestricted or a flag is required",
+                "error": "at least one of real_value, scope, unrestricted, enabled "
+                         "or a flag is required",
             }), 400
         if ("scope" in body or "unrestricted" in body) and not (preset and preset.scope_params):
             return jsonify({"ok": False, "error": f"{name} does not support scoping"}), 400
@@ -400,6 +414,8 @@ def create_app(state: ProxyState) -> Flask:
         try:
             if "unrestricted" in body:
                 require_bool(body, "unrestricted")
+            if "enabled" in body:
+                require_bool(body, "enabled")
             for flag in (preset.scope_flags if preset else ()):
                 if flag.name in body:
                     require_bool(body, flag.name)
@@ -427,6 +443,12 @@ def create_app(state: ProxyState) -> Flask:
                 else:
                     new_entry.pop(flag.name, None)
 
+        if "enabled" in body:
+            if body["enabled"]:
+                new_entry.pop("enabled", None)
+            else:
+                new_entry["enabled"] = False
+
         if preset is not None and preset.scope_params and not new_entry.get("unrestricted"):
             try:
                 preset.build_scope(new_entry.get("scope"))
@@ -436,7 +458,9 @@ def create_app(state: ProxyState) -> Flask:
                 return jsonify({"ok": False, "error": str(e)}), 400
 
         new_entries = list(entries)
-        new_entries[idx] = new_entry
+        # Keep a plain registry entry in its short form once nothing but the
+        # name is left (e.g. after re-enabling it).
+        new_entries[idx] = name if new_entry == {"service": name} else new_entry
         new_data = {**data, "services": new_entries}
         try:
             config = Config.from_data(new_data)

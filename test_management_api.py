@@ -383,7 +383,7 @@ class TestServicesEndpoints:
 
     def test_post_registry_service_updates_state_and_config(self, mgmt):
         r = mgmt.post("/services", json={"service": "npm"})
-        assert r.get_json() == {"ok": True, "service": {"service": "npm", "kind": "registry"}}
+        assert r.get_json() == {"ok": True, "service": {"service": "npm", "kind": "registry", "enabled": True}}
         assert mgmt._state.hosts.get("registry.npmjs.org") is not None
         with open(mgmt._state.config_path) as f:
             assert yaml.safe_load(f)["services"] == ["npm"]
@@ -694,3 +694,66 @@ class TestServicesEndpoints:
             "CRED_GITLAB_B_EXAMPLE_COM": "tb",
         }
         assert len(mgmt_secrets._state.credentials) == 2
+
+
+def _config_services(client):
+    with open(client._state.config_path) as f:
+        return yaml.safe_load(f).get("services")
+
+
+class TestServiceToggle:
+    def test_services_list_reports_enabled(self, mgmt):
+        mgmt.post("/services", json={"service": "npm"})
+        [row] = mgmt.get("/services").get_json()
+        assert row["enabled"] is True
+
+    def test_put_disable_keeps_config_and_makes_dormant(self, mgmt):
+        mgmt.post("/services", json={"service": "npm"})
+        r = mgmt.put("/services", json={"service": "npm", "enabled": False})
+        assert r.get_json()["service"]["enabled"] is False
+        assert _config_services(mgmt) == [{"service": "npm", "enabled": False}]
+        assert "registry.npmjs.org" not in mgmt._state.hosts
+        assert ("npm", None) in mgmt._state.dormant_services
+        [row] = mgmt.get("/services").get_json()
+        assert row["enabled"] is False
+
+    def test_put_reenable_restores_short_form(self, mgmt):
+        mgmt.post("/services", json={"service": "npm"})
+        mgmt.put("/services", json={"service": "npm", "enabled": False})
+        r = mgmt.put("/services", json={"service": "npm", "enabled": True})
+        assert r.get_json()["service"]["enabled"] is True
+        assert _config_services(mgmt) == ["npm"]
+        assert "registry.npmjs.org" in mgmt._state.hosts
+        assert mgmt._state.dormant_services == {}
+
+    def test_put_disable_keeps_token_and_scope(self, mgmt_secrets):
+        mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok", "scope": {"repos": ["o/r"]},
+        })
+        mgmt_secrets.put("/services", json={"service": "github", "enabled": False})
+        [entry] = _config_services(mgmt_secrets)
+        assert entry["enabled"] is False
+        assert entry["scope"] == {"repos": ["o/r"]}
+        assert entry["real_value"] == "${CRED_GITHUB}"
+        with open(mgmt_secrets._secrets_path) as f:
+            assert yaml.safe_load(f) == {"CRED_GITHUB": "tok"}
+        # Still redacted while disabled.
+        assert [c.real_value for c in mgmt_secrets._state.credentials] == ["token tok"]
+
+    @pytest.mark.parametrize("bad_value", ["no", 0, None])
+    def test_put_enabled_non_bool_rejected(self, mgmt, bad_value):
+        mgmt.post("/services", json={"service": "npm"})
+        r = mgmt.put("/services", json={"service": "npm", "enabled": bad_value})
+        assert r.status_code == 400
+        assert _config_services(mgmt) == ["npm"]
+
+    def test_post_disabled_service(self, mgmt):
+        r = mgmt.post("/services", json={"service": "npm", "enabled": False})
+        assert r.get_json()["service"]["enabled"] is False
+        assert _config_services(mgmt) == [{"service": "npm", "enabled": False}]
+        assert "registry.npmjs.org" not in mgmt._state.hosts
+
+    def test_post_enabled_non_bool_rejected(self, mgmt):
+        r = mgmt.post("/services", json={"service": "npm", "enabled": "false"})
+        assert r.status_code == 400
+        assert _config_services(mgmt) is None
