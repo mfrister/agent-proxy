@@ -58,9 +58,15 @@ def _fmt_expires(epoch: float) -> str:
 
 
 class DurationBar(Static):
-    """Shows the three duration options with the active one highlighted."""
+    """Shows the three duration options with the active one highlighted,
+    followed by the screen's key hints."""
 
     duration_idx: reactive[int] = reactive(0)
+
+    def __init__(self, keys: str, duration_idx: int = 0, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.keys = keys
+        self.set_reactive(DurationBar.duration_idx, duration_idx)
 
     def render(self) -> str:
         parts = []
@@ -70,10 +76,7 @@ class DurationBar(Static):
             else:
                 parts.append(f"  {label}  ")
         dur_str = "".join(parts)
-        return (
-            f"Duration: {dur_str}   [dim]t[/dim]=temp  [dim]p[/dim]=perm  "
-            f"[dim]s[/dim]=services  [dim]r[/dim]=refresh  [dim]q[/dim]=quit"
-        )
+        return f"Duration: {dur_str}   {self.keys}"
 
 
 class UrlBar(Static):
@@ -231,7 +234,8 @@ class ConfirmScreen(ModalScreen[bool]):
 
 
 class ServicesScreen(Screen):
-    """Configured service presets, with add / rotate-token / remove.
+    """Configured service presets, with add / rotate-token / remove, and
+    enable / disable / temporarily enable (config kept while disabled).
 
     Real tokens are entered once (masked) and sent to the management API,
     which stores them in secrets_file; they are never displayed or re-fetched.
@@ -257,14 +261,21 @@ class ServicesScreen(Screen):
         Binding("o", "rotate_token", "Rotate token"),
         Binding("e", "edit_scope", "Edit scope"),
         Binding("x", "remove_service", "Remove"),
+        Binding("space", "toggle_enabled", "On/off"),
+        Binding("t", "temp_enable", "Temp enable"),
+        Binding("1", "select_duration('0')", "1m", show=False),
+        Binding("2", "select_duration('1')", "10m", show=False),
+        Binding("3", "select_duration('2')", "2h", show=False),
+        Binding("d", "cycle_duration", "Cycle duration", show=False),
         Binding("r", "refresh", "Refresh", show=False),
         Binding("k", "cursor_up", "Up", show=False),
         Binding("j", "cursor_down", "Down", show=False),
     ]
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, duration_idx: int = 0) -> None:
         super().__init__()
         self.base_url = base_url
+        self._duration_idx = duration_idx
         self._rows: list[dict] = []
         # name -> /services/available catalog item; loaded once (presets are
         # static for the lifetime of the process) and used to render the
@@ -275,9 +286,11 @@ class ServicesScreen(Screen):
         yield Header(show_clock=True)
         with Vertical(id="services-pane"):
             yield DataTable(id="services-table", cursor_type="row", zebra_stripes=True)
-        yield Static(
-            "[dim]a[/dim]=add  [dim]o[/dim]=rotate token  [dim]e[/dim]=edit scope  "
-            "[dim]x[/dim]=remove  [dim]r[/dim]=refresh  [dim]esc[/dim]=back",
+        yield DurationBar(
+            "[dim]space[/dim]=on/off  [dim]t[/dim]=temp  [dim]a[/dim]=add  "
+            "[dim]o[/dim]=rotate token  [dim]e[/dim]=edit scope  [dim]x[/dim]=remove  "
+            "[dim]r[/dim]=refresh  [dim]esc[/dim]=back",
+            duration_idx=self._duration_idx,
             id="services-hint",
         )
         yield Footer()
@@ -286,9 +299,34 @@ class ServicesScreen(Screen):
         pane = self.query_one("#services-pane", Vertical)
         pane.border_title = "SERVICES"
         table = self.query_one("#services-table", DataTable)
-        table.add_columns("Service", "Host", "Kind", "Header", "Fake token", "Scope")
+        _, self._status_col, *_ = table.add_columns(
+            "Service", "Status", "Host", "Kind", "Header", "Fake token", "Scope",
+        )
         table.focus()
+        # Counts down temp enables (and flips them to "off" on expiry) from
+        # the last fetched rows; no API round-trip needed.
+        self.set_interval(1, self._update_status_cells)
         self.run_worker(self._refresh())
+
+    @staticmethod
+    def _row_key(row: dict) -> str:
+        return f"{row['service']}:{row.get('host', '')}"
+
+    def _status_cell(self, row: dict) -> Text:
+        if row["enabled"]:
+            return Text("on", style="bold")
+        until = row.get("temp_enabled_until")
+        if until is not None and until > time.time():
+            return Text(f"temp {_fmt_expires(until)}", style="green")
+        return Text("off", style="dim")
+
+    def _update_status_cells(self) -> None:
+        table = self.query_one("#services-table", DataTable)
+        for row in self._rows:
+            try:
+                table.update_cell(self._row_key(row), self._status_col, self._status_cell(row))
+            except Exception:
+                pass  # row vanished mid-refresh; the next refresh redraws it
 
     def _scope_cell(self, row: dict) -> Text | str:
         """Render a row's Scope column: named scope + flags, with any
@@ -339,12 +377,13 @@ class ServicesScreen(Screen):
         for row in self._rows:
             table.add_row(
                 row["service"],
+                self._status_cell(row),
                 row.get("host", ""),
                 row["kind"],
                 row.get("header", ""),
                 row.get("fake_value", ""),
                 self._scope_cell(row),
-                key=f"{row['service']}:{row.get('host', '')}",
+                key=self._row_key(row),
             )
         if current_row < len(self._rows):
             table.move_cursor(row=current_row)
@@ -371,6 +410,56 @@ class ServicesScreen(Screen):
         self.query_one("#services-table", DataTable).action_cursor_down()
 
     async def action_refresh(self) -> None:
+        await self._refresh()
+
+    def action_select_duration(self, idx: str) -> None:
+        i = int(idx)
+        if 0 <= i < len(DURATIONS):
+            self.query_one("#services-hint", DurationBar).duration_idx = i
+
+    def action_cycle_duration(self) -> None:
+        bar = self.query_one("#services-hint", DurationBar)
+        bar.duration_idx = (bar.duration_idx + 1) % len(DURATIONS)
+
+    @staticmethod
+    def _label(row: dict) -> str:
+        return row["service"] + (f" ({row['host']})" if row.get("host") else "")
+
+    async def action_toggle_enabled(self) -> None:
+        row = self._selected()
+        if row is None:
+            return
+        # A temporarily enabled service counts as off: toggling makes it
+        # permanently on (and ends the temp enable).
+        enable = not row["enabled"]
+        try:
+            await _api_request(
+                self.base_url, "PUT", "/services",
+                {**self._identity(row), "enabled": enable},
+            )
+        except Exception as exc:
+            self.notify(f"Error: {exc}", severity="error", timeout=8)
+            return
+        self.notify(f"{'Enabled' if enable else 'Disabled'} {self._label(row)}")
+        await self._refresh()
+
+    async def action_temp_enable(self) -> None:
+        row = self._selected()
+        if row is None:
+            return
+        if row["enabled"]:
+            self.notify(f"{self._label(row)} is already enabled", severity="warning")
+            return
+        label, seconds = DURATIONS[self.query_one("#services-hint", DurationBar).duration_idx]
+        try:
+            await _api_request(
+                self.base_url, "POST", "/services/temp-enable",
+                {**self._identity(row), "duration_seconds": seconds},
+            )
+        except Exception as exc:
+            self.notify(f"Error: {exc}", severity="error", timeout=8)
+            return
+        self.notify(f"Temporarily enabled {self._label(row)} for {label}")
         await self._refresh()
 
     async def _prompt_scope(self, name: str, scope_params: list[dict]) -> dict:
@@ -535,7 +624,7 @@ class ServicesScreen(Screen):
         row = self._selected()
         if row is None:
             return
-        label = row["service"] + (f" ({row['host']})" if row.get("host") else "")
+        label = self._label(row)
         confirmed = await self.app.push_screen_wait(ConfirmScreen(
             f"Remove service {label}? Its host access and any stored token "
             "are removed."
@@ -644,7 +733,11 @@ class ProxyMonitor(App[None]):
             with Vertical(id="allowed-pane"):
                 yield DataTable(id="allowed-table", cursor_type="row", zebra_stripes=True)
         yield UrlBar(id="url-bar")
-        yield DurationBar(id="dur-bar")
+        yield DurationBar(
+            "[dim]t[/dim]=temp  [dim]p[/dim]=perm  "
+            "[dim]s[/dim]=services  [dim]r[/dim]=refresh  [dim]q[/dim]=quit",
+            id="dur-bar",
+        )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -832,7 +925,8 @@ class ProxyMonitor(App[None]):
         await self._refresh_data()
 
     def action_services(self) -> None:
-        self.push_screen(ServicesScreen(self.base_url))
+        bar = self.query_one("#dur-bar", DurationBar)
+        self.push_screen(ServicesScreen(self.base_url, duration_idx=bar.duration_idx))
 
     def _selected_left_host(self) -> str | None:
         """Host of the selected left-pane row (denied or temp-allowed)."""
