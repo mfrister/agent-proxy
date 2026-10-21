@@ -490,6 +490,33 @@ class TestScopedGitLabRules:
         assert isinstance(without_write, registries.Violation)
         assert isinstance(with_write, registries.Allowed)
 
+    @pytest.mark.parametrize("action,body_len", [
+        ("subscribe", 0),
+        ("unsubscribe", 0),
+        ("time_estimate", 20),
+        ("add_spent_time", 20),
+        ("reset_time_estimate", 0),
+        ("reset_spent_time", 0),
+    ])
+    def test_write_gates_issue_subscription_and_time_tracking(self, action, body_len):
+        scope = {"projects": ["team/backend"]}
+        path = f"/api/v4/projects/team%2Fbackend/issues/7/{action}"
+        content_type = "application/json" if body_len else None
+        without_write = _gitlab_eval(scope, {}, "POST", path, body_len=body_len,
+                                     content_type=content_type)
+        with_write = _gitlab_eval(scope, {"write": True}, "POST", path, body_len=body_len,
+                                  content_type=content_type)
+        assert isinstance(without_write, registries.Violation)
+        assert isinstance(with_write, registries.Allowed)
+
+    @pytest.mark.parametrize("action", ["subscribe", "reset_spent_time"])
+    def test_bodyless_issue_actions_reject_a_body(self, action):
+        scope = {"projects": ["team/backend"]}
+        path = f"/api/v4/projects/team%2Fbackend/issues/7/{action}"
+        result = _gitlab_eval(scope, {"write": True}, "POST", path, body_len=20,
+                              content_type="application/json")
+        assert isinstance(result, registries.Violation)
+
     def test_authorization_header_present_for_credential(self):
         # gitlab's credential header is PRIVATE-TOKEN, not Authorization --
         # it must survive AllowlistAddon's header scrubbing the same way.

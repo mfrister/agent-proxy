@@ -328,6 +328,14 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
             registries._r(f"{base}/issues/{GL_IID}/notes", methods=["POST"], **write_kwargs),
             registries._r(f"{base}/merge_requests", methods=["POST"], **write_kwargs),
             registries._r(f"{base}/merge_requests/{GL_IID}", methods=["PUT"], **write_kwargs),
+            # glab issue subscribe/unsubscribe and --time-estimate/--time-spent;
+            # the reset and subscribe calls carry no body.
+            registries._r(f"{base}/issues/{GL_IID}/(?:subscribe|unsubscribe)",
+                          methods=["POST"], allow_percent=True),
+            registries._r(f"{base}/issues/{GL_IID}/(?:time_estimate|add_spent_time)",
+                          methods=["POST"], **write_kwargs),
+            registries._r(f"{base}/issues/{GL_IID}/(?:reset_time_estimate|reset_spent_time)",
+                          methods=["POST"], allow_percent=True),
         ]
 
     return {host: {"rules": rules, "request_headers": sorted(request_headers)}}
