@@ -22,10 +22,45 @@ from datetime import datetime, timezone
 
 from mitmproxy import http
 from mitmproxy.http import HTTPFlow
+from mitmproxy.net.http import url
 
 import registries
 from config import Config, HostConfig, HostEntry, ProxyState
 from management_api import create_app
+
+
+# ── Destination ────────────────────────────────────────────────────────────────
+
+def dest_host(flow: HTTPFlow) -> str:
+    """The host mitmproxy will actually connect to: the absolute-form URL host,
+    or the CONNECT target inside a tunnel (mitmproxy handles tunnelled requests
+    in transparent mode, taking .host from the tunnel's server address).
+
+    Never use pretty_host for policy: it prefers the client-controlled Host
+    header / :authority, which can name an allowed host while the connection
+    goes elsewhere.
+    """
+    return flow.request.host
+
+
+def host_header_mismatch(flow: HTTPFlow) -> str | None:
+    """Return the offending value if any Host header or HTTP/2+ :authority
+    names something other than the real destination host:port, else None.
+    The port may be omitted when it is the scheme's default."""
+    req = flow.request
+    claimed = list(req.headers.get_all("host"))
+    if (req.is_http2 or req.is_http3) and req.authority:
+        claimed.append(req.authority)
+    for value in claimed:
+        try:
+            host, port = url.parse_authority(value, check=True)
+        except ValueError:
+            return value
+        if port is None:
+            port = url.default_port(req.scheme)
+        if host.lower() != req.host.lower() or port != req.port:
+            return value
+    return None
 
 
 # ── Happy eyeballs ───────────────────────────────────────────────────────────────
@@ -87,8 +122,40 @@ class AllowlistAddon:
         self.state = state
 
     def request(self, flow: HTTPFlow):
-        host = flow.request.pretty_host
+        host = dest_host(flow)
         s = self.state
+
+        claimed = host_header_mismatch(flow)
+        if claimed is not None:
+            # Upstreams (CDNs, vhosts) may route by Host, so a mismatch means
+            # our policy decision might not describe where the request lands.
+            # Unlike other denials no approval can fix this: answer 403.
+            flow.response = http.Response.make(
+                403,
+                f"Host header {claimed[:256]!r} does not match the destination "
+                f"{host}:{flow.request.port}. This is a policy violation, not a "
+                "pending approval — it will not be granted by waiting.",
+                {"Content-Type": "text/plain"},
+            )
+            entry = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "host": host,
+                "url": flow.request.url[:512],
+                "method": flow.request.method,
+                # Shown as a violation by the TUI
+                "type": "policy_violation",
+                # Attacker-influenced; truncate so the deny log stays bounded
+                "reason": f"Host header {claimed[:256]!r} does not match destination",
+            }
+            with s.deny_lock:
+                s.deny_log.append(entry)
+            print(json.dumps({
+                "event": "host_header_mismatch",
+                "host": host,
+                "port": flow.request.port,
+                "claimed_host": claimed[:256],
+            }))
+            return
 
         entries = list(s.hosts.get(host, ()))
         with s.temp_lock:
@@ -153,7 +220,7 @@ class AllowlistAddon:
         """Disabled services (not temporarily enabled either) that would
         permit this request."""
         s = self.state
-        host = flow.request.pretty_host
+        host = dest_host(flow)
         with s.temp_lock:
             now = time.time()
             active = {key for key, exp in s.temp_services.items() if now < exp}
@@ -175,7 +242,7 @@ class AllowlistAddon:
             self.state.deny_log.append(entry)
 
     def _deny_pending(self, flow: HTTPFlow):
-        host = flow.request.pretty_host
+        host = dest_host(flow)
         flow.response = http.Response.make(
             503,
             f"Request to {host} is pending human approval. Retry the request after approval is granted.",
@@ -184,14 +251,14 @@ class AllowlistAddon:
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "host": host,
-            "url": flow.request.pretty_url,
+            "url": flow.request.url,
             "method": flow.request.method,
             "type": "pending_approval",
         }
         self._log_denial(flow, entry)
 
     def _deny_violation(self, flow: HTTPFlow, host_entry: HostEntry, verdict):
-        host = flow.request.pretty_host
+        host = dest_host(flow)
         source = host_entry.rules.source
         flow.response = http.Response.make(
             503,
@@ -204,7 +271,7 @@ class AllowlistAddon:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "host": host,
             # Attacker-influenced; truncate so the deny log stays bounded
-            "url": flow.request.pretty_url[:512],
+            "url": flow.request.url[:512],
             "method": flow.request.method,
             "type": "policy_violation",
             "reason": verdict.reason,
@@ -228,7 +295,7 @@ class AllowlistAddon:
             # Names only — scrubbed values may contain credentials
             print(json.dumps({
                 "event": "registry_headers_scrubbed",
-                "host": flow.request.pretty_host,
+                "host": dest_host(flow),
                 "dropped": sorted(verdict.drop_headers),
                 "clamped": sorted(name for name, _ in verdict.clamp_headers),
             }))
@@ -264,7 +331,7 @@ class CredentialBrokerAddon:
         if flow.response is not None:
             return
 
-        host = flow.request.pretty_host
+        host = dest_host(flow)
         host_entry = flow.metadata.get("host_entry")
         cred = host_entry.credential if host_entry is not None else None
         self._strip_withheld(flow, cred)
@@ -308,7 +375,7 @@ class CredentialBrokerAddon:
 
     def _strip_withheld(self, flow: HTTPFlow, cred):
         """Drop headers carrying a credential of another entry for this host."""
-        host = flow.request.pretty_host
+        host = dest_host(flow)
         keep = cred.header.lower() if cred is not None else None
         # The entries AllowlistAddon considered, temporarily enabled services
         # included; state.hosts when it didn't stamp them.
@@ -370,7 +437,7 @@ class LoggingAddon:
             "event": "request",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "method": flow.request.method,
-            "host": flow.request.pretty_host,
+            "host": dest_host(flow),
             "path": flow.request.path,
         }
         registry = flow.metadata.get("registry")

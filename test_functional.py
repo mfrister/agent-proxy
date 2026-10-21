@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -97,6 +98,15 @@ class CookieHandler(BaseHTTPRequestHandler):
         pass
 
 
+class RecordingHandler(EchoHandler):
+    """EchoHandler that also records every request's headers on the server
+    object, so tests can assert what actually reached the upstream."""
+
+    def _echo(self):
+        self.server.received.append({k.lower(): v for k, v in self.headers.items()})
+        super()._echo()
+
+
 class _ForceProxyHandler(urllib.request.ProxyHandler):
     """ProxyHandler that ignores no_proxy — needed because the system no_proxy
     typically excludes 127.0.0.1/localhost, which is where our echo server runs."""
@@ -122,10 +132,16 @@ def agent_opener(proxy_url: str) -> urllib.request.OpenerDirector:
 # ── Fixture factory ────────────────────────────────────────────────────────────
 
 @contextmanager
-def _proxy_context(tmp, handler_class, config_text):
-    """Spin up an HTTP server and a mitmdump proxy; yield connection details."""
+def _proxy_context(tmp, handler_class, config_text, server_tls=None, extra_args=()):
+    """Spin up an HTTP server and a mitmdump proxy; yield connection details.
+    server_tls: optional (certfile, keyfile) to serve HTTPS instead of HTTP."""
     server_port = free_port()
     server = HTTPServer(("127.0.0.1", server_port), handler_class)
+    server.received = []
+    if server_tls:
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(*server_tls)
+        server.socket = tls.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
     management_port = free_port()
@@ -135,7 +151,7 @@ def _proxy_context(tmp, handler_class, config_text):
     proxy_port = free_port()
     proc = subprocess.Popen(
         [MITMDUMP, "-s", "addon.py", "--listen-port", str(proxy_port),
-         "--set", f"confdir={tmp}"],
+         "--set", f"confdir={tmp}", *extra_args],
         cwd=HERE,
         env={
             **os.environ,
@@ -160,6 +176,10 @@ def _proxy_context(tmp, handler_class, config_text):
         yield {
             "opener": agent_opener(f"http://127.0.0.1:{proxy_port}"),
             "server_url": f"http://127.0.0.1:{server_port}",
+            "server": server,
+            "server_port": server_port,
+            "proxy_port": proxy_port,
+            "ca_cert": tmp / "mitmproxy-ca-cert.pem",
             "management_url": f"http://127.0.0.1:{management_port}",
         }
     finally:
@@ -375,6 +395,112 @@ def proxy_github_scoped(tmp_path_factory):
         GITHUB_SCOPE_CONFIG,
     ) as ctx:
         yield ctx
+
+
+SPOOF_SECRET = "Bearer REAL-SECRET-123"
+SPOOF_CONFIG = (
+    "hosts:\n"
+    "  - host: example.org\n"
+    "    credential:\n"
+    "      header: Authorization\n"
+    f"      real_value: {SPOOF_SECRET}\n"
+)
+
+
+@pytest.fixture
+def proxy_spoof(tmp_path):
+    """Only example.org is allowed (with an inject-mode credential); the local
+    recording server is NOT allowed, so reaching it means a bypass."""
+    with _proxy_context(tmp_path, RecordingHandler, SPOOF_CONFIG) as ctx:
+        yield ctx
+
+
+def _self_signed_cert(tmp) -> tuple:
+    """Write a throwaway self-signed cert for 127.0.0.1; return (cert, key) paths."""
+    import datetime
+    import ipaddress
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name).issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName(
+            [x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_path, key_path = tmp / "server-cert.pem", tmp / "server-key.pem"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ))
+    return cert_path, key_path
+
+
+@pytest.fixture
+def proxy_spoof_tls(tmp_path):
+    """proxy_spoof with an HTTPS upstream; mitmproxy skips upstream cert
+    verification since the server cert is self-signed."""
+    with _proxy_context(
+        tmp_path, RecordingHandler, SPOOF_CONFIG,
+        server_tls=_self_signed_cert(tmp_path),
+        extra_args=("--set", "ssl_insecure=true"),
+    ) as ctx:
+        yield ctx
+
+
+def _recv_response(sock) -> bytes:
+    """Read one HTTP/1.1 response (headers + Content-Length body)."""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return data
+        data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            length = int(value.strip())
+    while len(body) < length:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        body += chunk
+    return head + b"\r\n\r\n" + body
+
+
+def _status(response: bytes) -> int:
+    return int(response.split(b" ", 2)[1])
+
+
+def _raw_request(ctx, request: bytes) -> bytes:
+    """Send one raw request to the proxy itself (absolute-form)."""
+    with socket.create_connection(("127.0.0.1", ctx["proxy_port"]), timeout=10) as sock:
+        sock.sendall(request)
+        return _recv_response(sock)
+
+
+def _connect_tunnel(ctx) -> socket.socket:
+    """Open a CONNECT tunnel through the proxy to the local server."""
+    sock = socket.create_connection(("127.0.0.1", ctx["proxy_port"]), timeout=10)
+    target = f"127.0.0.1:{ctx['server_port']}"
+    sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+    resp = _recv_response(sock)
+    assert _status(resp) == 200, resp
+    return sock
 
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
@@ -617,3 +743,67 @@ def test_two_entries_one_host_credential_bound_to_scoped_entry(
     data = json.loads(ctx["opener"].open(out_of_scope).read())
     assert data["path"] == "/api/v4/projects/other%2Fproject/issues"
     assert "private-token" not in data["headers"]
+
+
+# ── Spoofed Host header (policy host != real destination) ─────────────────────
+
+SPOOFED_GET = b"GET /a HTTP/1.1\r\nHost: example.org\r\nConnection: close\r\n\r\n"
+
+
+def _assert_blocked_and_not_leaked(ctx, resp):
+    assert _status(resp) == 403, resp
+    assert b"REAL-SECRET" not in resp
+    # The real secret must never reach the server — nothing should at all
+    assert all(SPOOF_SECRET not in h.values() for h in ctx["server"].received)
+    assert ctx["server"].received == []
+
+
+def test_spoofed_host_absolute_form_blocked(proxy_spoof):
+    """Absolute-form request to the local server with Host: example.org must
+    not be treated as a request to the allowed example.org."""
+    resp = _raw_request(proxy_spoof, (
+        f"GET http://127.0.0.1:{proxy_spoof['server_port']}/a HTTP/1.1\r\n"
+        "Host: example.org\r\nConnection: close\r\n\r\n").encode())
+    _assert_blocked_and_not_leaked(proxy_spoof, resp)
+
+
+def test_spoofed_host_connect_http_blocked(proxy_spoof):
+    """CONNECT to the local server, then a plaintext inner request with
+    Host: example.org."""
+    with _connect_tunnel(proxy_spoof) as sock:
+        sock.sendall(SPOOFED_GET)
+        resp = _recv_response(sock)
+    _assert_blocked_and_not_leaked(proxy_spoof, resp)
+
+
+def test_spoofed_host_connect_tls_blocked(proxy_spoof_tls):
+    """CONNECT to the local HTTPS server, TLS with SNI example.org, then an
+    inner request with Host: example.org."""
+    tls = ssl.create_default_context(cafile=str(proxy_spoof_tls["ca_cert"]))
+    with _connect_tunnel(proxy_spoof_tls) as raw:
+        with tls.wrap_socket(raw, server_hostname="example.org") as sock:
+            sock.sendall(SPOOFED_GET)
+            resp = _recv_response(sock)
+    _assert_blocked_and_not_leaked(proxy_spoof_tls, resp)
+
+
+def test_mismatched_host_blocked_even_if_destination_allowed(proxy):
+    """127.0.0.1 is allowed here, but Host names another host: fail closed
+    rather than forward a request the upstream may route by Host."""
+    resp = _raw_request(proxy, (
+        f"GET {proxy['server_url']}/a HTTP/1.1\r\n"
+        "Host: example.org\r\nConnection: close\r\n\r\n").encode())
+    assert _status(resp) == 403, resp
+
+
+def test_matching_host_via_connect_reaches_server(proxy):
+    """A non-spoofed CONNECT + inner request still works, with credential swap."""
+    with _connect_tunnel(proxy) as sock:
+        sock.sendall((
+            f"GET /tunnel HTTP/1.1\r\nHost: 127.0.0.1:{proxy['server_port']}\r\n"
+            "X-Api-Key: fake-key\r\nConnection: close\r\n\r\n").encode())
+        resp = _recv_response(sock)
+    assert _status(resp) == 200, resp
+    data = json.loads(resp.partition(b"\r\n\r\n")[2])
+    assert data["path"] == "/tunnel"
+    assert data["headers"]["x-api-key"] == "real-key"

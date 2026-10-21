@@ -29,7 +29,7 @@ Run headless via `mitmdump -s addon.py`, or with the web UI via `mitmweb -s addo
 
 **1. Allowlist + deny logging**
 - Permanent allowlist loaded from a YAML/JSON file at startup
-- On each `request()` hook: check `flow.request.pretty_host` against the set
+- On each `request()` hook: reject requests whose `Host` header (or HTTP/2 `:authority`) differs from the real destination, then check `flow.request.host` (the host mitmproxy actually connects to) against the set
 - Denied → set `flow.response` to a 403 immediately, log structured entry (timestamp, host, full URL, method) to a deny log
 - Reload allowlist from disk on `SIGHUP` for non-temporary changes
 
@@ -53,7 +53,7 @@ Run headless via `mitmdump -s addon.py`, or with the web UI via `mitmweb -s addo
 
 ### Key Implementation Notes
 
-- **`pretty_host`** resolves the correct hostname for both HTTP and HTTPS flows — prefer it over `flow.request.host`
+- **Use `flow.request.host`, never `pretty_host`, for policy and credential decisions** — `pretty_host` prefers the client-controlled `Host` header / `:authority`, so a request to an arbitrary destination could claim an allowed host and receive its injected credentials. In regular proxy mode `host` is the absolute-form URL host or, inside a CONNECT tunnel, the CONNECT target. Additionally reject any request whose `Host`/`:authority` disagrees with `host`:`port`, since upstreams may route by `Host`
 - **Body rewriting** requires buffering: set `flow.request.stream = False` to ensure the full body is available before the `request()` hook fires
 - **`Content-Length`** must be updated after body rewriting — mitmproxy handles this automatically if you assign to `flow.request.content`
 - **Don't log real credentials** — audit your logging calls; log the fake value (confirms agent identity) but never the substituted real value
