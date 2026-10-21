@@ -102,6 +102,7 @@ Key bindings:
 | `d` | Cycle through durations |
 | `t` | Temporarily allow the selected denied host |
 | `p` | Permanently allow the selected denied host |
+| `e` | Temporarily enable the disabled service that would permit the selected denied request (rows marked `·svc`; a picker appears if several would) |
 | `s` | Open the services view |
 | `r` | Force refresh |
 | `q` | Quit |
@@ -115,7 +116,7 @@ Runs on `127.0.0.1:8082` (not proxied).
 | Method | Path | Body | Description |
 |---|---|---|---|
 | GET | `/allowlist` | — | Permanent + active temporary allows, and active temporarily enabled services (`temporary_services`) |
-| GET | `/denied` | — | Recent denied requests |
+| GET | `/denied` | — | Recent denied requests; `disabled_services` names any disabled service that would have permitted one |
 | POST | `/allow/temp` | `{"host": "…", "duration_seconds": 60}` | Add TTL-based allow; `duration_seconds` defaults to 300 |
 | POST | `/allow/permanent` | `{"host": "…"}` | Append to current config file and reload |
 | GET | `/services/available` | — | Service preset catalog (name, needs_token, host_param, scope_params, scope_flags, header, fake prefix) |
