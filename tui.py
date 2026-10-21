@@ -9,6 +9,7 @@ import time
 from datetime import datetime
 
 import httpx
+import yaml
 from rich.markup import escape
 from rich.text import Text
 from textual import work
@@ -20,13 +21,23 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
 from textual.widgets import DataTable, Footer, Header, Input, Label, Static
 
+from config import default_management_socket
+
 DURATIONS: list[tuple[str, int]] = [("1m", 60), ("10m", 600), ("2h", 7200)]
 
 
-async def _api_request(base_url: str, method: str, path: str, body: dict | None = None):
+def _client(socket_path: str) -> httpx.AsyncClient:
+    """An HTTP client for the management API on its Unix socket."""
+    return httpx.AsyncClient(
+        transport=httpx.AsyncHTTPTransport(uds=socket_path),
+        base_url="http://agent-proxy", timeout=5.0,
+    )
+
+
+async def _api_request(socket_path: str, method: str, path: str, body: dict | None = None):
     """Call the management API; raise RuntimeError with the API's error text."""
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        r = await client.request(method, f"{base_url}{path}", json=body)
+    async with _client(socket_path) as client:
+        r = await client.request(method, path, json=body)
     try:
         data = r.json()
     except Exception:
@@ -353,9 +364,9 @@ class ServicesScreen(Screen):
         Binding("j", "cursor_down", "Down", show=False),
     ]
 
-    def __init__(self, base_url: str, duration_idx: int = 0) -> None:
+    def __init__(self, socket_path: str, duration_idx: int = 0) -> None:
         super().__init__()
-        self.base_url = base_url
+        self.socket_path = socket_path
         self._duration_idx = duration_idx
         self._rows: list[dict] = []
         # name -> /services/available catalog item; loaded once (presets are
@@ -443,12 +454,12 @@ class ServicesScreen(Screen):
     async def _refresh(self) -> None:
         if not self._catalog:
             try:
-                catalog = await _api_request(self.base_url, "GET", "/services/available")
+                catalog = await _api_request(self.socket_path, "GET", "/services/available")
                 self._catalog = {item["name"]: item for item in catalog}
             except Exception:
                 pass  # table still renders; Scope column just loses highlighting
         try:
-            self._rows = await _api_request(self.base_url, "GET", "/services")
+            self._rows = await _api_request(self.socket_path, "GET", "/services")
         except Exception as exc:
             self.notify(f"Fetch error: {exc}", severity="error", timeout=5)
             return
@@ -515,7 +526,7 @@ class ServicesScreen(Screen):
         enable = not row["enabled"]
         try:
             await _api_request(
-                self.base_url, "PUT", "/services",
+                self.socket_path, "PUT", "/services",
                 {**self._identity(row), "enabled": enable},
             )
         except Exception as exc:
@@ -534,7 +545,7 @@ class ServicesScreen(Screen):
         label, seconds = DURATIONS[self.query_one("#services-hint", DurationBar).duration_idx]
         try:
             await _api_request(
-                self.base_url, "POST", "/services/temp-enable",
+                self.socket_path, "POST", "/services/temp-enable",
                 {**self._identity(row), "duration_seconds": seconds},
             )
         except Exception as exc:
@@ -600,7 +611,7 @@ class ServicesScreen(Screen):
     @work
     async def action_add_service(self) -> None:
         try:
-            catalog = await _api_request(self.base_url, "GET", "/services/available")
+            catalog = await _api_request(self.socket_path, "GET", "/services/available")
         except Exception as exc:
             self.notify(f"Fetch error: {exc}", severity="error", timeout=5)
             return
@@ -633,7 +644,7 @@ class ServicesScreen(Screen):
         if item["scope_flags"]:
             body.update(await self._prompt_flags(item["name"], item["scope_flags"]))
         try:
-            result = await _api_request(self.base_url, "POST", "/services", body)
+            result = await _api_request(self.socket_path, "POST", "/services", body)
         except Exception as exc:
             self.notify(f"Error: {exc}", severity="error", timeout=8)
             return
@@ -667,7 +678,7 @@ class ServicesScreen(Screen):
         try:
             # Extended PUT /services: scope/flags only, never real_value --
             # editing scope must not touch the brokered token.
-            await _api_request(self.base_url, "PUT", "/services", body)
+            await _api_request(self.socket_path, "PUT", "/services", body)
         except Exception as exc:
             self.notify(f"Error: {exc}", severity="error", timeout=8)
             return
@@ -691,7 +702,7 @@ class ServicesScreen(Screen):
             return
         try:
             await _api_request(
-                self.base_url, "PUT", "/services",
+                self.socket_path, "PUT", "/services",
                 {**self._identity(row), "real_value": token},
             )
         except Exception as exc:
@@ -713,7 +724,7 @@ class ServicesScreen(Screen):
         if not confirmed:
             return
         try:
-            await _api_request(self.base_url, "DELETE", "/services", self._identity(row))
+            await _api_request(self.socket_path, "DELETE", "/services", self._identity(row))
         except Exception as exc:
             self.notify(f"Error: {exc}", severity="error", timeout=8)
             return
@@ -791,9 +802,9 @@ class ProxyMonitor(App[None]):
         Binding("j", "move_down", "Down", show=False),
     ]
 
-    def __init__(self, mgmt_port: int = 8082) -> None:
+    def __init__(self, socket_path: str) -> None:
         super().__init__()
-        self.base_url = f"http://127.0.0.1:{mgmt_port}"
+        self.socket_path = socket_path
         # Raw denied rows (deduplicated, newest-first)
         self._denied_rows: list[dict] = []
         # Left-pane rows: denied entries followed by temp-allowed hosts and
@@ -869,11 +880,11 @@ class ProxyMonitor(App[None]):
 
     async def _do_refresh(self) -> None:
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with _client(self.socket_path) as client:
                 denied_r, allow_r, services_r = await asyncio.gather(
-                    client.get(f"{self.base_url}/denied"),
-                    client.get(f"{self.base_url}/allowlist"),
-                    client.get(f"{self.base_url}/services"),
+                    client.get("/denied"),
+                    client.get("/allowlist"),
+                    client.get("/services"),
                     return_exceptions=True,
                 )
             for r in (denied_r, allow_r):
@@ -887,7 +898,7 @@ class ProxyMonitor(App[None]):
             if self._consecutive_failures == 1:
                 self.notify(f"Fetch error: {exc}", severity="error", timeout=4)
             self.query_one("#status-bar", Static).update(
-                f"  {self.base_url}  |  [red]disconnected[/red] "
+                f"  {escape(self.socket_path)}  |  [red]disconnected[/red] "
                 f"({escape(str(exc) or exc.__class__.__name__)})  |  "
                 f"retrying in {self._skip_ticks}s"
             )
@@ -940,7 +951,7 @@ class ProxyMonitor(App[None]):
         services_note = ("" if self._services is not None
                          else "  |  [yellow]service state unavailable[/yellow]")
         self.query_one("#status-bar", Static).update(
-            f"  {self.base_url}  |  Last updated: {now}  |  Polling every 1s{services_note}"
+            f"  {escape(self.socket_path)}  |  Last updated: {now}  |  Polling every 1s{services_note}"
         )
 
     def _denied_row(self, entry: dict) -> dict:
@@ -1087,7 +1098,7 @@ class ProxyMonitor(App[None]):
 
     def action_services(self) -> None:
         bar = self.query_one("#dur-bar", DurationBar)
-        self.push_screen(ServicesScreen(self.base_url, duration_idx=bar.duration_idx))
+        self.push_screen(ServicesScreen(self.socket_path, duration_idx=bar.duration_idx))
 
     def _selected_left_host(self) -> str | None:
         """Host of the selected left-pane row (denied or temp-allowed); None
@@ -1108,9 +1119,9 @@ class ProxyMonitor(App[None]):
         bar = self.query_one("#dur-bar", DurationBar)
         label, seconds = DURATIONS[bar.duration_idx]
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with _client(self.socket_path) as client:
                 r = await client.post(
-                    f"{self.base_url}/allow/temp",
+                    "/allow/temp",
                     json={"host": host, "duration_seconds": seconds},
                 )
             r.raise_for_status()
@@ -1141,7 +1152,7 @@ class ProxyMonitor(App[None]):
                 return
         try:
             await _api_request(
-                self.base_url, "POST", "/services/temp-enable",
+                self.socket_path, "POST", "/services/temp-enable",
                 {**svc, "duration_seconds": seconds},
             )
         except Exception as exc:
@@ -1155,9 +1166,9 @@ class ProxyMonitor(App[None]):
         if not host:
             return
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with _client(self.socket_path) as client:
                 r = await client.post(
-                    f"{self.base_url}/allow/permanent",
+                    "/allow/permanent",
                     json={"host": host},
                 )
             r.raise_for_status()
@@ -1168,13 +1179,26 @@ class ProxyMonitor(App[None]):
         await self._refresh_data()
 
 
+def _configured_socket() -> str:
+    """The proxy's management socket: $PROXY_MGMT_SOCKET, else the
+    management_socket set in the proxy's config ($PROXY_CONFIG, default
+    config.yaml), else the proxy's default."""
+    if os.getenv("PROXY_MGMT_SOCKET"):
+        return os.environ["PROXY_MGMT_SOCKET"]
+    try:
+        with open(os.getenv("PROXY_CONFIG", "config.yaml")) as f:
+            path = (yaml.safe_load(f) or {}).get("management_socket")
+    except (OSError, yaml.YAMLError, AttributeError):
+        path = None
+    return os.path.expanduser(path) if isinstance(path, str) and path else default_management_socket()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Agent Proxy TUI")
     parser.add_argument(
-        "--port",
-        type=int,
-        default=int(os.getenv("PROXY_MGMT_PORT", "8082")),
-        help="Management API port (default: $PROXY_MGMT_PORT or 8082)",
+        "--socket",
+        help="Management API Unix socket (default: $PROXY_MGMT_SOCKET, else "
+             "management_socket from $PROXY_CONFIG/config.yaml, else the proxy's default)",
     )
     args = parser.parse_args()
-    ProxyMonitor(mgmt_port=args.port).run()
+    ProxyMonitor(socket_path=args.socket or _configured_socket()).run()

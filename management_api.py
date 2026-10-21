@@ -1,9 +1,13 @@
 """
 Management API for the sandbox proxy.
 
-A small Flask app (loopback-only) that lets a human operator inspect denied
-requests, grant temporary or permanent allowlist entries, and manage service
-presets. Served in a background thread by ManagementApiAddon (see addon.py).
+A small Flask app that lets a human operator inspect denied requests, grant
+temporary or permanent allowlist entries, and manage service presets. Served
+in a background thread by ManagementApiAddon (see addon.py) on a Unix socket
+private to the operator (ManagementServer), never on TCP: the sandbox reaches
+the host's loopback through Lima's host.lima.internal, and browsers reach any
+loopback port, so a TCP listener would let the agent (or any web page) grant
+itself access.
 
 Real credentials are write-only through this API: they are accepted on
 POST/PUT /services, persisted to the configured secrets_file, referenced from
@@ -21,10 +25,14 @@ import logging
 import os
 import re
 import secrets as py_secrets
+import socket
+import stat
+import threading
 import time
 
 import yaml
-from flask import Flask, jsonify, request as flask_request
+from flask import Flask, abort, jsonify, request as flask_request
+from werkzeug.serving import make_server
 
 import services as services_module
 from config import Config, ProxyState, require_bool
@@ -114,6 +122,26 @@ def create_app(state: ProxyState) -> Flask:
                 return view(*args, **kwargs)
         return wrapper
 
+    @app.before_request
+    def _require_json_body():
+        """Refuse a body not sent as application/json. Defense in depth
+        beside the private socket: a web page can make a browser send a
+        cross-site text/plain, form or multipart request without a CORS
+        preflight, but not an application/json one."""
+        if flask_request.method in ("GET", "HEAD", "OPTIONS"):
+            return None
+        if not flask_request.is_json:
+            return jsonify({"ok": False, "error": "Content-Type must be application/json"}), 415
+        return None
+
+    def _json_body() -> dict:
+        """The request's JSON object body; 400 (as JSON) for anything else."""
+        body = flask_request.get_json(silent=True)
+        if not isinstance(body, dict):
+            abort(app.make_response((
+                jsonify({"ok": False, "error": "request body must be a JSON object"}), 400)))
+        return body
+
     def _editable_config() -> dict:
         """A copy of the applied config, as written, to modify and commit."""
         return copy.deepcopy(state.raw_config)
@@ -153,7 +181,7 @@ def create_app(state: ProxyState) -> Flask:
 
     @app.post("/allow/temp")
     def temp_allow():
-        body = flask_request.get_json(force=True)
+        body = _json_body()
         host = body["host"]
         duration = float(body.get("duration_seconds", 300))
         with state.temp_lock:
@@ -163,7 +191,7 @@ def create_app(state: ProxyState) -> Flask:
     @app.post("/allow/permanent")
     @_config_write
     def permanent_allow():
-        host = flask_request.get_json(force=True)["host"]
+        host = _json_body()["host"]
         data = _editable_config()
         hosts = data.get("hosts", [])
 
@@ -284,7 +312,7 @@ def create_app(state: ProxyState) -> Flask:
     def temp_enable_service():
         """Enable a disabled service for duration_seconds, in memory only --
         a restart (or any explicit PUT enabled / DELETE) ends it."""
-        body = flask_request.get_json(force=True)
+        body = _json_body()
         key = (body.get("service"), body.get("host"))
         try:
             duration = float(body.get("duration_seconds", 300))
@@ -311,7 +339,7 @@ def create_app(state: ProxyState) -> Flask:
     @app.post("/services")
     @_config_write
     def add_service():
-        body = flask_request.get_json(force=True)
+        body = _json_body()
         name = body.get("service")
         host = body.get("host")
         preset = services_module.SERVICE_PRESETS.get(name)
@@ -431,7 +459,7 @@ def create_app(state: ProxyState) -> Flask:
         token never touches scope: each field below is only written into
         new_entry when the caller actually supplied it.
         """
-        body = flask_request.get_json(force=True)
+        body = _json_body()
         name, host = body.get("service"), body.get("host")
         preset = services_module.SERVICE_PRESETS.get(name)
         flag_names = {f.name for f in preset.scope_flags} if preset else set()
@@ -545,7 +573,7 @@ def create_app(state: ProxyState) -> Flask:
     @app.delete("/services")
     @_config_write
     def remove_service():
-        body = flask_request.get_json(force=True)
+        body = _json_body()
         name, host = body.get("service"), body.get("host")
 
         data = _editable_config()
@@ -580,3 +608,101 @@ def create_app(state: ProxyState) -> Flask:
         return jsonify({"ok": True})
 
     return app
+
+
+class ManagementServer:
+    """The management API on a Unix socket, served from a background thread.
+
+    The socket is the access control: its directory must be owned by this
+    user and closed to everyone else (0700, created so if missing), and the
+    socket itself is 0600. Nothing outside the host can connect to it -- not
+    the Lima VM (sockets don't work across its mounts), not a browser.
+    """
+
+    def __init__(self, state: ProxyState):
+        self.state = state
+        self.path = state.management_socket
+        self._server = None
+        self._inode = None
+
+    def _bind(self) -> socket.socket:
+        directory = os.path.dirname(self.path)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        st = os.stat(directory)
+        if st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise OSError(
+                f"{directory} must be owned by this user with mode 0700 "
+                f"(is uid {st.st_uid}, mode {stat.S_IMODE(st.st_mode):o}); "
+                f"fix it or set management_socket elsewhere"
+            )
+        # Remove a socket left by a run that didn't clean up, but never a
+        # live one (another proxy) or anything that isn't a socket.
+        try:
+            st = os.lstat(self.path)
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISSOCK(st.st_mode):
+                raise OSError(f"{self.path} exists and is not a socket")
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(self.path)
+            except ConnectionRefusedError:
+                os.unlink(self.path)
+            else:
+                raise OSError(f"{self.path} is in use (is another proxy running?)")
+            finally:
+                probe.close()
+
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(self.path)
+            # Before listen(), so nothing can connect while it still has the
+            # umask's mode; the 0700 directory covers that window anyway.
+            os.chmod(self.path, 0o600)
+            sock.listen(128)
+        except BaseException:
+            sock.close()
+            raise
+        self._inode = os.stat(self.path).st_ino
+        return sock
+
+    def start(self, poll_interval: float = 0.5) -> None:
+        """Bind the socket (raising on failure, in the caller's thread) and
+        serve the API from a daemon thread."""
+        sock = self._bind()
+        try:
+            # Werkzeug dups the fd. Binding it ourselves also keeps werkzeug's
+            # sys.exit() on bind errors from silently ending a server thread.
+            self._server = make_server(
+                f"unix://{self.path}", 0, create_app(self.state),
+                threaded=True, fd=sock.fileno(),
+            )
+        finally:
+            sock.close()
+
+        server = self._server
+
+        def serve():
+            try:
+                server.serve_forever(poll_interval)
+            except Exception as e:
+                print(json.dumps({
+                    "event": "management_api_error", "socket": self.path,
+                    "message": f"management API stopped: {e}",
+                }))
+
+        threading.Thread(target=serve, daemon=True).start()
+
+    def stop(self) -> None:
+        """Stop serving and remove the socket, if it's still the one we bound."""
+        if self._server is None:
+            return
+        self._server.shutdown()
+        self._server.server_close()
+        self._server = None
+        try:
+            if os.stat(self.path).st_ino == self._inode:
+                os.unlink(self.path)
+        except FileNotFoundError:
+            pass

@@ -6,12 +6,13 @@ Run with:  pytest test_tui.py -v
 """
 
 import asyncio
-import threading
+import os
+import shutil
+import tempfile
 import time
 
 import pytest
 import yaml
-from werkzeug.serving import make_server
 
 from config import Config, ProxyState
 import tui
@@ -23,20 +24,23 @@ def proxy(tmp_path):
     """A ProxyState with npm disabled and one denied request it would permit,
     plus a management API serving it."""
     from addon import AllowlistAddon
-    from management_api import create_app
+    from management_api import ManagementServer
 
     config = tmp_path / "config.yaml"
     config.write_text("services:\n  - {service: npm, enabled: false}\n")
-    state = ProxyState(config_path=str(config))
+    # A short dir: AF_UNIX paths are capped at ~104 bytes.
+    sock_dir = tempfile.mkdtemp(prefix="ap-")
+    state = ProxyState(config_path=str(config),
+                       management_socket=os.path.join(sock_dir, "mgmt.sock"))
     state.apply(Config.load(str(config)))
     AllowlistAddon(state).request(make_flow("registry.npmjs.org", path="/left-pad"))
 
-    server = make_server("127.0.0.1", 0, create_app(state))
-    # A short poll interval keeps shutdown() from waiting out the 0.5s default.
-    threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
-    state.management_port = server.server_port
+    server = ManagementServer(state)
+    # A short poll interval keeps stop() from waiting out the 0.5s default.
+    server.start(poll_interval=0.01)
     yield state
-    server.shutdown()
+    server.stop()
+    shutil.rmtree(sock_dir, ignore_errors=True)
 
 
 class Monitor(tui.ProxyMonitor):
@@ -61,7 +65,7 @@ def run_tui(state, script):
     """Run the main TUI screen and `await script(app, pilot)` against it,
     once the initial refresh has landed."""
     async def main():
-        app = Monitor(mgmt_port=state.management_port)
+        app = Monitor(socket_path=state.management_socket)
         async with app.run_test() as pilot:
             await asyncio.wait_for(app.refreshed.wait(), timeout=5)
             await script(app, pilot)

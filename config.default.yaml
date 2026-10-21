@@ -25,7 +25,15 @@
 #         real_value: "session=abc123"     # inject mode: omit fake_value
 # <<<
 
-# management_port: 8082   # port for the management API (default: 8082)
+# Unix socket the management API (and the TUI) uses; there is no TCP port,
+# so neither the sandbox nor a browser can reach it. Its directory is created
+# 0700 if missing and must be owned by you and closed to everyone else.
+# Default: $XDG_RUNTIME_DIR/agent-proxy/mgmt.sock, or, without
+# XDG_RUNTIME_DIR (macOS), <temp dir>/agent-proxy-<uid>/mgmt.sock, where the
+# temp dir is $TMPDIR (per-user on macOS). Needs a restart to change.
+# (management_port is no longer supported and is rejected.)
+#
+# management_socket: ~/.local/state/agent-proxy/mgmt.sock
 
 # Delay in seconds before racing the next address family when connecting
 # upstream (RFC 8305 "happy eyeballs"). Works around mitmproxy trying resolved

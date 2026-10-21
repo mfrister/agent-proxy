@@ -4,8 +4,15 @@ Tests for the management API (management_api.py).
 Run with:  pytest test_management_api.py -v
 """
 
+import json
+import os
+import shutil
+import socket
+import stat
+import tempfile
 import time
 
+import httpx
 import pytest
 import yaml
 
@@ -923,3 +930,161 @@ class TestConfigInMemory:
         })
         assert r.status_code == 200
         assert yaml.safe_load(mgmt_secrets._secrets_path.read_text()) == {"CRED_GITHUB": "tok"}
+
+
+MUTATING_ENDPOINTS = [
+    ("POST", "/allow/temp"),
+    ("POST", "/allow/permanent"),
+    ("POST", "/services/temp-enable"),
+    ("POST", "/services"),
+    ("PUT", "/services"),
+    ("DELETE", "/services"),
+]
+
+
+class TestJsonContentType:
+    """Bodies must be sent as application/json. A web page can make a
+    browser send a cross-site text/plain, form-encoded or multipart request
+    without a CORS preflight, but not an application/json one."""
+
+    @pytest.mark.parametrize("method,path", MUTATING_ENDPOINTS)
+    @pytest.mark.parametrize("content_type", [
+        "text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x", None,
+    ])
+    def test_non_json_body_rejected_415(self, mgmt, method, path, content_type):
+        headers = {"Content-Type": content_type} if content_type else {}
+        r = mgmt.open(path, method=method, data='{"host": "evil.com", "service": "npm"}',
+                      headers=headers)
+        assert r.status_code == 415
+        assert r.get_json()["ok"] is False
+
+    def test_text_plain_permanent_allow_leaves_config_untouched(self, mgmt):
+        config_path = mgmt._state.config_path
+        with open(config_path) as f:
+            before = f.read()
+        mgmt.post("/allow/permanent", data='{"host": "evil.com"}', content_type="text/plain")
+        with open(config_path) as f:
+            assert f.read() == before
+        assert "evil.com" not in mgmt._state.hosts
+
+    @pytest.mark.parametrize("method,path", MUTATING_ENDPOINTS)
+    @pytest.mark.parametrize("body", ["{not json", "[1, 2]", '"host"'])
+    def test_malformed_or_non_object_json_rejected_400(self, mgmt, method, path, body):
+        r = mgmt.open(path, method=method, data=body, content_type="application/json")
+        assert r.status_code == 400
+        assert r.get_json()["ok"] is False
+
+    def test_json_still_accepted(self, mgmt):
+        r = mgmt.post("/allow/temp", json={"host": "evil.com"})
+        assert r.status_code == 200
+
+
+@pytest.fixture
+def sock_path():
+    """A socket path under a fresh private dir, short enough for AF_UNIX
+    (~104 bytes), which a pytest tmp_path can exceed."""
+    d = tempfile.mkdtemp(prefix="ap-")
+    yield os.path.join(d, "run", "mgmt.sock")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def _uds_get(path: str, url: str) -> httpx.Response:
+    with httpx.Client(transport=httpx.HTTPTransport(uds=path),
+                      base_url="http://agent-proxy", timeout=5) as client:
+        return client.get(url)
+
+
+class TestManagementServer:
+    """ManagementServer: the API on a private Unix socket."""
+
+    def _state(self, tmp_path, sock_path):
+        state = make_state(config_path=str(tmp_path / "config.yaml"),
+                           management_socket=sock_path)
+        state.reload()
+        return state
+
+    def _make_dir(self, sock_path, mode=0o700):
+        os.makedirs(os.path.dirname(sock_path))
+        os.chmod(os.path.dirname(sock_path), mode)
+
+    def test_serves_api_on_private_socket(self, tmp_path, sock_path):
+        from management_api import ManagementServer
+        server = ManagementServer(self._state(tmp_path, sock_path))
+        server.start()
+        try:
+            assert stat.S_ISSOCK(os.lstat(sock_path).st_mode)
+            assert os.stat(sock_path).st_mode & 0o777 == 0o600
+            assert os.stat(os.path.dirname(sock_path)).st_mode & 0o777 == 0o700
+            r = _uds_get(sock_path, "/allowlist")
+            assert r.status_code == 200
+            assert "permanent" in r.json()
+        finally:
+            server.stop()
+        assert not os.path.exists(sock_path)
+
+    def test_stale_socket_replaced(self, tmp_path, sock_path):
+        """A socket file left by a crashed run (nothing listening) is removed."""
+        from management_api import ManagementServer
+        self._make_dir(sock_path)
+        stale = socket.socket(socket.AF_UNIX)
+        stale.bind(sock_path)
+        stale.close()
+        server = ManagementServer(self._state(tmp_path, sock_path))
+        server.start()
+        try:
+            assert _uds_get(sock_path, "/denied").status_code == 200
+        finally:
+            server.stop()
+
+    def test_live_socket_not_stolen(self, tmp_path, sock_path):
+        from management_api import ManagementServer
+        first = ManagementServer(self._state(tmp_path, sock_path))
+        first.start()
+        try:
+            with pytest.raises(OSError, match="in use"):
+                ManagementServer(self._state(tmp_path, sock_path)).start()
+            assert _uds_get(sock_path, "/denied").status_code == 200
+        finally:
+            first.stop()
+
+    def test_non_socket_file_not_removed(self, tmp_path, sock_path):
+        from management_api import ManagementServer
+        self._make_dir(sock_path)
+        with open(sock_path, "w") as f:
+            f.write("keep me")
+        with pytest.raises(OSError, match="not a socket"):
+            ManagementServer(self._state(tmp_path, sock_path)).start()
+        with open(sock_path) as f:
+            assert f.read() == "keep me"
+
+    def test_shared_directory_refused(self, tmp_path, sock_path):
+        """The socket's directory must be private to this user."""
+        from management_api import ManagementServer
+        self._make_dir(sock_path, 0o755)
+        with pytest.raises(OSError, match="0700"):
+            ManagementServer(self._state(tmp_path, sock_path)).start()
+        assert not os.path.exists(sock_path)
+
+    def test_addon_logs_bind_failure(self, tmp_path, sock_path, capsys):
+        """A bind failure is reported, not lost with a dying thread; the
+        proxy itself keeps running (its policy doesn't depend on the API)."""
+        from addon import ManagementApiAddon
+        self._make_dir(sock_path, 0o755)
+        addon = ManagementApiAddon(self._state(tmp_path, sock_path))
+        addon.running()
+        addon.done()
+        events = [json.loads(line) for line in capsys.readouterr().out.splitlines()
+                  if line.startswith("{")]
+        [event] = [e for e in events if e["event"] == "management_api_error"]
+        assert event["socket"] == sock_path
+        assert "0700" in event["message"]
+
+    def test_addon_starts_and_cleans_up(self, tmp_path, sock_path):
+        from addon import ManagementApiAddon
+        addon = ManagementApiAddon(self._state(tmp_path, sock_path))
+        addon.running()
+        try:
+            assert _uds_get(sock_path, "/denied").status_code == 200
+        finally:
+            addon.done()
+        assert not os.path.exists(sock_path)

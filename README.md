@@ -71,7 +71,7 @@ For services without a preset, a `hosts:` entry can carry a `credential:` (heade
 | Variable | Default | Description |
 |---|---|---|
 | `PROXY_CONFIG` | `config.yaml` | Path to config YAML (see `config.default.yaml` for example) |
-| `PROXY_MGMT_PORT` | `8082` | Management API port the TUI connects to |
+| `PROXY_MGMT_SOCKET` | see below | Management API socket the TUI connects to |
 
 ## Terminal UI
 
@@ -79,11 +79,11 @@ A terminal UI for monitoring and managing the proxy at runtime:
 
 ```bash
 uv run python tui.py
-# or with a custom port:
-uv run python tui.py --port 9000
+# or with an explicit socket:
+uv run python tui.py --socket /path/to/mgmt.sock
 ```
 
-The port defaults to `$PROXY_MGMT_PORT` (or 8082 if unset).
+The TUI connects to the management API's Unix socket: `--socket`, else `$PROXY_MGMT_SOCKET`, else the `management_socket` set in the proxy's config (`$PROXY_CONFIG`, default `config.yaml`), else the proxy's default path (see [Management API](#management-api)). Run it as the same user as the proxy.
 
 ![TUI screenshot](docs/tui-screenshot.svg)
 
@@ -119,7 +119,13 @@ Allowing a restricted host with `t` or `p` lifts its restrictions, but not onto 
 
 ## Management API
 
-Runs on `127.0.0.1:8082` (not proxied).
+Listens only on a Unix socket, never on TCP: anything on the host's loopback is reachable from the Lima VM (`host.lima.internal`) and from any web page, and the API can change the proxy's own policy. The socket is `0600` in a `0700` directory owned by the proxy's user. Its path is `management_socket` in `config.yaml`, defaulting to `$XDG_RUNTIME_DIR/agent-proxy/mgmt.sock`, or `$TMPDIR/agent-proxy-<uid>/mgmt.sock` where `XDG_RUNTIME_DIR` is unset (macOS). The old `management_port` setting is rejected at startup. A leftover socket from an unclean exit is replaced; a live one (another proxy instance) is not. If the API can't start, the proxy logs a `management_api_error` event and keeps enforcing its loaded policy.
+
+Request bodies must be sent as `Content-Type: application/json` (415 otherwise; a non-object body is 400).
+
+```bash
+curl --unix-socket "$XDG_RUNTIME_DIR/agent-proxy/mgmt.sock" http://localhost/denied
+```
 
 | Method | Path | Body | Description |
 |---|---|---|---|

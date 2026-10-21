@@ -14,7 +14,9 @@ import copy
 import dataclasses
 import hashlib
 import json
+import os
 import re
+import tempfile
 import threading
 from dataclasses import dataclass, field
 
@@ -215,6 +217,33 @@ def _host_entry(rules, credential, host_config) -> HostEntry:
 ServiceKey = tuple[str, str | None]
 
 
+def default_management_socket() -> str:
+    """Where the management API's Unix socket lives unless config.yaml sets
+    management_socket: the per-user runtime dir on Linux, else a per-user
+    dir in the temp dir ($TMPDIR on macOS, already per-user there). Not
+    under the home directory, which Lima mounts into the VM."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        return os.path.join(runtime, "agent-proxy", "mgmt.sock")
+    return os.path.join(tempfile.gettempdir(), f"agent-proxy-{os.getuid()}", "mgmt.sock")
+
+
+def _management_socket(data: dict) -> str:
+    if "management_port" in data:
+        raise ValueError(
+            "management_port was removed: the management API now listens on a "
+            "Unix socket instead of TCP, which the sandbox could reach; delete "
+            "management_port (and set management_socket only to override the "
+            f"default socket path, {default_management_socket()})"
+        )
+    if "management_socket" not in data:
+        return default_management_socket()
+    path = data["management_socket"]
+    if not isinstance(path, str) or not os.path.isabs(os.path.expanduser(path)):
+        raise ValueError(f"management_socket must be an absolute path, got {path!r}")
+    return os.path.expanduser(path)
+
+
 @dataclass(frozen=True)
 class Config:
     """A complete, validated proxy configuration.
@@ -229,7 +258,7 @@ class Config:
     # `hosts` -- a temporary enable (ProxyState.temp_services) adds their
     # entries at request time.
     dormant_services: dict[ServiceKey, dict[str, list[HostEntry]]] = field(default_factory=dict)
-    management_port: int = 8082
+    management_socket: str = field(default_factory=default_management_socket)
     happy_eyeballs_delay: float = 0.25
     # The config as written (before ${KEY} expansion), for the management
     # API to show and edit -- the fields above are compiled from it.
@@ -511,7 +540,7 @@ class Config:
             return cls(
                 hosts=hosts,
                 dormant_services=dormant_services,
-                management_port=int(data.get("management_port", 8082)),
+                management_socket=_management_socket(data),
                 happy_eyeballs_delay=float(data.get("happy_eyeballs_delay", 0.25) or 0),
                 raw=raw,
             )
@@ -536,7 +565,7 @@ class ProxyState:
     config_path: str  # path to config YAML, used by reload()
     hosts: dict[str, list[HostEntry]] = field(default_factory=dict)
     credentials: list[Credential] = field(default_factory=list)
-    management_port: int = 8082
+    management_socket: str = field(default_factory=default_management_socket)
     dormant_services: dict[ServiceKey, dict[str, list[HostEntry]]] = field(default_factory=dict)
     temp_allows: dict[str, float] = field(default_factory=dict)  # host -> expires_at (epoch)
     temp_services: dict[ServiceKey, float] = field(default_factory=dict)  # -> expires_at (epoch)
@@ -557,8 +586,8 @@ class ProxyState:
 
         Replace-not-mutate: each policy field is rebound to a fresh object, so
         readers on other threads see either the old or the new object, never a
-        half-updated one. management_port is intentionally not re-applied —
-        the API server is already bound; the port is set once at construction.
+        half-updated one. management_socket is intentionally not re-applied —
+        the API server is already bound; the path is set once at construction.
         """
         self.hosts = dict(config.hosts)
         self.dormant_services = dict(config.dormant_services)

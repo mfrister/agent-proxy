@@ -43,7 +43,7 @@ Run headless via `mitmdump -s addon.py`, or with the web UI via `mitmweb -s addo
 **3. Temporary allows**
 - In-memory dict of `host → expires_at` timestamp, protected by a lock
 - Checked after the permanent allowlist: `now < expires_at` → allow
-- A small companion HTTP management API (separate thread, separate port, not proxied) exposes:
+- A small companion HTTP management API (separate thread, not proxied) exposes the following on a Unix socket private to the operator — never a TCP port, which the sandbox (via Lima's `host.lima.internal` → host loopback forwarding) or any web page could reach to grant itself access:
   - `GET /denied` — recent deny log
   - `POST /allow/temp {host, duration_seconds}` — add TTL entry
   - `POST /allow/permanent {host}` — append to allowlist file + reload
