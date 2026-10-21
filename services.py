@@ -254,6 +254,10 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
     base = f"/api/v4/projects/{project_id}"
 
     rules = [
+        # The token's own user: glab calls this on `auth login`/`auth status`
+        # and for assignee lookups. Fixed path, no query, GET/HEAD only, and
+        # it returns the token owner rather than any project data.
+        registries._r("/api/v4/user"),
         registries._r(base, allow_percent=True),
         registries._r(f"{base}/repository/files/{GL_PATH}",
                       query={"ref": GL_REF}, allow_percent=True),

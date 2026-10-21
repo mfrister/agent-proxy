@@ -563,6 +563,18 @@ def test_scoped_credential_reaches_upstream_on_in_scope_request(proxy_gitlab_sco
     assert data["headers"].get("private-token") == "real-glpat-secret"
 
 
+def test_scoped_credential_reaches_upstream_on_current_user(proxy_gitlab_scoped_readonly):
+    """glab verifies its token via GET /api/v4/user; that call must pass on a
+    read-only scope and carry the real token, or `glab auth login` fails."""
+    req = urllib.request.Request(
+        proxy_gitlab_scoped_readonly["server_url"] + "/api/v4/user",
+        headers={"PRIVATE-TOKEN": "glpat-fake-token"},
+    )
+    data = json.loads(proxy_gitlab_scoped_readonly["opener"].open(req).read())
+    assert data["path"] == "/api/v4/user"
+    assert data["headers"].get("private-token") == "real-glpat-secret"
+
+
 def test_scoped_credential_never_reaches_upstream_on_denied_request(proxy_gitlab_scoped):
     """A request denied by policy must be stopped before CredentialBrokerAddon
     ever runs -- the real token must never reach upstream. EchoHandler.received

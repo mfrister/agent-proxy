@@ -383,6 +383,24 @@ class TestScopedGitLabRules:
         )
         assert isinstance(result, registries.Violation)
 
+    def test_current_user_allowed(self):
+        # glab auth login/status verifies the token via GET /api/v4/user.
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(scope, {}, "GET", "/api/v4/user")
+        assert isinstance(result, registries.Allowed)
+
+    @pytest.mark.parametrize("method,path", [
+        ("GET", "/api/v4/user?x=1"),
+        ("GET", "/api/v4/users"),
+        ("GET", "/api/v4/user/keys"),
+        ("GET", "/api/v4/users/1"),
+        ("PUT", "/api/v4/user"),
+    ])
+    def test_current_user_rule_is_exact(self, method, path):
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(scope, {"write": True}, method, path)
+        assert isinstance(result, registries.Violation)
+
     def test_write_gates_post_to_issues(self):
         scope = {"projects": ["team/backend"]}
         path = "/api/v4/projects/team%2Fbackend/issues"
