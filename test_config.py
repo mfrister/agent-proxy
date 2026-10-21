@@ -764,6 +764,56 @@ class TestScopedServiceExpansion:
         assert "authorization" in private.rules.request_headers
 
 
+class TestDisabledServices:
+    def test_disabled_service_is_dormant_not_in_hosts(self):
+        cfg = Config.from_data({"services": [
+            {"service": "github", "enabled": False,
+             "scope": {"repos": ["myorg/myrepo"]}, **GITHUB_CRED},
+            "go",
+        ]})
+        assert "api.github.com" not in cfg.hosts
+        assert "proxy.golang.org" in cfg.hosts
+        [entry] = cfg.dormant_services[("github", None)]["api.github.com"]
+        assert entry.rules.source == "github"
+        assert entry.credential.real_value == "token ghp_real"
+
+    def test_enabled_true_is_the_default(self):
+        cfg = Config.from_data({"services": [{"service": "go", "enabled": True}]})
+        assert "proxy.golang.org" in cfg.hosts
+        assert cfg.dormant_services == {}
+
+    def test_dormant_service_keyed_by_host(self):
+        cfg = Config.from_data({"services": [
+            {"service": "gitlab", "host": "gitlab.example.com", "enabled": False,
+             "scope": {"projects": ["team/backend"]},
+             "fake_value": "glpat-fake", "real_value": "glpat-real"},
+        ]})
+        assert set(cfg.dormant_services) == {("gitlab", "gitlab.example.com")}
+
+    def test_disabled_service_is_still_validated(self):
+        with pytest.raises(ValueError, match="must be scoped"):
+            Config.from_data({"services": [
+                {"service": "github", "enabled": False, **GITHUB_CRED},
+            ]})
+
+    def test_non_bool_enabled_rejected(self):
+        with pytest.raises(ValueError, match="'enabled' must be true or false"):
+            Config.from_data({"services": [{"service": "go", "enabled": "no"}]})
+
+    def test_dormant_credentials_still_listed_for_redaction(self):
+        cfg = Config.from_data({"services": [
+            {"service": "github", "enabled": False,
+             "scope": {"repos": ["myorg/myrepo"]}, **GITHUB_CRED},
+        ]})
+        assert [c.real_value for c in cfg.credentials] == ["token ghp_real"]
+
+    def test_apply_carries_dormant_services(self):
+        cfg = Config.from_data({"services": [{"service": "go", "enabled": False}]})
+        state = make_state(hosts={})
+        state.apply(cfg)
+        assert ("go", None) in state.dormant_services
+
+
 # ── config.default.yaml examples ─────────────────────────────────────────────
 
 def test_default_yaml_examples_are_valid(tmp_path):
