@@ -20,10 +20,8 @@ def mgmt(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text("hosts:\n  - host: existing.com\n")
 
-    state = make_state(
-        hosts={"existing.com": None},
-        config_path=str(config),
-    )
+    state = make_state(config_path=str(config))
+    state.reload()
     app = create_app(state)
     app.config["TESTING"] = True
     with app.test_client() as client:
@@ -40,6 +38,7 @@ def mgmt_secrets(mgmt, tmp_path):
         original = f.read()
     with open(config_path, "w") as f:
         f.write(f"secrets_file: {secrets}\n" + original)
+    mgmt._state.reload()
     mgmt._secrets_path = secrets
     return mgmt
 
@@ -318,24 +317,22 @@ class TestManagementAPI:
         assert real_token not in written
         assert "${GITHUB_TOKEN}" in written
 
-    def test_post_allow_permanent_rejects_without_touching_disk_or_state(self, mgmt):
-        # An unrelated bad section (e.g. a malformed credential) must not let
-        # this endpoint write a new host to disk while failing to update the
-        # in-memory host policy -- that would leave the two out of sync.
+    def test_post_allow_permanent_refuses_after_unreloaded_edit(self, mgmt):
+        # A hand edit not yet reloaded must neither be overwritten nor be
+        # applied as a side effect of this write.
         config_path = mgmt._state.config_path
-        with open(config_path) as f:
-            original = f.read()
-        bad = original + "credentials:\n  - host: api.example.com\n"
+        edited = "hosts:\n  - host: existing.com\n  - host: hand-added.com\n"
         with open(config_path, "w") as f:
-            f.write(bad)
+            f.write(edited)
 
         r = mgmt.post("/allow/permanent", json={"host": "new.com"})
 
-        assert r.status_code == 500
-        assert r.get_json()["ok"] is False
+        assert r.status_code == 409
+        assert "SIGHUP" in r.get_json()["error"]
         assert "new.com" not in mgmt._state.hosts
+        assert "hand-added.com" not in mgmt._state.hosts
         with open(config_path) as f:
-            assert f.read() == bad
+            assert f.read() == edited
 
 
 class TestServicesEndpoints:
@@ -460,16 +457,18 @@ class TestServicesEndpoints:
         mgmt.post("/services", json={"service": "npm"})
         assert mgmt.post("/services", json={"service": "npm"}).status_code == 409
 
-    def test_post_rolls_back_secret_when_validation_fails(self, mgmt_secrets):
-        # Break an unrelated config section after fixture setup, then attempt
-        # to add a credential service: the secret written before validation
-        # must be rolled back, and neither config nor state may change.
+    def test_post_rolls_back_secret_when_validation_fails(self, mgmt_secrets, monkeypatch):
+        # The secret is written before the final Config.from_data check; if
+        # that check fails, the secret must be rolled back, and neither
+        # config nor state may change.
+        import management_api
+
+        def reject(data):
+            raise ValueError("rejected")
+        monkeypatch.setattr(management_api.Config, "from_data", staticmethod(reject))
         config_path = mgmt_secrets._state.config_path
         with open(config_path) as f:
             original = f.read()
-        bad = original + "credentials:\n  - host: api.example.com\n"
-        with open(config_path, "w") as f:
-            f.write(bad)
 
         r = mgmt_secrets.post("/services", json={
             "service": "github", "real_value": "x", "unrestricted": True,
@@ -479,7 +478,7 @@ class TestServicesEndpoints:
         assert not mgmt_secrets._secrets_path.exists()
         assert mgmt_secrets._state.credentials == []
         with open(config_path) as f:
-            assert f.read() == bad
+            assert f.read() == original
 
     def test_put_rotates_secret_in_place(self, mgmt_secrets):
         mgmt_secrets.post("/services", json={
@@ -526,6 +525,7 @@ class TestServicesEndpoints:
         }]
         with open(config_path, "w") as f:
             yaml.safe_dump(data, f)
+        mgmt_secrets._state.reload()
 
         r = mgmt_secrets.delete("/services", json={"service": "github"})
         assert r.get_json()["ok"] is True
@@ -854,3 +854,72 @@ class TestServiceTempEnable:
         allowed = make_flow("registry.npmjs.org", path="/left-pad")
         addon.request(allowed)
         assert allowed.response is None
+
+
+class TestConfigInMemory:
+    """Reads come from the applied config; config.yaml is only read on load
+    and written back by the API."""
+
+    def _hand_edit(self, client, text):
+        with open(client._state.config_path, "w") as f:
+            f.write(text)
+
+    def test_get_services_reads_applied_config_not_disk(self, mgmt):
+        mgmt.post("/services", json={"service": "npm"})
+        self._hand_edit(mgmt, "services: [go]\n")
+        assert [r["service"] for r in mgmt.get("/services").get_json()] == ["npm"]
+
+    def test_get_services_survives_unparseable_config_file(self, mgmt):
+        mgmt.post("/services", json={"service": "npm"})
+        self._hand_edit(mgmt, "services: [npm\n")
+        r = mgmt.get("/services")
+        assert r.status_code == 200
+        assert [row["service"] for row in r.get_json()] == ["npm"]
+
+    def test_temp_enable_judges_enabled_by_applied_config(self, mgmt):
+        mgmt.post("/services", json={"service": "npm", "enabled": False})
+        # Enabled on disk, but not reloaded: still disabled in effect.
+        self._hand_edit(mgmt, "services: [npm]\n")
+        r = mgmt.post("/services/temp-enable", json={"service": "npm", "duration_seconds": 60})
+        assert r.status_code == 200
+
+    @pytest.mark.parametrize("method,path,body", [
+        ("post", "/allow/permanent", {"host": "new.com"}),
+        ("post", "/services", {"service": "npm"}),
+        ("put", "/services", {"service": "go", "enabled": False}),
+        ("delete", "/services", {"service": "go"}),
+    ])
+    def test_writes_refuse_after_unreloaded_edit(self, mgmt, method, path, body):
+        mgmt.post("/services", json={"service": "go"})
+        edited = "services: [go, pypi]\n"
+        self._hand_edit(mgmt, edited)
+        r = getattr(mgmt, method)(path, json=body)
+        assert r.status_code == 409
+        with open(mgmt._state.config_path) as f:
+            assert f.read() == edited
+        assert "pypi.org" not in mgmt._state.hosts
+
+    def test_write_proceeds_after_reload(self, mgmt):
+        self._hand_edit(mgmt, "services: [go]\n")
+        mgmt._state.reload()
+        r = mgmt.post("/services", json={"service": "npm"})
+        assert r.status_code == 200
+        assert _config_services(mgmt) == ["go", "npm"]
+        assert not mgmt._state.config_changed_on_disk()
+
+    def test_write_creates_missing_config_file(self, tmp_path):
+        from management_api import create_app
+        state = make_state(config_path=str(tmp_path / "config.yaml"))
+        state.reload()
+        client = create_app(state).test_client()
+        assert client.post("/services", json={"service": "npm"}).status_code == 200
+        with open(state.config_path) as f:
+            assert yaml.safe_load(f) == {"services": ["npm"]}
+
+    def test_first_token_with_not_yet_existing_secrets_file(self, mgmt_secrets):
+        assert not mgmt_secrets._secrets_path.exists()
+        r = mgmt_secrets.post("/services", json={
+            "service": "github", "real_value": "tok", "unrestricted": True,
+        })
+        assert r.status_code == 200
+        assert yaml.safe_load(mgmt_secrets._secrets_path.read_text()) == {"CRED_GITHUB": "tok"}

@@ -8,8 +8,14 @@ presets. Served in a background thread by ManagementApiAddon (see addon.py).
 Real credentials are write-only through this API: they are accepted on
 POST/PUT /services, persisted to the configured secrets_file, referenced from
 config.yaml as ${KEY}, and never returned by any endpoint.
+
+Endpoints read the applied config (ProxyState.raw_config), not config.yaml;
+writes go back to the file through ProxyState.commit, and are refused while
+the file holds an unreloaded hand edit.
 """
 
+import copy
+import functools
 import json
 import logging
 import os
@@ -90,6 +96,28 @@ def create_app(state: ProxyState) -> Flask:
     import flask.cli
     flask.cli.show_server_banner = lambda *_a, **_kw: None
 
+    # Reads use the applied config (state.raw_config), never config.yaml:
+    # the file is only read on load (startup, SIGHUP) and written back here.
+    def _config_write(view):
+        """Serialize a config-changing endpoint, and refuse it with 409 when
+        config.yaml was edited on disk since it was last loaded -- writing
+        the applied config back would silently discard that edit."""
+        @functools.wraps(view)
+        def wrapper(*args, **kwargs):
+            with state.config_lock:
+                if state.config_changed_on_disk():
+                    return jsonify({
+                        "ok": False,
+                        "error": f"{state.config_path} changed on disk since it was "
+                                 f"loaded; reload the proxy (SIGHUP) first",
+                    }), 409
+                return view(*args, **kwargs)
+        return wrapper
+
+    def _editable_config() -> dict:
+        """A copy of the applied config, as written, to modify and commit."""
+        return copy.deepcopy(state.raw_config)
+
     @app.get("/denied")
     def get_denied():
         with state.deny_lock:
@@ -133,13 +161,10 @@ def create_app(state: ProxyState) -> Flask:
         return jsonify({"ok": True})
 
     @app.post("/allow/permanent")
+    @_config_write
     def permanent_allow():
         host = flask_request.get_json(force=True)["host"]
-        try:
-            with open(state.config_path) as f:
-                data = yaml.safe_load(f) or {}
-        except FileNotFoundError:
-            data = {}
+        data = _editable_config()
         hosts = data.get("hosts", [])
 
         def entry_host(item):
@@ -179,22 +204,13 @@ def create_app(state: ProxyState) -> Flask:
             print(json.dumps({"event": "config_error", "message": str(e)}))
             return jsonify({"ok": False, "error": str(e)}), 500
 
-        with open(state.config_path, "w") as f:
-            yaml.safe_dump(new_data, f)
-        state.apply(config)
+        state.commit(new_data, config)
         # Promotion to permanent supersedes any temporary grant for this host.
         with state.temp_lock:
             state.temp_allows.pop(host, None)
         return jsonify({"ok": True})
 
     # ── Service presets ────────────────────────────────────────────────────
-
-    def _read_config():
-        try:
-            with open(state.config_path) as f:
-                return yaml.safe_load(f) or {}
-        except FileNotFoundError:
-            return {}
 
     def _read_secrets(path):
         """(parsed dict, original file text or None if the file is missing)."""
@@ -255,9 +271,8 @@ def create_app(state: ProxyState) -> Flask:
 
     @app.get("/services")
     def get_services():
-        data = _read_config()
         views = []
-        for entry in data.get("services") or []:
+        for entry in state.raw_config.get("services") or []:
             view = _redacted_view(entry)
             until = None if view["enabled"] else _temp_enabled_until(_service_key(entry))
             if until is not None:
@@ -278,11 +293,14 @@ def create_app(state: ProxyState) -> Flask:
         if not duration > 0:
             return jsonify({"ok": False, "error": "duration_seconds must be positive"}), 400
 
-        entry = next((e for e in _read_config().get("services") or []
-                      if _service_key(e) == key), None)
-        if entry is None:
+        # Under config_lock, so both checks see the same applied config.
+        with state.config_lock:
+            configured = any(_service_key(e) == key
+                             for e in state.raw_config.get("services") or [])
+            dormant = key in state.dormant_services
+        if not configured:
             return jsonify({"ok": False, "error": "service not configured"}), 404
-        if _redacted_view(entry)["enabled"]:
+        if not dormant:
             return jsonify({"ok": False, "error": "service is already enabled"}), 409
 
         expires = time.time() + duration
@@ -291,6 +309,7 @@ def create_app(state: ProxyState) -> Flask:
         return jsonify({"ok": True, "expires": expires})
 
     @app.post("/services")
+    @_config_write
     def add_service():
         body = flask_request.get_json(force=True)
         name = body.get("service")
@@ -306,7 +325,7 @@ def create_app(state: ProxyState) -> Flask:
         except ValueError as e:
             return jsonify({"ok": False, "error": str(e)}), 400
 
-        data = _read_config()
+        data = _editable_config()
         entries = list(data.get("services") or [])
         if any(_service_key(e) == (name, host) for e in entries):
             return jsonify({"ok": False, "error": "service already configured"}), 409
@@ -399,12 +418,11 @@ def create_app(state: ProxyState) -> Flask:
             print(json.dumps({"event": "config_error", "message": str(e)}))
             return jsonify({"ok": False, "error": str(e)}), 500
 
-        with open(state.config_path, "w") as f:
-            yaml.safe_dump(new_data, f)
-        state.apply(config)
+        state.commit(new_data, config)
         return jsonify({"ok": True, "service": _redacted_view(new_entry)})
 
     @app.put("/services")
+    @_config_write
     def edit_service():
         """Rotate a service's token, edit its scope and/or toggle `enabled`
         -- one verb, since all are "change a field on an existing entry,
@@ -428,7 +446,7 @@ def create_app(state: ProxyState) -> Flask:
         if ("scope" in body or "unrestricted" in body) and not (preset and preset.scope_params):
             return jsonify({"ok": False, "error": f"{name} does not support scoping"}), 400
 
-        data = _read_config()
+        data = _editable_config()
         entries = list(data.get("services") or [])
         idx = next(
             (i for i, e in enumerate(entries) if _service_key(e) == (name, host)), None
@@ -518,20 +536,19 @@ def create_app(state: ProxyState) -> Flask:
             print(json.dumps({"event": "config_error", "message": str(e)}))
             return jsonify({"ok": False, "error": str(e)}), 500
 
-        with open(state.config_path, "w") as f:
-            yaml.safe_dump(new_data, f)
-        state.apply(config)
+        state.commit(new_data, config)
         if "enabled" in body:
             # An explicit toggle supersedes any temporary enable.
             _clear_temp_enable((name, host))
         return jsonify({"ok": True, "service": _redacted_view(new_entry)})
 
     @app.delete("/services")
+    @_config_write
     def remove_service():
         body = flask_request.get_json(force=True)
         name, host = body.get("service"), body.get("host")
 
-        data = _read_config()
+        data = _editable_config()
         entries = list(data.get("services") or [])
         entry = next((e for e in entries if _service_key(e) == (name, host)), None)
         if entry is None:
@@ -544,9 +561,7 @@ def create_app(state: ProxyState) -> Flask:
             print(json.dumps({"event": "config_error", "message": str(e)}))
             return jsonify({"ok": False, "error": str(e)}), 500
 
-        with open(state.config_path, "w") as f:
-            yaml.safe_dump(new_data, f)
-        state.apply(config)
+        state.commit(new_data, config)
         _clear_temp_enable((name, host))
 
         # The entry is gone from the config; scrub its secret, unless another
