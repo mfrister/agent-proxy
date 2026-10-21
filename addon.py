@@ -80,7 +80,7 @@ class AllowlistAddon:
     flow.metadata["host_entry"] for CredentialBrokerAddon and
     ResponseCookieFilterAddon, and the full list considered on
     flow.metadata["host_entries"]. A denial reports the first entry that rejected
-    the request.
+    the request, and names any disabled service that would have permitted it.
     """
 
     def __init__(self, state: ProxyState):
@@ -93,9 +93,9 @@ class AllowlistAddon:
         entries = list(s.hosts.get(host, ()))
         with s.temp_lock:
             now = time.time()
-            for key, exp in s.temp_services.items():
-                if now < exp:
-                    entries.extend(s.dormant_services.get(key, {}).get(host, ()))
+            active = {key for key, exp in s.temp_services.items() if now < exp}
+            for key in active:
+                entries.extend(s.dormant_services.get(key, {}).get(host, ()))
             exp = s.temp_allows.get(host)
             if exp and now < exp:
                 # Temp-allow grants access, not a cookie policy: keep whatever
@@ -122,16 +122,7 @@ class AllowlistAddon:
             if entry.rules is None:
                 flow.metadata["host_entry"] = entry
                 return
-            verdict = registries.evaluate(
-                entry.rules,
-                method=flow.request.method,
-                path_with_query=flow.request.path,
-                headers=flow.request.headers,
-                # raw_content is the buffered body mitmproxy actually forwards;
-                # the client-supplied Content-Length header can lie.
-                body_len=len(flow.request.raw_content or b""),
-                content_type=flow.request.headers.get("content-type"),
-            )
+            verdict = self._evaluate(entry, flow)
             if isinstance(verdict, registries.Allowed):
                 self._apply_scrubbing(flow, verdict)
                 flow.metadata["host_entry"] = entry
@@ -141,6 +132,47 @@ class AllowlistAddon:
                 rejection = (entry, verdict)
 
         self._deny_violation(flow, *rejection)
+
+    @staticmethod
+    def _evaluate(entry: HostEntry, flow: HTTPFlow):
+        return registries.evaluate(
+            entry.rules,
+            method=flow.request.method,
+            path_with_query=flow.request.path,
+            headers=flow.request.headers,
+            # raw_content is the buffered body mitmproxy actually forwards;
+            # the client-supplied Content-Length header can lie.
+            body_len=len(flow.request.raw_content or b""),
+            content_type=flow.request.headers.get("content-type"),
+        )
+
+    def _permits(self, entry: HostEntry, flow: HTTPFlow) -> bool:
+        return entry.rules is None or isinstance(self._evaluate(entry, flow), registries.Allowed)
+
+    def _disabled_services(self, flow: HTTPFlow) -> list:
+        """Disabled services (not temporarily enabled either) that would
+        permit this request."""
+        s = self.state
+        host = flow.request.pretty_host
+        with s.temp_lock:
+            now = time.time()
+            active = {key for key, exp in s.temp_services.items() if now < exp}
+        return [
+            key for key, dormant in s.dormant_services.items()
+            if key not in active
+            and any(self._permits(e, flow) for e in dormant.get(host, ()))
+        ]
+
+    def _log_denial(self, flow: HTTPFlow, entry: dict) -> None:
+        # Name the disabled services that would have permitted the request,
+        # so the operator can enable one instead of opening the whole host.
+        disabled = self._disabled_services(flow)
+        if disabled:
+            entry["disabled_services"] = [
+                {"service": name, **({"host": h} if h else {})} for name, h in disabled
+            ]
+        with self.state.deny_lock:
+            self.state.deny_log.append(entry)
 
     def _deny_pending(self, flow: HTTPFlow):
         host = flow.request.pretty_host
@@ -156,8 +188,7 @@ class AllowlistAddon:
             "method": flow.request.method,
             "type": "pending_approval",
         }
-        with self.state.deny_lock:
-            self.state.deny_log.append(entry)
+        self._log_denial(flow, entry)
 
     def _deny_violation(self, flow: HTTPFlow, host_entry: HostEntry, verdict):
         host = flow.request.pretty_host
@@ -178,8 +209,7 @@ class AllowlistAddon:
             "type": "policy_violation",
             "reason": verdict.reason,
         }
-        with self.state.deny_lock:
-            self.state.deny_log.append(entry)
+        self._log_denial(flow, entry)
         print(json.dumps({
             "event": "registry_policy_violation",
             "host": host,

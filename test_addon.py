@@ -702,6 +702,71 @@ class TestTemporarilyEnabledServices:
         assert flow.request.headers["Authorization"] == GH_FAKE
 
 
+class TestDenialNamesDisabledServices:
+    IN_SCOPE = "/repos/myorg/myrepo/issues"
+    OUT_OF_SCOPE = "/repos/otherorg/secret/issues"
+
+    def _deny(self, state, path):
+        flow = run_pipeline(state, make_flow(
+            "api.github.com", path=path, headers={"Authorization": GH_FAKE}))
+        assert flow.response.status_code == 503
+        return state.deny_log[-1]
+
+    def test_pending_denial_names_permitting_disabled_service(self):
+        entry = self._deny(state_from(dormant_github_config()), self.IN_SCOPE)
+        assert entry["type"] == "pending_approval"
+        assert entry["disabled_services"] == [{"service": "github"}]
+
+    def test_violation_denial_names_permitting_disabled_service(self):
+        from config import Config
+        cfg = Config.from_data({
+            "services": [{"service": "github", "enabled": False,
+                          "unrestricted": True,
+                          "fake_value": "ghp_fake", "real_value": "ghp_real"}],
+            "hosts": [{"host": "api.github.com",
+                       "rules": [{"methods": ["GET"], "path": "/public"}]}],
+        })
+        entry = self._deny(state_from(cfg), self.OUT_OF_SCOPE)
+        assert entry["type"] == "policy_violation"
+        assert entry["disabled_services"] == [{"service": "github"}]
+
+    def test_disabled_service_out_of_its_scope_not_named(self):
+        entry = self._deny(state_from(dormant_github_config()), self.OUT_OF_SCOPE)
+        assert "disabled_services" not in entry
+
+    def test_temp_enabled_service_not_named(self):
+        # Already enabled for now -- the denial is its own scope's, not a
+        # missing enable.
+        state = state_from(dormant_github_config(),
+                           temp_services={("github", None): time.time() + 60})
+        entry = self._deny(state, self.OUT_OF_SCOPE)
+        assert "disabled_services" not in entry
+
+    def test_expired_temp_enable_named_again(self):
+        state = state_from(dormant_github_config(),
+                           temp_services={("github", None): time.time() - 1})
+        entry = self._deny(state, self.IN_SCOPE)
+        assert entry["disabled_services"] == [{"service": "github"}]
+
+    def test_self_hosted_service_named_with_host(self):
+        from config import Config
+        cfg = Config.from_data({"services": [{
+            "service": "gitlab", "host": "gl.example.com", "enabled": False,
+            "unrestricted": True,
+            "fake_value": "glpat-fake", "real_value": "glpat-real",
+        }]})
+        state = state_from(cfg)
+        run_pipeline(state, make_flow("gl.example.com", path="/api/v4/projects"))
+        assert state.deny_log[-1]["disabled_services"] == [
+            {"service": "gitlab", "host": "gl.example.com"},
+        ]
+
+    def test_unrelated_denial_has_no_field(self):
+        state = state_from(dormant_github_config())
+        run_pipeline(state, make_flow("evil.com"))
+        assert "disabled_services" not in state.deny_log[-1]
+
+
 # ── LoggingAddon ───────────────────────────────────────────────────────────────
 
 class TestLoggingAddon:
