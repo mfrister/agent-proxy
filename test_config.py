@@ -814,6 +814,64 @@ class TestDisabledServices:
         assert ("go", None) in state.dormant_services
 
 
+class TestRawConfigAndDigest:
+    def test_raw_keeps_secret_references_unexpanded(self, tmp_path):
+        secrets = tmp_path / "secrets.yaml"
+        secrets.write_text("TOKEN: the-real-secret\n")
+        data = {"secrets_file": str(secrets), "services": [{
+            "service": "github", "unrestricted": True,
+            "fake_value": "ghp_fake", "real_value": "${TOKEN}",
+        }]}
+        cfg = Config.from_data(data)
+        assert cfg.raw == data
+        assert "the-real-secret" not in json.dumps(cfg.raw)
+
+    def test_raw_is_a_copy(self):
+        data = {"hosts": ["a.com"]}
+        cfg = Config.from_data(data)
+        data["hosts"].append("b.com")
+        assert cfg.raw == {"hosts": ["a.com"]}
+
+    def test_load_records_file_digest(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text("hosts: [a.com]\n")
+        cfg = Config.load(str(path))
+        assert cfg.raw == {"hosts": ["a.com"]}
+        assert cfg.source_digest is not None
+        assert Config.load(str(tmp_path / "missing.yaml")).source_digest is None
+
+    def test_changed_on_disk_detects_unreloaded_edit(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text("hosts: [a.com]\n")
+        state = make_state(config_path=str(path))
+        state.reload()
+        assert not state.config_changed_on_disk()
+        path.write_text("hosts: [a.com, b.com]\n")
+        assert state.config_changed_on_disk()
+        state.reload()
+        assert not state.config_changed_on_disk()
+        assert state.raw_config == {"hosts": ["a.com", "b.com"]}
+
+    def test_missing_file_is_unchanged_until_created(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        state = make_state(config_path=str(path))
+        state.reload()
+        assert not state.config_changed_on_disk()
+        path.write_text("hosts: [a.com]\n")
+        assert state.config_changed_on_disk()
+
+    def test_commit_writes_applies_and_tracks_digest(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        state = make_state(config_path=str(path), hosts={})
+        state.reload()
+        data = {"hosts": ["a.com"]}
+        state.commit(data, Config.from_data(data))
+        assert yaml.safe_load(path.read_text()) == data
+        assert "a.com" in state.hosts
+        assert state.raw_config == data
+        assert not state.config_changed_on_disk()
+
+
 # ── config.default.yaml examples ─────────────────────────────────────────────
 
 def test_default_yaml_examples_are_valid(tmp_path):

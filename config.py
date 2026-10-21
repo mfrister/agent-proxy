@@ -10,7 +10,9 @@ covered in that same file's "Credential presets" section.
 """
 
 import collections
+import copy
 import dataclasses
+import hashlib
 import json
 import re
 import threading
@@ -229,6 +231,12 @@ class Config:
     dormant_services: dict[ServiceKey, dict[str, list[HostEntry]]] = field(default_factory=dict)
     management_port: int = 8082
     happy_eyeballs_delay: float = 0.25
+    # The config as written (before ${KEY} expansion), for the management
+    # API to show and edit -- the fields above are compiled from it.
+    raw: dict = field(default_factory=dict, compare=False)
+    # sha256 of the file this was loaded from (None: built from data, or the
+    # file was missing), to detect edits made on disk since.
+    source_digest: str | None = None
 
     @property
     def credentials(self) -> list[Credential]:
@@ -243,15 +251,16 @@ class Config:
     @classmethod
     def load(cls, path: str) -> "Config":
         try:
-            with open(path) as f:
-                data = yaml.safe_load(f) or {}
+            with open(path, "rb") as f:
+                content = f.read()
         except FileNotFoundError:
             print(json.dumps({
                 "event": "config_warning",
                 "message": f"config file not found: {path}; starting with empty config (deny-all)",
             }))
-            data = {}
-        return cls.from_data(data)
+            return cls.from_data({})
+        config = cls.from_data(yaml.safe_load(content) or {})
+        return dataclasses.replace(config, source_digest=_digest(content))
 
     @classmethod
     def from_data(cls, data: dict) -> "Config":
@@ -261,6 +270,7 @@ class Config:
         checking a rewritten config.yaml) before persisting it, instead of
         writing first and finding out it doesn't load.
         """
+        raw = copy.deepcopy(data)
         secrets = {}
         secrets_path = data.get("secrets_file")
         if secrets_path:
@@ -490,9 +500,22 @@ class Config:
                 dormant_services=dormant_services,
                 management_port=int(data.get("management_port", 8082)),
                 happy_eyeballs_delay=float(data.get("happy_eyeballs_delay", 0.25) or 0),
+                raw=raw,
             )
         except ValueError as e:
             raise ValueError(_redact_known_secrets(str(e), secrets)) from None
+
+
+def _digest(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _file_digest(path: str) -> str | None:
+    try:
+        with open(path, "rb") as f:
+            return _digest(f.read())
+    except FileNotFoundError:
+        return None
 
 
 @dataclass
@@ -507,6 +530,14 @@ class ProxyState:
     temp_lock: threading.Lock = field(default_factory=threading.Lock)
     deny_log: collections.deque = field(default_factory=lambda: collections.deque(maxlen=1000))
     deny_lock: threading.Lock = field(default_factory=threading.Lock)
+    # The applied config as written, and the digest of the file it came from
+    # (see Config.raw / Config.source_digest). Everything but loading and
+    # writing back reads these, never the file.
+    raw_config: dict = field(default_factory=dict)
+    config_digest: str | None = None
+    # Serializes config changes: reload() and the management API's
+    # read-modify-write-apply sequences.
+    config_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def apply(self, config: Config) -> None:
         """Swap in a validated config.
@@ -519,7 +550,25 @@ class ProxyState:
         self.hosts = dict(config.hosts)
         self.dormant_services = dict(config.dormant_services)
         self.credentials = list(config.credentials)
+        self.raw_config = config.raw
+        self.config_digest = config.source_digest
 
     def reload(self) -> None:
-        """Re-read the config file and apply it. Shared by SIGHUP and the API."""
-        self.apply(Config.load(self.config_path))
+        """Re-read the config file and apply it (SIGHUP)."""
+        with self.config_lock:
+            self.apply(Config.load(self.config_path))
+
+    def config_changed_on_disk(self) -> bool:
+        """Whether the config file differs from what was last loaded or
+        written -- a hand edit not yet reloaded, which a write would
+        otherwise overwrite."""
+        return _file_digest(self.config_path) != self.config_digest
+
+    def commit(self, data: dict, config: Config) -> None:
+        """Write `data` (already validated as `config`) to the config file
+        and apply it. The caller holds config_lock and has checked
+        config_changed_on_disk()."""
+        content = yaml.safe_dump(data).encode()
+        with open(self.config_path, "wb") as f:
+            f.write(content)
+        self.apply(dataclasses.replace(config, source_digest=_digest(content)))
