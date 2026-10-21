@@ -38,7 +38,10 @@ An entry with `enabled: false` is validated and expanded the same way but
 grants nothing: its config (scope, flags, token reference) stays put until
 it's switched back on, or temporarily enabled from the TUI or
 `POST /services/temp-enable` — an in-memory grant that ends on expiry,
-restart, or an explicit toggle.
+restart, or an explicit toggle. A denied request that a disabled service
+would have permitted is logged with that service under `disabled_services`,
+and the TUI's `e` key enables it for the selected duration straight from
+the denied row.
 
 Presets are descriptors (`services.py`), expanded at config load into the
 proxy's existing primitives — the unified `hosts:` policy (unrestricted or
