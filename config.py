@@ -33,6 +33,7 @@ class HostConfig:
 # (e.g. "wrtie: true") is a hard error instead of a silently-ignored no-op.
 _SERVICE_ENTRY_KEYS = frozenset({
     "service", "host", "scope", "unrestricted", "real_value", "fake_value", "allow_host",
+    "enabled",
 })
 
 
@@ -207,6 +208,11 @@ def _host_entry(rules, credential, host_config) -> HostEntry:
     return HostEntry(rules=rules, host_config=host_config, credential=credential)
 
 
+# Identity of a `services:` entry: (service name, host or None). The
+# management API addresses services by the same pair.
+ServiceKey = tuple[str, str | None]
+
+
 @dataclass(frozen=True)
 class Config:
     """A complete, validated proxy configuration.
@@ -217,14 +223,21 @@ class Config:
     """
 
     hosts: dict[str, list[HostEntry]]
+    # `enabled: false` services, fully validated and expanded but not in
+    # `hosts` -- a temporary enable (ProxyState.temp_services) adds their
+    # entries at request time.
+    dormant_services: dict[ServiceKey, dict[str, list[HostEntry]]] = field(default_factory=dict)
     management_port: int = 8082
     happy_eyeballs_delay: float = 0.25
 
     @property
     def credentials(self) -> list[Credential]:
         """Every entry's credential, flattened (for redaction, counts and the
-        management API -- brokering itself goes through the matched entry)."""
-        return [e.credential for entries in self.hosts.values()
+        management API -- brokering itself goes through the matched entry).
+        Includes dormant services' credentials, so a disabled service's real
+        token is still redacted."""
+        host_maps = [self.hosts, *self.dormant_services.values()]
+        return [e.credential for hosts in host_maps for entries in hosts.values()
                 for e in entries if e.credential is not None]
 
     @classmethod
@@ -290,6 +303,7 @@ class Config:
             # registries don't need them, and Set-Cookie is a session/tracking
             # channel into the sandbox.
             hosts = {}
+            dormant_services = {}
             for i, entry in enumerate(data.get("services") or []):
                 if isinstance(entry, str):
                     entry = {"service": entry}
@@ -437,9 +451,14 @@ class Config:
                         f"services[{i}] ({name}): preset produced no entry for its "
                         f"credential's host {cred_host!r}"
                     )
+                # A disabled entry is validated and expanded all the same, so
+                # enabling it (permanently or temporarily) can't fail later.
+                target = hosts
+                if not require_bool(entry, "enabled", True):
+                    target = dormant_services.setdefault((name, resolved_host), {})
                 for host, rules in preset_hosts.items():
                     host_cred = credential if host == cred_host else None
-                    hosts.setdefault(host, []).append(_host_entry(
+                    target.setdefault(host, []).append(_host_entry(
                         rules, host_cred,
                         HostConfig(allow_response_cookies=[] if rules is not None else None),
                     ))
@@ -468,6 +487,7 @@ class Config:
 
             return cls(
                 hosts=hosts,
+                dormant_services=dormant_services,
                 management_port=int(data.get("management_port", 8082)),
                 happy_eyeballs_delay=float(data.get("happy_eyeballs_delay", 0.25) or 0),
             )
@@ -481,7 +501,9 @@ class ProxyState:
     hosts: dict[str, list[HostEntry]] = field(default_factory=dict)
     credentials: list[Credential] = field(default_factory=list)
     management_port: int = 8082
+    dormant_services: dict[ServiceKey, dict[str, list[HostEntry]]] = field(default_factory=dict)
     temp_allows: dict[str, float] = field(default_factory=dict)  # host -> expires_at (epoch)
+    temp_services: dict[ServiceKey, float] = field(default_factory=dict)  # -> expires_at (epoch)
     temp_lock: threading.Lock = field(default_factory=threading.Lock)
     deny_log: collections.deque = field(default_factory=lambda: collections.deque(maxlen=1000))
     deny_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -495,6 +517,7 @@ class ProxyState:
         the API server is already bound; the port is set once at construction.
         """
         self.hosts = dict(config.hosts)
+        self.dormant_services = dict(config.dormant_services)
         self.credentials = list(config.credentials)
 
     def reload(self) -> None:
