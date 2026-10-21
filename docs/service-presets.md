@@ -330,7 +330,7 @@ leaked push credential cannot be exercised through the proxy.
 | `pypi` | `pypi.org`, `files.pythonhosted.org` | Simple index (PEP 503), JSON API, and package files. |
 | `crates` | `index.crates.io`, `crates.io`, `static.crates.io` | Sparse index, the API download endpoint, and `.crate` files. |
 | `github` | `api.github.com`, scoped to `scope.repos`/`scope.orgs` | Repo metadata, contents, commits, branches, pulls, issues, and git refs/trees/blobs (read-only). `write: true` adds issue/PR/comment POST/PATCH; `graphql: true` adds unscoped `POST /graphql`. |
-| `gitlab` | the entry's `host:`, scoped to `scope.projects`/`scope.groups` | The `/api/v4/projects/{id}` equivalent of the above: files, commits, branches, merge requests, issues, repository tree/blobs (read-only), plus the token's own user (`GET /api/v4/user`, which `glab auth login`/`auth status` need). `write: true` adds issue/MR/note POST/PUT. |
+| `gitlab` | the entry's `host:`, scoped to `scope.projects`/`scope.groups` | The `/api/v4/projects/{id}` equivalent of the above: files, commits, branches, merge requests, issues (with `glab issue list`'s filter parameters) and issue comments, repository tree/blobs (read-only), plus the token's own user (`GET /api/v4/user`, which `glab auth login`/`auth status` need). `write: true` adds issue/MR/note POST/PUT. |
 
 Rule definitions live in `registries.py` (`PRESETS`) for registry presets and
 in `services.py` (`_github_rules`, `_gitlab_rules`) for the API presets; git
@@ -348,6 +348,12 @@ history for either is the audit trail for policy changes.
   (see "Why `POST /graphql` is denied by default" above). `gh api
   repos/<owner>/<repo>/pulls` and other REST-shaped `gh api` calls against an
   in-scope repo work normally.
+- **Some `glab issue` options are not covered by a scoped `gitlab` service.**
+  `--attach` (a binary upload to `/uploads`), `issue delete`, `--group` and
+  `--epic` listings (group endpoints, outside the project scope),
+  `--linked-issues`, and `--assignee`/`--author <username>` (an instance-wide
+  `/users` lookup) are denied; `--assignee=@me`, `@none` and `@any` work.
+  Search terms, label and milestone names are limited to printable ASCII.
 - If a preset pattern turns out too tight for a legitimate workflow, the
   violation shows up in the TUI; temp-allowing the host is the immediate
   escape hatch, and a custom `hosts:` entry (added alongside the preset's

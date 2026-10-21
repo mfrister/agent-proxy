@@ -491,10 +491,13 @@ def test_temp_allow_lifts_restrictions(proxy_restricted_fn):
 # write-gated POST with a body, and the always-deny-by-default `/graphql`.
 
 def test_scoped_in_scope_path_passes(proxy_gitlab_scoped):
-    resp = proxy_gitlab_scoped["opener"].open(
-        proxy_gitlab_scoped["server_url"] + "/api/v4/projects/acme%2Fwebapp/issues")
+    # The query glab issue list sends by default, so the query whitelist is
+    # exercised through the real proxy as well as the path.
+    path = ("/api/v4/projects/acme%2Fwebapp/issues?in=title%2Cdescription"
+            "&order_by=created_at&page=1&per_page=30&sort=desc&state=opened")
+    resp = proxy_gitlab_scoped["opener"].open(proxy_gitlab_scoped["server_url"] + path)
     data = json.loads(resp.read())
-    assert data["path"] == "/api/v4/projects/acme%2Fwebapp/issues"
+    assert data["path"] == path
 
 
 def test_scoped_out_of_scope_path_503(proxy_gitlab_scoped):

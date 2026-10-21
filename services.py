@@ -171,6 +171,20 @@ GL_PATH = rf"(?:{GL_SEG}(?:(?:/|%2[fF]){GL_SEG}){{0,20}})?"
 GL_STATE = r"opened|closed|merged|all"
 GL_PER_PAGE = r"[1-9][0-9]{0,2}"
 GL_PAGE = r"[1-9][0-9]{0,3}"
+GL_ID = r"\d{1,10}"                        # user/iteration/milestone id
+GL_BOOL = r"true|false"
+GL_SORT = r"asc|desc"
+GL_TIMESTAMP = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})"
+# free text (search term, milestone title) and label names: explicit ASCII
+# classes, so an unusual character fails closed rather than widening the
+# channel. A label list is comma-separated, so a label name excludes ','.
+GL_TEXT = r"[A-Za-z0-9 _.,:;#@!?'()&+/-]{1,255}"
+GL_LABEL = r"[A-Za-z0-9 _.:;#@!?'()&+/-]{1,255}"
+GL_LABELS = rf"{GL_LABEL}(?:,{GL_LABEL}){{0,19}}"
+GL_ISSUE_ORDER = (r"created_at|updated_at|priority|due_date|relative_position|"
+                  r"label_priority|milestone_due|popularity|weight|title")
+GL_ISSUE_IN = r"title|description|title,description|description,title"
+GL_ISSUE_TYPE = r"issue|incident|test_case|task"
 
 _WRITE_BODY = dict(allow_body=True, max_body_bytes=65_536,
                     content_types=["application/json"])
@@ -258,7 +272,10 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
         # and for assignee lookups. Fixed path, no query, GET/HEAD only, and
         # it returns the token owner rather than any project data.
         registries._r("/api/v4/user"),
-        registries._r(base, allow_percent=True),
+        # glab issue create fetches the project with these flags first.
+        registries._r(base, query={"license": GL_BOOL, "statistics": GL_BOOL,
+                                   "with_custom_attributes": GL_BOOL},
+                      allow_percent=True),
         registries._r(f"{base}/repository/files/{GL_PATH}",
                       query={"ref": GL_REF}, allow_percent=True),
         registries._r(f"{base}/repository/commits",
@@ -272,10 +289,28 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
                       query={"state": GL_STATE, "per_page": GL_PER_PAGE, "page": GL_PAGE},
                       allow_percent=True),
         registries._r(f"{base}/merge_requests/{GL_IID}", allow_percent=True),
+        # glab issue list always sends in/order_by/sort; the rest are its
+        # filter flags (--search, --label, --assignee, --created-after, ...).
         registries._r(f"{base}/issues",
-                      query={"state": GL_STATE, "per_page": GL_PER_PAGE, "page": GL_PAGE},
+                      query={"state": GL_STATE, "per_page": GL_PER_PAGE, "page": GL_PAGE,
+                             "in": GL_ISSUE_IN, "order_by": GL_ISSUE_ORDER,
+                             "sort": GL_SORT, "search": GL_TEXT,
+                             "labels": GL_LABELS, "not[labels]": GL_LABELS,
+                             "milestone": GL_TEXT, "confidential": GL_BOOL,
+                             "issue_type": GL_ISSUE_TYPE, "iteration_id": GL_ID,
+                             "assignee_id": rf"{GL_ID}|None|Any",
+                             "not[assignee_id]": GL_ID,
+                             "author_id": GL_ID, "not[author_id]": GL_ID,
+                             "created_after": GL_TIMESTAMP,
+                             "created_before": GL_TIMESTAMP,
+                             "updated_after": GL_TIMESTAMP,
+                             "updated_before": GL_TIMESTAMP},
                       allow_percent=True),
         registries._r(f"{base}/issues/{GL_IID}", allow_percent=True),
+        registries._r(f"{base}/issues/{GL_IID}/notes",
+                      query={"sort": GL_SORT, "order_by": "created_at|updated_at",
+                             "per_page": GL_PER_PAGE, "page": GL_PAGE},
+                      allow_percent=True),
         registries._r(f"{base}/repository/tree",
                       query={"ref": GL_REF, "path": GL_PATH, "per_page": GL_PER_PAGE,
                              "page": GL_PAGE},
