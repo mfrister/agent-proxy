@@ -117,15 +117,28 @@ class TestConfigLoad:
         with pytest.raises(KeyError, match="MISSING_KEY"):
             Config.load(str(config))
 
-    def test_missing_secrets_file_raises(self, tmp_path):
+    def test_missing_secrets_file_raises_when_referenced(self, tmp_path):
         from config import Config
         config = tmp_path / "config.yaml"
         config.write_text(
             "secrets_file: /nonexistent/secrets.yaml\n"
-            "hosts: []\n"
+            "hosts:\n"
+            "  - host: api.example.com\n"
+            "    credential: {header: Authorization, real_value: '${TOKEN}'}\n"
         )
-        with pytest.raises(FileNotFoundError):
+        with pytest.raises(FileNotFoundError, match="/nonexistent/secrets.yaml.*TOKEN"):
             Config.load(str(config))
+
+    def test_missing_secrets_file_loads_when_unreferenced(self, tmp_path):
+        # Before the first token is stored through the management API, the
+        # configured secrets_file need not exist yet.
+        from config import Config
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            "secrets_file: /nonexistent/secrets.yaml\n"
+            "hosts: [api.example.com]\n"
+        )
+        assert "api.example.com" in Config.load(str(config)).hosts
 
     def test_no_secrets_file_plain_values_unchanged(self, tmp_path):
         from config import Config
