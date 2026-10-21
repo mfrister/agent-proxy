@@ -467,6 +467,24 @@ class TestScopedGitLabRules:
                               content_type="application/json")
         assert isinstance(result, registries.Violation)
 
+    def test_milestone_lookup_by_title_allowed(self):
+        # --milestone <title> on glab issue create/update
+        scope = {"projects": ["team/backend"]}
+        path = ("/api/v4/projects/team%2Fbackend/milestones"
+                "?include_parent_milestones=true&per_page=30&title=Release+2.0")
+        result = _gitlab_eval(scope, {}, "GET", path)
+        assert isinstance(result, registries.Allowed)
+
+    @pytest.mark.parametrize("path", [
+        "/api/v4/projects/team%2Fbackend/milestones?search=x",
+        "/api/v4/projects/team%2Fbackend/milestones/3",
+        "/api/v4/projects/other%2Fproject/milestones?title=Release+2.0",
+    ])
+    def test_milestone_lookup_other_shapes_denied(self, path):
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(scope, {}, "GET", path)
+        assert isinstance(result, registries.Violation)
+
     def test_project_fetch_with_glab_create_flags_allowed(self):
         # glab issue create fetches the project before posting anything.
         scope = {"projects": ["team/backend"]}

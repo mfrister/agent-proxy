@@ -307,6 +307,14 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
                              "updated_before": GL_TIMESTAMP},
                       allow_percent=True),
         registries._r(f"{base}/issues/{GL_IID}", allow_percent=True),
+        # --milestone <title> on glab issue create/update resolves the title
+        # to an id here (include_parent_milestones is the pre-16.7 spelling).
+        registries._r(f"{base}/milestones",
+                      query={"title": GL_TEXT, "state": "active|closed",
+                             "include_parent_milestones": GL_BOOL,
+                             "include_ancestors": GL_BOOL,
+                             "per_page": GL_PER_PAGE, "page": GL_PAGE},
+                      allow_percent=True),
         registries._r(f"{base}/issues/{GL_IID}/notes",
                       query={"sort": GL_SORT, "order_by": "created_at|updated_at",
                              "per_page": GL_PER_PAGE, "page": GL_PAGE},
