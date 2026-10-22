@@ -62,6 +62,17 @@ def host_header_mismatch(flow: HTTPFlow) -> str | None:
     return None
 
 
+def sni_mismatch(flow: HTTPFlow) -> str | None:
+    """Return the client's TLS SNI if it names something other than the real
+    destination host, else None. mitmproxy sends the client's SNI upstream
+    (and verifies the upstream cert against it), so a front that routes by
+    SNI would deliver the request to the host it names."""
+    sni = flow.client_conn.sni
+    if sni is not None and sni.lower() != flow.request.host.lower():
+        return sni
+    return None
+
+
 # ── Happy eyeballs ───────────────────────────────────────────────────────────────
 
 def happy_eyeballs_supported(version: tuple = None) -> bool:
@@ -124,36 +135,15 @@ class AllowlistAddon:
         host = dest_host(flow)
         s = self.state
 
+        # Upstreams (CDNs, vhosts) may route by Host or SNI, so a mismatch
+        # means our policy decision might not describe where the request lands.
         claimed = host_header_mismatch(flow)
         if claimed is not None:
-            # Upstreams (CDNs, vhosts) may route by Host, so a mismatch means
-            # our policy decision might not describe where the request lands.
-            # Unlike other denials no approval can fix this: answer 403.
-            flow.response = http.Response.make(
-                403,
-                f"Host header {claimed[:256]!r} does not match the destination "
-                f"{host}:{flow.request.port}. This is a policy violation, not a "
-                "pending approval — it will not be granted by waiting.",
-                {"Content-Type": "text/plain"},
-            )
-            entry = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "host": host,
-                "url": flow.request.url[:512],
-                "method": flow.request.method,
-                # Shown as a violation by the TUI
-                "type": "policy_violation",
-                # Attacker-influenced; truncate so the deny log stays bounded
-                "reason": f"Host header {claimed[:256]!r} does not match destination",
-            }
-            with s.deny_lock:
-                s.deny_log.append(entry)
-            print(json.dumps({
-                "event": "host_header_mismatch",
-                "host": host,
-                "port": flow.request.port,
-                "claimed_host": claimed[:256],
-            }))
+            self._deny_mismatch(flow, "Host header", "host_header_mismatch", claimed)
+            return
+        claimed = sni_mismatch(flow)
+        if claimed is not None:
+            self._deny_mismatch(flow, "TLS SNI", "sni_mismatch", claimed)
             return
 
         entries = list(s.hosts.get(host, ()))
@@ -239,6 +229,37 @@ class AllowlistAddon:
             ]
         with self.state.deny_lock:
             self.state.deny_log.append(entry)
+
+    def _deny_mismatch(self, flow: HTTPFlow, what: str, event: str, claimed: str):
+        """Refuse a request claiming a host other than its destination.
+        Unlike other denials no approval can fix this: answer 403."""
+        host = dest_host(flow)
+        # Attacker-influenced; truncate so responses and the deny log stay bounded
+        claimed = claimed[:256]
+        flow.response = http.Response.make(
+            403,
+            f"{what} {claimed!r} does not match the destination "
+            f"{host}:{flow.request.port}. This is a policy violation, not a "
+            "pending approval — it will not be granted by waiting.",
+            {"Content-Type": "text/plain"},
+        )
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "host": host,
+            "url": flow.request.url[:512],
+            "method": flow.request.method,
+            # Shown as a violation by the TUI
+            "type": "policy_violation",
+            "reason": f"{what} {claimed!r} does not match destination",
+        }
+        with self.state.deny_lock:
+            self.state.deny_log.append(entry)
+        print(json.dumps({
+            "event": event,
+            "host": host,
+            "port": flow.request.port,
+            "claimed_host": claimed,
+        }))
 
     def _deny_pending(self, flow: HTTPFlow):
         host = dest_host(flow)

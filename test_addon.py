@@ -19,7 +19,7 @@ from conftest import make_restricted, make_state
 # ── Test helpers ───────────────────────────────────────────────────────────────
 
 def make_flow(host, method="GET", path="/", headers=None, body=b"",
-              port=80, scheme="http", host_header=None, authority=""):
+              port=80, scheme="http", host_header=None, authority="", sni=None):
     """Return a mock HTTPFlow with the given request properties.
 
     host is the real destination (request.host); the Host header defaults to
@@ -35,6 +35,7 @@ def make_flow(host, method="GET", path="/", headers=None, body=b"",
     flow.request.authority = authority
     flow.request.is_http2 = bool(authority)
     flow.request.is_http3 = False
+    flow.client_conn.sni = sni
     flow.request.pretty_host = "pretty-host-must-not-be-used.invalid"
     flow.request.pretty_url = "http://pretty-host-must-not-be-used.invalid/"
     flow.request.url = f"{scheme}://{host}:{port}{path}"
@@ -997,6 +998,39 @@ class TestSighupReload:
         time.sleep(0.05)
 
         assert state.hosts["proxy.golang.org"][0].rules is not None
+
+
+# ── TLS SNI vs. real destination ─────────────────────────────────────────────
+
+class TestSniMismatch:
+    def _run(self, flow):
+        from addon import AllowlistAddon
+        state = make_state(hosts={"good.com": None})
+        AllowlistAddon(state).request(flow)
+        return state
+
+    def test_spoofed_sni_blocked(self, capsys):
+        flow = make_flow("good.com", port=443, scheme="https", sni="other.com")
+        state = self._run(flow)
+        assert flow.response.status_code == 403
+        assert "Retry-After" not in flow.response.headers
+        assert b"TLS SNI 'other.com'" in flow.response.content
+        entry = state.deny_log[-1]
+        assert entry["type"] == "policy_violation"
+        assert entry["host"] == "good.com"
+        log = json.loads(capsys.readouterr().out)
+        assert log["event"] == "sni_mismatch"
+        assert log["claimed_host"] == "other.com"
+
+    def test_matching_sni_passes(self):
+        flow = make_flow("good.com", port=443, scheme="https", sni="GOOD.com")
+        self._run(flow)
+        assert flow.response is None
+
+    def test_no_sni_passes(self):
+        flow = make_flow("good.com", port=443, scheme="https")
+        self._run(flow)
+        assert flow.response is None
 
 
 # ── Cookie allowlist (response side) ──────────────────────────────────────────
