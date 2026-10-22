@@ -344,7 +344,7 @@ leaked push credential cannot be exercised through the proxy.
 |---|---|---|
 | `go` | `proxy.golang.org`, `sum.golang.org` | Module list/info/mod/zip, `@latest`, and the checksum DB — including the `/sumdb/…` paths the toolchain fetches *through* the module proxy. |
 | `npm` | `registry.npmjs.org` | Packuments (incl. scoped `@scope/name` and the `%2f`-encoded form) and `/-/…tgz` tarballs. |
-| `docker` | `registry-1.docker.io`, `auth.docker.io`, `production.cloudflare.docker.com`, `production.cloudfront.docker.com` | `/v2/` ping, manifests, blobs, pull-scoped tokens, and the CDN hosts blob GETs redirect to (Cloudflare or CloudFront, varies over time/region). |
+| `docker` | `registry-1.docker.io`, `auth.docker.io`, `production.cloudflare.docker.com`, `production.cloudfront.docker.com` | `/v2/` ping, manifests, blobs, referrers (OCI 1.1, optional `artifactType` filter), pull-scoped tokens, and the CDN hosts blob GETs redirect to (Cloudflare or CloudFront, varies over time/region). |
 | `ghcr` | `ghcr.io`, `pkg-containers.githubusercontent.com` | Pull-scoped tokens, manifests, blobs, and the blob CDN redirect target. |
 | `pypi` | `pypi.org`, `files.pythonhosted.org` | Simple index (PEP 503), JSON API (project and per-version), and package files. |
 | `crates` | `index.crates.io`, `crates.io`, `static.crates.io` | Sparse index, the API download endpoint, and `.crate` files. |

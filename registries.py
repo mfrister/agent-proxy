@@ -458,6 +458,9 @@ OCI_SEG = r"[a-z0-9][a-z0-9._-]{0,127}"
 OCI_NAME = f"{OCI_SEG}(?:/{OCI_SEG}){{0,3}}"
 OCI_TAG = r"[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}"
 OCI_REF = f"(?:sha256:{HEX64}|{OCI_TAG})"
+# RFC 6838 media type for the referrers API's artifactType filter. parse_qsl
+# decodes an unescaped '+' (e.g. "+json") to space, hence the space.
+MEDIA_TYPE = f"{seg('a-zA-Z0-9!#$&^_.+-', 1, 127)}/{seg('a-zA-Z0-9!#$&^_. +-', 1, 127)}"
 SUMDB_TILE = r"tile/\d{1,2}/(?:\d{1,2}|data)/(?:x\d{3}/){0,3}\d{1,3}(?:\.p/\d{1,3})?"
 PYPI_PROJECT = seg("a-z0-9-", 1, 128)         # PEP 503 normalized names
 PYPI_VERSION = seg(r"a-zA-Z0-9.!+_-", 1, 64)  # PEP 440 incl. epoch (!) and local (+)
@@ -523,6 +526,8 @@ PRESETS = {
                 _r("/v2/"),
                 _r(f"/v2/{OCI_NAME}/manifests/{OCI_REF}"),
                 _r(f"/v2/{OCI_NAME}/blobs/sha256:{HEX64}"),
+                _r(f"/v2/{OCI_NAME}/referrers/sha256:{HEX64}",
+                   query={"artifactType": MEDIA_TYPE}),
             ],
             "request_headers": ["authorization"],
         },

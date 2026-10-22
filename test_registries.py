@@ -99,7 +99,18 @@ VECTORS = [
     ("docker", "production.cloudfront.docker.com", "GET",
      f"/registry-v2/docker/registry/v2/blobs/sha256/55/{HEX}/data"
      "?Expires=1719900000&Signature=aBc~123_-&Key-Pair-Id=APKAJ123", True),
+    ("docker", "registry-1.docker.io", "GET",
+     "/v2/library/golang/referrers/sha256:15babe8edb6f430d350c7febc76734ee8e65acd859356b2fb44d1e6b2579030a", True),
+    ("docker", "registry-1.docker.io", "GET",
+     f"/v2/library/ubuntu/referrers/sha256:{HEX}"
+     "?artifactType=application/vnd.dev.sigstore.bundle.v0.3%2Bjson", True),
     # docker — negatives
+    ("docker", "registry-1.docker.io", "GET",
+     "/v2/library/ubuntu/referrers/latest", False),
+    ("docker", "registry-1.docker.io", "GET",
+     f"/v2/library/ubuntu/referrers/sha256:{HEX}?q=secret", False),
+    ("docker", "registry-1.docker.io", "GET",
+     f"/v2/library/ubuntu/referrers/sha256:{HEX}?artifactType=" + "a" * 200, False),
     ("docker", "auth.docker.io", "GET",
      "/token?service=registry.docker.io&scope=repository:library/ubuntu:push", False),
     ("docker", "auth.docker.io", "GET",
