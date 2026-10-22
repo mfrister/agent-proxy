@@ -200,9 +200,11 @@ def _proxy_context(tmp, handler_class, config_text, server_tls=None, extra_args=
     server_port = free_port()
     server = HTTPServer(("127.0.0.1", server_port), handler_class)
     server.received = []
+    server.sni = []  # SNI of each TLS handshake the server saw (None: no SNI)
     if server_tls:
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.load_cert_chain(*server_tls)
+        tls.sni_callback = lambda _sock, name, _ctx: server.sni.append(name)
         server.socket = tls.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
@@ -842,6 +844,53 @@ def test_spoofed_host_connect_tls_blocked(proxy_spoof_tls):
             sock.sendall(SPOOFED_GET)
             resp = _recv_response(sock)
     _assert_blocked_and_not_leaked(proxy_spoof_tls, resp)
+
+
+@pytest.fixture
+def proxy_allowed_tls(tmp_path):
+    """The local HTTPS server is itself allowed, with an inject-mode
+    credential, so only the SNI can point the request elsewhere."""
+    with _proxy_context(
+        tmp_path, RecordingHandler,
+        "hosts:\n"
+        "  - host: 127.0.0.1\n"
+        "    credential:\n"
+        "      header: Authorization\n"
+        f"      real_value: {SPOOF_SECRET}\n",
+        server_tls=_self_signed_cert(tmp_path),
+        extra_args=("--set", "ssl_insecure=true"),
+    ) as ctx:
+        yield ctx
+
+
+def test_spoofed_sni_blocked(proxy_allowed_tls):
+    """CONNECT to the allowed destination with a matching Host header, but TLS
+    SNI other.example: mitmproxy would pass that SNI upstream, so a front
+    that routes by SNI could deliver the credential to another backend."""
+    ctx = proxy_allowed_tls
+    tls = ssl.create_default_context(cafile=str(ctx["ca_cert"]))
+    with _connect_tunnel(ctx) as raw:
+        with tls.wrap_socket(raw, server_hostname="other.example") as sock:
+            sock.sendall((
+                f"GET /a HTTP/1.1\r\nHost: 127.0.0.1:{ctx['server_port']}\r\n"
+                "Connection: close\r\n\r\n").encode())
+            resp = _recv_response(sock)
+    assert ctx["server"].sni == []
+    _assert_blocked_and_not_leaked(ctx, resp)
+
+
+def test_connect_tls_without_sni_reaches_server(proxy_allowed_tls):
+    """An IP-literal destination carries no SNI; that must keep working."""
+    ctx = proxy_allowed_tls
+    tls = ssl.create_default_context(cafile=str(ctx["ca_cert"]))
+    with _connect_tunnel(ctx) as raw:
+        with tls.wrap_socket(raw, server_hostname="127.0.0.1") as sock:
+            sock.sendall((
+                f"GET /a HTTP/1.1\r\nHost: 127.0.0.1:{ctx['server_port']}\r\n"
+                "Connection: close\r\n\r\n").encode())
+            resp = _recv_response(sock)
+    assert _status(resp) == 200, resp
+    assert ctx["server"].received[0]["authorization"] == SPOOF_SECRET
 
 
 def _h2_get(sock, authority: str, path: str) -> tuple[int, bytes]:
