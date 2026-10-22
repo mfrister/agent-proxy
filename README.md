@@ -14,10 +14,10 @@ uv sync
 
 ```bash
 # headless
-uv run mitmdump -s addon.py
+uv run mitmdump --listen-host 127.0.0.1 -s addon.py
 
 # with web UI
-uv run mitmweb -s addon.py
+uv run mitmweb --listen-host 127.0.0.1 -s addon.py
 ```
 
 Point the agent at the proxy and install the CA cert:
