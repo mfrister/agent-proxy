@@ -844,6 +844,49 @@ def test_spoofed_host_connect_tls_blocked(proxy_spoof_tls):
     _assert_blocked_and_not_leaked(proxy_spoof_tls, resp)
 
 
+def _h2_get(sock, authority: str, path: str) -> tuple[int, bytes]:
+    """Send one HTTP/2 GET over an established h2 TLS socket; return
+    (status, body)."""
+    import h2.connection
+    import h2.events
+
+    conn = h2.connection.H2Connection()
+    conn.initiate_connection()
+    conn.send_headers(1, [(":method", "GET"), (":scheme", "https"),
+                          (":authority", authority), (":path", path)],
+                      end_stream=True)
+    sock.sendall(conn.data_to_send())
+    status, body = None, b""
+    while True:
+        data = sock.recv(65536)
+        if not data:
+            break
+        for event in conn.receive_data(data):
+            if isinstance(event, h2.events.ResponseReceived):
+                status = int(dict(event.headers)[b":status"])
+            elif isinstance(event, h2.events.DataReceived):
+                body += event.data
+                conn.acknowledge_received_data(event.flow_controlled_length, 1)
+            elif isinstance(event, (h2.events.StreamEnded, h2.events.StreamReset)):
+                return status, body
+        sock.sendall(conn.data_to_send())
+    return status, body
+
+
+def test_spoofed_authority_http2_blocked(proxy_spoof_tls):
+    """CONNECT to the local HTTPS server, then an HTTP/2 request whose
+    :authority is example.org."""
+    tls = ssl.create_default_context(cafile=str(proxy_spoof_tls["ca_cert"]))
+    tls.set_alpn_protocols(["h2"])
+    with _connect_tunnel(proxy_spoof_tls) as raw:
+        with tls.wrap_socket(raw, server_hostname="example.org") as sock:
+            assert sock.selected_alpn_protocol() == "h2"
+            status, body = _h2_get(sock, "example.org", "/a")
+    assert status == 403, body
+    assert SPOOF_SECRET.encode() not in body
+    assert proxy_spoof_tls["server"].received == []
+
+
 def test_mismatched_host_blocked_even_if_destination_allowed(proxy):
     """127.0.0.1 is allowed here, but Host names another host: fail closed
     rather than forward a request the upstream may route by Host."""
@@ -993,4 +1036,38 @@ def test_raw_bytes_after_connect_not_relayed(proxy, raw_server):
     time.sleep(0.5)
     assert b"secret-data" not in reply
     assert raw_server.received == b""
+    assert raw_server.accepted == 0
+
+
+@pytest.fixture
+def proxy_unsafe_set(tmp_path):
+    """The proxy fixture's config, launched asking for mitmproxy's unsafe
+    defaults explicitly; the addon must override both."""
+    with _proxy_context(
+        tmp_path, EchoHandler, "hosts:\n  - host: 127.0.0.1\n",
+        extra_args=("--set", "rawtcp=true", "--set", "connection_strategy=eager"),
+    ) as ctx:
+        yield ctx
+
+
+def test_set_rawtcp_overridden(proxy_unsafe_set, raw_server):
+    sock, head = raw_connect(proxy_unsafe_set["proxy_port"], f"127.0.0.1:{raw_server.port}")
+    with sock:
+        assert head.startswith(b"HTTP/1.1 200")
+        sock.sendall(b"SSH-2.0-exfil secret-data\r\n")
+        reply = recv_all(sock)
+    time.sleep(0.5)
+    assert b"secret-data" not in reply
+    assert raw_server.received == b""
+
+
+def test_set_eager_connection_strategy_overridden(proxy_unsafe_set, raw_server):
+    target = f"localhost:{raw_server.port}"
+    sock, head = raw_connect(proxy_unsafe_set["proxy_port"], target)
+    with sock:
+        assert head.startswith(b"HTTP/1.1 200")
+        sock.sendall(_get(target))
+        resp = _recv_response(sock)
+    assert _status(resp) == 503, resp
+    time.sleep(0.5)
     assert raw_server.accepted == 0
