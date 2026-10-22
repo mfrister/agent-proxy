@@ -460,6 +460,7 @@ OCI_TAG = r"[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}"
 OCI_REF = f"(?:sha256:{HEX64}|{OCI_TAG})"
 SUMDB_TILE = r"tile/\d{1,2}/(?:\d{1,2}|data)/(?:x\d{3}/){0,3}\d{1,3}(?:\.p/\d{1,3})?"
 PYPI_PROJECT = seg("a-z0-9-", 1, 128)         # PEP 503 normalized names
+PYPI_VERSION = seg(r"a-zA-Z0-9.!+_-", 1, 64)  # PEP 440 incl. epoch (!) and local (+)
 CRATE = seg("a-z0-9_-", 1, 64)
 CRATE_VERSION = seg(r"a-zA-Z0-9.+-", 1, 64)
 # CDN signed-URL query values (decoded): base64ish plus timestamp separators.
@@ -569,6 +570,7 @@ PRESETS = {
             _r("/simple/"),
             _r(f"/simple/{PYPI_PROJECT}/?"),
             _r(f"/pypi/{PYPI_PROJECT}/json"),
+            _r(f"/pypi/{PYPI_PROJECT}/{PYPI_VERSION}/json"),
         ]},
         "files.pythonhosted.org": {"rules": [
             _r(f"/packages/(?:{seg('A-Za-z0-9._+-', 1, 64)}/){{2,4}}"

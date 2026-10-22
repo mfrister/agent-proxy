@@ -128,12 +128,16 @@ VECTORS = [
     ("pypi", "pypi.org", "GET", "/simple/requests/", True),
     ("pypi", "pypi.org", "GET", "/simple/requests", True),
     ("pypi", "pypi.org", "GET", "/pypi/requests/json", True),
+    ("pypi", "pypi.org", "GET", "/pypi/mitmproxy-linux/0.12.15/json", True),
+    ("pypi", "pypi.org", "GET", "/pypi/torch/2.1.0+cpu/json", True),
     ("pypi", "files.pythonhosted.org", "GET",
      "/packages/aa/bb/" + "c" * 60 + "/requests-2.31.0-py3-none-any.whl", True),
     # pypi — negatives
     ("pypi", "pypi.org", "GET", "/simple/Requests/", False),
     ("pypi", "pypi.org", "POST", "/simple/requests/", False),
     ("pypi", "pypi.org", "GET", "/search/?q=secret", False),
+    ("pypi", "pypi.org", "GET", "/pypi/requests/" + "1" * 65 + "/json", False),
+    ("pypi", "pypi.org", "GET", "/pypi/requests/1.0/2.0/json", False),
 
     # crates
     ("crates", "index.crates.io", "GET", "/config.json", True),
