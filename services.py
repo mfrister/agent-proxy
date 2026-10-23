@@ -327,6 +327,8 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
         # glab mr view fetches the approval state on every call and ignores a
         # failure, but client-go retries the proxy's 503 first, stalling it.
         registries._r(f"{base}/merge_requests/{GL_IID}/approval_state", allow_percent=True),
+        registries._r(f"{base}/merge_requests/{GL_IID}/pipelines",
+                      query={"per_page": GL_PER_PAGE, "page": GL_PAGE}, allow_percent=True),
         # glab mr view --comments
         registries._r(f"{base}/merge_requests/{GL_IID}/discussions",
                       query={"sort": GL_SORT, "per_page": GL_PER_PAGE, "page": GL_PAGE},

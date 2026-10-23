@@ -513,6 +513,8 @@ class TestScopedGitLabRules:
         "/merge_requests/7?include_diverged_commits_count=true"
         "&include_rebase_in_progress=true&render_html=true",
         "/merge_requests/7/approval_state",
+        "/merge_requests/7/pipelines",
+        "/merge_requests/7/pipelines?page=2&per_page=20",
         "/merge_requests/7/discussions?page=1&per_page=30&sort=asc",
     ])
     def test_glab_mr_view_allowed(self, path):
@@ -523,6 +525,7 @@ class TestScopedGitLabRules:
     @pytest.mark.parametrize("path", [
         "/merge_requests/7?render_html=yes",
         "/merge_requests/7/approval_state?x=1",
+        "/merge_requests/7/pipelines?ref=main",
         "/merge_requests/7/discussions?sort=random",
     ])
     def test_glab_mr_view_bad_params_denied(self, path):
