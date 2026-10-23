@@ -479,6 +479,23 @@ class TestPathResolver:
                                  make_flow("h.com", path="/id/1"))
         assert flow.metadata["host_entry"] is resolving
 
+    def test_resolver_error_is_denied_not_skipped(self, capsys):
+        # Raising out of the hook would make mitmproxy skip AllowlistAddon.
+        from config import HostEntry
+
+        class Broken:
+            async def resolve(self, path, credential):
+                raise RuntimeError("boom")
+
+        entry = HostEntry(rules=_resolved_rules("/name/1", Broken()))
+        flow = run_with_resolver(make_state(hosts={"h.com": [entry]}),
+                                 make_flow("h.com", path="/id/1"))
+        assert flow.response.status_code == 503
+        assert json.loads(capsys.readouterr().out.splitlines()[0]) == {
+            "event": "path_resolver_error", "host": "h.com",
+            "policy": "resolved", "error": "RuntimeError",
+        }
+
     def test_disabled_service_is_not_resolved(self):
         from config import HostEntry
         resolver = FakeResolver()

@@ -135,6 +135,11 @@ class PathResolverAddon:
     flow.metadata["resolved_paths"] (keyed by id of the rules), where
     AllowlistAddon picks it up. The request itself is never modified. A
     resolver returning None leaves the request's own path in effect.
+
+    A resolver error must not escape: mitmproxy runs SandboxProxy's child
+    addons under one error handler, so an exception here would skip
+    AllowlistAddon and forward the request unchecked. It's logged and
+    treated as None instead.
     """
 
     def __init__(self, state: ProxyState):
@@ -146,7 +151,16 @@ class PathResolverAddon:
             resolver = entry.rules.path_resolver if entry.rules is not None else None
             if resolver is None or id(entry.rules) in resolved:
                 continue
-            path = await resolver.resolve(flow.request.path, entry.credential)
+            try:
+                path = await resolver.resolve(flow.request.path, entry.credential)
+            except Exception as e:
+                print(json.dumps({
+                    "event": "path_resolver_error",
+                    "host": dest_host(flow),
+                    "policy": entry.rules.source,
+                    "error": type(e).__name__,
+                }))
+                continue
             if path is not None:
                 resolved[id(entry.rules)] = path
         if resolved:
