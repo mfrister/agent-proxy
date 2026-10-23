@@ -32,7 +32,7 @@ and query-value patterns, for presets and user rules alike):
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import parse_qsl
 
 # Private stdlib API: re._parser is the regex engine's own parser (named
@@ -71,6 +71,12 @@ class HostRules:
     request_headers: frozenset = frozenset()  # extras beyond BASE_REQUEST_HEADERS
     max_url_len: int = 4096
     source: str = ""                # preset name or "config" — for logging
+    # Optional; service presets only. An object with
+    #   async resolve(path_with_query, credential) -> str | None
+    # returning the path these rules are checked against instead of the
+    # request's own (which is still what goes upstream), or None to check
+    # the request's path. See PathResolverAddon in addon.py.
+    path_resolver: object = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -309,7 +315,7 @@ def literal_alternation(items) -> str:
     return "(?i:" + "|".join(re.escape(i) for i in items) + ")"
 
 
-def compile_host_rules(spec: dict, source: str) -> HostRules:
+def compile_host_rules(spec: dict, source: str, path_resolver=None) -> HostRules:
     """Compile one host's rule spec (preset data or config.yaml dict)."""
     rules = []
     for r in spec["rules"]:
@@ -353,6 +359,7 @@ def compile_host_rules(spec: dict, source: str) -> HostRules:
         request_headers=frozenset(h.lower() for h in spec.get("request_headers", [])),
         max_url_len=int(spec.get("max_url_len", 4096)),
         source=source,
+        path_resolver=path_resolver,
     )
 
 

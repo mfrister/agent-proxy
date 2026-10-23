@@ -483,7 +483,10 @@ class Config:
                         escaped = preset.build_scope(entry.get("scope"))
                         spec_by_host = preset.scope_template(escaped, flags, resolved_host)
                         for host, rule_spec in spec_by_host.items():
-                            preset_hosts[host] = registries.compile_host_rules(rule_spec, source=name)
+                            preset_hosts[host] = registries.compile_host_rules(
+                                rule_spec, source=name,
+                                path_resolver=rule_spec.get("path_resolver"),
+                            )
                 elif resolved_host is not None:
                     preset_hosts[resolved_host] = None
 
