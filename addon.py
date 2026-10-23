@@ -108,7 +108,7 @@ def enable_happy_eyeballs(delay: float) -> None:
 # ── Addons ─────────────────────────────────────────────────────────────────────
 
 def active_entries(state: ProxyState, host: str) -> list[HostEntry]:
-    """The host's entries in matching order: configured ones, then those of
+    """The host's entries in config order: configured ones, then those of
     temporarily enabled services, then a live temporary allow as a final
     unrestricted entry."""
     entries = list(state.hosts.get(host, ()))
@@ -132,7 +132,7 @@ class PathResolverAddon:
     Runs before AllowlistAddon. For each of the host's active entries whose
     rules carry a path_resolver (see registries.HostRules), awaits the path
     those rules should be checked against and records it in
-    flow.metadata["resolved_paths"] (keyed by id of the rules), where
+    flow.metadata["resolved_paths"] as (rules, path) pairs, where
     AllowlistAddon picks it up. The request itself is never modified. A
     resolver returning None leaves the request's own path in effect.
 
@@ -146,10 +146,10 @@ class PathResolverAddon:
         self.state = state
 
     async def request(self, flow: HTTPFlow):
-        resolved = {}
+        resolved = []
         for entry in active_entries(self.state, dest_host(flow)):
             resolver = entry.rules.path_resolver if entry.rules is not None else None
-            if resolver is None or id(entry.rules) in resolved:
+            if resolver is None or any(rules is entry.rules for rules, _ in resolved):
                 continue
             try:
                 path = await resolver.resolve(flow.request.path, entry.credential)
@@ -162,7 +162,7 @@ class PathResolverAddon:
                 }))
                 continue
             if path is not None:
-                resolved[id(entry.rules)] = path
+                resolved.append((entry.rules, path))
         if resolved:
             flow.metadata["resolved_paths"] = resolved
 
@@ -241,9 +241,14 @@ class AllowlistAddon:
         return registries.evaluate(
             entry.rules,
             method=flow.request.method,
-            # A path_resolver's result (PathResolverAddon), if it produced one
-            path_with_query=flow.metadata.get("resolved_paths", {}).get(
-                id(entry.rules), flow.request.path),
+            # A path_resolver's result (PathResolverAddon), if it produced
+            # one for these exact rules; identity, not id(), which a config
+            # reload during the resolver's await could hand to new rules.
+            path_with_query=next(
+                (path for rules, path in flow.metadata.get("resolved_paths", ())
+                 if rules is entry.rules),
+                flow.request.path,
+            ),
             headers=flow.request.headers,
             # raw_content is the buffered body mitmproxy actually forwards;
             # the client-supplied Content-Length header can lie.
