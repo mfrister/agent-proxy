@@ -22,6 +22,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import registries
+from gitlab_resolver import GitLabProjectResolver
 
 
 @dataclass(frozen=True)
@@ -420,7 +421,10 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
             registries._r(f"{base}/ci/lint", methods=["POST"], **write_kwargs),
         ]
 
-    return {host: {"rules": rules, "request_headers": sorted(request_headers)}}
+    # Numeric project IDs (/api/v4/projects/1901/...) are checked as the
+    # project path they resolve to; see gitlab_resolver.py.
+    return {host: {"rules": rules, "request_headers": sorted(request_headers),
+                   "path_resolver": GitLabProjectResolver(host)}}
 
 
 SERVICE_PRESETS = {

@@ -22,6 +22,7 @@ dev = [
 testpaths = [
     "test_addon.py",
     "test_config.py",
+    "test_gitlab_resolver.py",
     "test_management_api.py",
     "test_registries.py",
     "test_services.py",
