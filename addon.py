@@ -107,6 +107,26 @@ def enable_happy_eyeballs(delay: float) -> None:
 
 # ── Addons ─────────────────────────────────────────────────────────────────────
 
+def active_entries(state: ProxyState, host: str) -> list[HostEntry]:
+    """The host's entries in matching order: configured ones, then those of
+    temporarily enabled services, then a live temporary allow as a final
+    unrestricted entry."""
+    entries = list(state.hosts.get(host, ()))
+    with state.temp_lock:
+        now = time.time()
+        active = {key for key, exp in state.temp_services.items() if now < exp}
+        for key in active:
+            entries.extend(state.dormant_services.get(key, {}).get(host, ()))
+        exp = state.temp_allows.get(host)
+        if exp and now < exp:
+            # Temp-allow grants access, not a cookie policy: keep whatever
+            # the host's configured entries filter.
+            entries.append(HostEntry(
+                host_config=entries[0].host_config if entries else HostConfig(),
+            ))
+    return entries
+
+
 class AllowlistAddon:
     """
     Checks every request against the host's `hosts:` entries and any active
@@ -146,20 +166,7 @@ class AllowlistAddon:
             self._deny_mismatch(flow, "TLS SNI", "sni_mismatch", claimed)
             return
 
-        entries = list(s.hosts.get(host, ()))
-        with s.temp_lock:
-            now = time.time()
-            active = {key for key, exp in s.temp_services.items() if now < exp}
-            for key in active:
-                entries.extend(s.dormant_services.get(key, {}).get(host, ()))
-            exp = s.temp_allows.get(host)
-            if exp and now < exp:
-                # Temp-allow grants access, not a cookie policy: keep whatever
-                # the host's configured entries filter.
-                entries.append(HostEntry(
-                    host_config=entries[0].host_config if entries else HostConfig(),
-                ))
-
+        entries = active_entries(s, host)
         if not entries:
             self._deny_pending(flow)
             return
