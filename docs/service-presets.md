@@ -144,7 +144,7 @@ the two `github` scope params; `gitlab` has `projects`
 (`namespace[/subgroup...]/project`, up to 10 path segments) and `groups`
 (same shape, up to 9 subgroup segments) plus a required scalar `host:` naming
 the self-hosted instance. `write` (both presets) adds issue/PR/MR/comment
-POST/PATCH/PUT routes; `graphql` (`github` only) is covered above. At least
+POST/PATCH/PUT routes (and, for `gitlab`, the CI config lint); `graphql` (`github` only) is covered above. At least
 one scope param must be supplied — an entry with `scope: {}` or all-empty
 lists is rejected the same as a missing `scope:` key.
 
@@ -249,7 +249,8 @@ are auditable after the fact.
    bounded overall by the 4096-character URL limit. `glab mr list`'s
    `search`, `milestone`, `environment`, `labels` and `not[labels]` filters
    accept the same character set with shorter caps: 100 characters per
-   value, 64 per label, up to 10 labels. The other read-only
+   value, 64 per label, up to 10 labels; so do `glab ci list --name` and
+   the job name of `glab ci artifact`. The other read-only
    rules only accept ref-, path- and id-shaped values. These values reach the
    GitLab instance's request logs, so a read-only scope is not a zero-write
    channel to whoever can read those logs. Every such request is logged with
@@ -352,7 +353,7 @@ leaked push credential cannot be exercised through the proxy.
 | `pypi` | `pypi.org`, `files.pythonhosted.org` | Simple index (PEP 503), JSON API (project and per-version), and package files. |
 | `crates` | `index.crates.io`, `crates.io`, `static.crates.io` | Sparse index, the API download endpoint, and `.crate` files. |
 | `github` | `api.github.com`, scoped to `scope.repos`/`scope.orgs` | Repo metadata, contents, commits, branches, pulls, issues, and git refs/trees/blobs (read-only). `write: true` adds issue/PR/comment POST/PATCH; `graphql: true` adds unscoped `POST /graphql`. |
-| `gitlab` | the entry's `host:`, scoped to `scope.projects`/`scope.groups` | The `/api/v4/projects/{id}` equivalent of the above: files, commits, branches, merge requests (with `glab mr list`'s filter parameters, the branch lookup `glab mr view` and friends do without an MR number, and `mr view`'s approval state and discussions), issues (with `glab issue list`'s filter parameters) and issue comments, milestone lookup by title, repository tree/blobs (read-only), plus the token's own user (`GET /api/v4/user`, which `glab auth login`/`auth status` need). `write: true` adds issue/MR/note POST/PUT, issue subscribe/unsubscribe, and issue time tracking. |
+| `gitlab` | the entry's `host:`, scoped to `scope.projects`/`scope.groups` | The `/api/v4/projects/{id}` equivalent of the above: files, commits, branches, merge requests (with `glab mr list`'s filter parameters, the branch lookup `glab mr view` and friends do without an MR number, and `mr view`'s approval state and discussions), issues (with `glab issue list`'s filter parameters) and issue comments, milestone lookup by title, repository tree/blobs, CI pipelines, jobs, job logs, commit statuses and artifact download for `glab ci list/get/status/view/trace/artifact` (all read-only), plus the token's own user (`GET /api/v4/user`, which `glab auth login`/`auth status` need). `write: true` adds issue/MR/note POST/PUT, issue subscribe/unsubscribe, issue time tracking, and `glab ci lint` (`POST .../ci/lint`). |
 
 Rule definitions live in `registries.py` (`PRESETS`) for registry presets and
 in `services.py` (`_github_rules`, `_gitlab_rules`) for the API presets; git
@@ -378,6 +379,13 @@ history for either is the audit trail for policy changes.
   Search terms, label and milestone names are limited to printable ASCII.
   The same applies to `glab mr list`: `--author`, `--assignee` and
   `--reviewer <username>` and `--group` are denied; `@me` and `@any` work.
+- **`glab ci` is read-only on a scoped `gitlab` service.** `ci run`,
+  `run-trig`, `retry`, `cancel`, `trigger`, `delete` and the job actions in
+  `ci view` start, stop or remove pipelines, which runs (or skips) code with
+  the project's CI secrets and deploy access, so not even `write: true`
+  allows them. `ci get --with-variables` is denied too: pipeline variables
+  can carry trigger-time secrets. If the instance serves artifacts by
+  redirecting to object storage, that storage host needs its own entry.
 - If a preset pattern turns out too tight for a legitimate workflow, the
   violation shows up in the TUI; temp-allowing the host is the immediate
   escape hatch, and a custom `hosts:` entry (added alongside the preset's

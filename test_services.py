@@ -530,6 +530,58 @@ class TestScopedGitLabRules:
         result = _gitlab_eval(scope, {}, "GET", f"/api/v4/projects/team%2Fbackend{path}")
         assert isinstance(result, registries.Violation)
 
+    # Encoded the way glab ci sends them (client-go, sorted keys).
+    @pytest.mark.parametrize("path", [
+        "/pipelines?page=1",
+        "/pipelines?order_by=id&page=1&per_page=50&ref=feature%2Fx&scope=branches"
+        "&sha=0123abcd&sort=desc&source=merge_request_event&status=failed"
+        "&updated_after=2026-10-01T00%3A00%3A00Z&username=some.user&yaml_errors=true",
+        "/pipelines?name=Nightly+build&page=1",
+        "/pipelines/latest?ref=main",
+        "/pipelines/123",
+        "/pipelines/123/jobs?per_page=500",
+        "/pipelines/123/jobs?page=2&per_page=100&scope%5B%5D=failed",
+        "/pipelines/123/bridges?page=1&per_page=500",
+        "/jobs/456",
+        "/jobs/456/trace",
+        "/jobs/artifacts/feature/x/download?job=build+linux",
+        "/repository/commits/0123abcd/statuses?all=true",
+    ])
+    def test_glab_ci_reads_allowed(self, path):
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(scope, {}, "GET", f"/api/v4/projects/team%2Fbackend{path}")
+        assert isinstance(result, registries.Allowed)
+
+    @pytest.mark.parametrize("method,path", [
+        ("GET", "/pipelines/123/variables"),        # may carry trigger-time secrets
+        ("GET", "/variables"),
+        ("GET", "/pipelines?status=bogus"),
+        ("GET", "/pipelines?name=" + "a" * 101),
+        ("GET", "/pipelines/latest?ref=a%3Bb"),
+        ("GET", "/jobs/456/artifacts/some/file"),
+        ("POST", "/pipeline"),                      # glab ci run
+        ("POST", "/pipelines/123/retry"),
+        ("POST", "/pipelines/123/cancel"),
+        ("DELETE", "/pipelines/123"),
+        ("POST", "/jobs/456/play"),
+        ("POST", "/jobs/456/retry"),
+        ("POST", "/jobs/456/cancel"),
+        ("POST", "/trigger/pipeline"),
+    ])
+    def test_glab_ci_writes_and_secrets_denied(self, method, path):
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(scope, {"write": True}, method,
+                              f"/api/v4/projects/team%2Fbackend{path}")
+        assert isinstance(result, registries.Violation)
+
+    @pytest.mark.parametrize("flags,allowed", [({}, False), ({"write": True}, True)])
+    def test_glab_ci_lint_needs_write(self, flags, allowed):
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(scope, flags, "POST",
+                              "/api/v4/projects/team%2Fbackend/ci/lint", body_len=10,
+                              content_type="application/json")
+        assert isinstance(result, registries.Allowed if allowed else registries.Violation)
+
     def test_issue_notes_list_allowed(self):
         # glab issue view --comments
         scope = {"projects": ["team/backend"]}
