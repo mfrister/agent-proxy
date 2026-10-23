@@ -412,6 +412,84 @@ class TestMultiEntryMatching:
         assert temp.host_config.allow_response_cookies == []
 
 
+# ── Path resolvers ─────────────────────────────────────────────────────────────
+
+class FakeResolver:
+    """Maps /id/<n> to /name/<n>; records each call."""
+
+    def __init__(self, result=None):
+        self.calls = []
+        self.result = result
+
+    async def resolve(self, path, credential):
+        self.calls.append((path, credential))
+        if self.result is not None:
+            return self.result
+        return path.replace("/id/", "/name/") if path.startswith("/id/") else None
+
+
+def _resolved_rules(path, resolver):
+    import registries
+    return registries.compile_host_rules(
+        {"rules": [{"methods": ["GET"], "path": path}]}, source="resolved",
+        path_resolver=resolver,
+    )
+
+
+def run_with_resolver(state, flow):
+    import asyncio
+    from addon import AllowlistAddon, PathResolverAddon
+    asyncio.run(PathResolverAddon(state).request(flow))
+    AllowlistAddon(state).request(flow)
+    return flow
+
+
+class TestPathResolver:
+    def test_resolved_path_is_checked_but_request_unchanged(self):
+        from config import HostEntry
+        resolver = FakeResolver()
+        entry = HostEntry(rules=_resolved_rules("/name/1", resolver), credential=CRED)
+        flow = run_with_resolver(make_state(hosts={"h.com": [entry]}),
+                                 make_flow("h.com", path="/id/1"))
+        assert flow.response is None
+        assert flow.metadata["host_entry"] is entry
+        assert flow.request.path == "/id/1"
+        assert resolver.calls == [("/id/1", CRED)]
+
+    def test_resolved_path_out_of_scope_is_denied(self):
+        from config import HostEntry
+        entry = HostEntry(rules=_resolved_rules("/name/1", FakeResolver()))
+        flow = run_with_resolver(make_state(hosts={"h.com": [entry]}),
+                                 make_flow("h.com", path="/id/2"))
+        assert flow.response.status_code == 503
+
+    def test_none_keeps_request_path(self):
+        from config import HostEntry
+        entry = HostEntry(rules=_resolved_rules("/name/1", FakeResolver()))
+        state = make_state(hosts={"h.com": [entry]})
+        assert run_with_resolver(state, make_flow("h.com", path="/name/1")).response is None
+        assert run_with_resolver(state, make_flow("h.com", path="/x")).response.status_code == 503
+
+    def test_resolution_applies_only_to_its_own_entry(self):
+        # A sibling entry without a resolver still sees the request's path.
+        from config import HostEntry
+        plain = HostEntry(rules=_rules("/a", "plain"))
+        resolving = HostEntry(rules=_resolved_rules("/a", FakeResolver(result="/a")))
+        flow = run_with_resolver(make_state(hosts={"h.com": [plain, resolving]}),
+                                 make_flow("h.com", path="/id/1"))
+        assert flow.metadata["host_entry"] is resolving
+
+    def test_disabled_service_is_not_resolved(self):
+        from config import HostEntry
+        resolver = FakeResolver()
+        state = make_state(dormant_services={
+            ("svc", None): {"h.com": [HostEntry(rules=_resolved_rules("/name/1", resolver))]},
+        })
+        flow = run_with_resolver(state, make_flow("h.com", path="/id/1"))
+        assert flow.response.status_code == 503
+        assert resolver.calls == []
+
+
 # ── Host header vs. real destination ─────────────────────────────────────────
 
 class TestHostHeaderMismatch:

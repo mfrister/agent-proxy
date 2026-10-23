@@ -127,6 +127,32 @@ def active_entries(state: ProxyState, host: str) -> list[HostEntry]:
     return entries
 
 
+class PathResolverAddon:
+    """
+    Runs before AllowlistAddon. For each of the host's active entries whose
+    rules carry a path_resolver (see registries.HostRules), awaits the path
+    those rules should be checked against and records it in
+    flow.metadata["resolved_paths"] (keyed by id of the rules), where
+    AllowlistAddon picks it up. The request itself is never modified. A
+    resolver returning None leaves the request's own path in effect.
+    """
+
+    def __init__(self, state: ProxyState):
+        self.state = state
+
+    async def request(self, flow: HTTPFlow):
+        resolved = {}
+        for entry in active_entries(self.state, dest_host(flow)):
+            resolver = entry.rules.path_resolver if entry.rules is not None else None
+            if resolver is None or id(entry.rules) in resolved:
+                continue
+            path = await resolver.resolve(flow.request.path, entry.credential)
+            if path is not None:
+                resolved[id(entry.rules)] = path
+        if resolved:
+            flow.metadata["resolved_paths"] = resolved
+
+
 class AllowlistAddon:
     """
     Checks every request against the host's `hosts:` entries and any active
@@ -201,7 +227,9 @@ class AllowlistAddon:
         return registries.evaluate(
             entry.rules,
             method=flow.request.method,
-            path_with_query=flow.request.path,
+            # A path_resolver's result (PathResolverAddon), if it produced one
+            path_with_query=flow.metadata.get("resolved_paths", {}).get(
+                id(entry.rules), flow.request.path),
             headers=flow.request.headers,
             # raw_content is the buffered body mitmproxy actually forwards;
             # the client-supplied Content-Length header can lie.
@@ -568,6 +596,7 @@ class SandboxProxy:
         apply_safe_options(ctx.options)
         self.state = state
         self.addons = [
+            PathResolverAddon(state),
             AllowlistAddon(state),
             CredentialBrokerAddon(state),
             ResponseCookieFilterAddon(state),
