@@ -181,6 +181,14 @@ GL_TIMESTAMP = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}
 GL_TEXT = r"[A-Za-z0-9 _.,:;#@!?'()&+/-]{1,255}"
 GL_LABEL = r"[A-Za-z0-9 _.:;#@!?'()&+/-]{1,255}"
 GL_LABELS = rf"{GL_LABEL}(?:,{GL_LABEL}){{0,19}}"
+# glab mr list filters: the same classes, shorter caps. Long enough for real
+# search terms, label names and environment names, short enough to keep each
+# value a small channel.
+GL_FILTER_TEXT = r"[A-Za-z0-9 _.,:;#@!?'()&+/-]{1,100}"
+GL_FILTER_LABEL = r"[A-Za-z0-9 _.:;#@!?'()&+/-]{1,64}"
+GL_FILTER_LABELS = rf"{GL_FILTER_LABEL}(?:,{GL_FILTER_LABEL}){{0,9}}"
+GL_MR_ORDER = (r"created_at|updated_at|merged_at|title|priority|label_priority|"
+               r"milestone_due|popularity")
 GL_ISSUE_ORDER = (r"created_at|updated_at|priority|due_date|relative_position|"
                   r"label_priority|milestone_due|popularity|weight|title")
 GL_ISSUE_IN = r"title|description|title,description|description,title"
@@ -286,10 +294,39 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
         registries._r(f"{base}/repository/branches",
                       query={"per_page": GL_PER_PAGE, "page": GL_PAGE}, allow_percent=True),
         registries._r(f"{base}/repository/branches/{GL_REF}", allow_percent=True),
+        # glab mr view/note/... without an IID resolve the checked-out (or
+        # named) branch's MR via source_branch; the rest are glab mr list's
+        # filter flags. --author/--assignee/--reviewer by username need the
+        # denied /users lookup, so only @me (via /user) and @any get here.
         registries._r(f"{base}/merge_requests",
-                      query={"state": GL_STATE, "per_page": GL_PER_PAGE, "page": GL_PAGE},
+                      query={"state": GL_STATE, "per_page": GL_PER_PAGE, "page": GL_PAGE,
+                             "source_branch": GL_REF, "target_branch": GL_REF,
+                             "order_by": GL_MR_ORDER, "sort": GL_SORT,
+                             "search": GL_FILTER_TEXT, "milestone": GL_FILTER_TEXT,
+                             "environment": GL_FILTER_TEXT,
+                             "labels": GL_FILTER_LABELS, "not[labels]": GL_FILTER_LABELS,
+                             "wip": "yes|no", "scope": "assigned_to_me",
+                             "author_id": GL_ID,
+                             "assignee_id": rf"{GL_ID}|Any",
+                             "reviewer_id": rf"{GL_ID}|Any",
+                             "created_after": GL_TIMESTAMP,
+                             "created_before": GL_TIMESTAMP,
+                             "deployed_after": GL_TIMESTAMP,
+                             "deployed_before": GL_TIMESTAMP},
                       allow_percent=True),
-        registries._r(f"{base}/merge_requests/{GL_IID}", allow_percent=True),
+        # glab mr view sends these flags; other mr commands send none.
+        registries._r(f"{base}/merge_requests/{GL_IID}",
+                      query={"include_diverged_commits_count": GL_BOOL,
+                             "render_html": GL_BOOL,
+                             "include_rebase_in_progress": GL_BOOL},
+                      allow_percent=True),
+        # glab mr view fetches the approval state on every call and ignores a
+        # failure, but client-go retries the proxy's 503 first, stalling it.
+        registries._r(f"{base}/merge_requests/{GL_IID}/approval_state", allow_percent=True),
+        # glab mr view --comments
+        registries._r(f"{base}/merge_requests/{GL_IID}/discussions",
+                      query={"sort": GL_SORT, "per_page": GL_PER_PAGE, "page": GL_PAGE},
+                      allow_percent=True),
         # glab issue list always sends in/order_by/sort; the rest are its
         # filter flags (--search, --label, --assignee, --created-after, ...).
         registries._r(f"{base}/issues",

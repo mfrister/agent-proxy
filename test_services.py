@@ -453,6 +453,83 @@ class TestScopedGitLabRules:
         result = _gitlab_eval(scope, {}, "GET", f"{self.GLAB_ISSUE_LIST}&{param}")
         assert isinstance(result, registries.Violation)
 
+    def test_glab_mr_lookup_by_source_branch_allowed(self):
+        scope = {"projects": ["team/backend"]}
+        path = ("/api/v4/projects/team%2Fbackend/merge_requests"
+                "?per_page=30&source_branch=feature%2Fgovulncheck-update-go")
+        result = _gitlab_eval(scope, {}, "GET", path)
+        assert isinstance(result, registries.Allowed)
+
+    def test_glab_mr_lookup_bad_source_branch_denied(self):
+        scope = {"projects": ["team/backend"]}
+        path = "/api/v4/projects/team%2Fbackend/merge_requests?source_branch=a%3Bb"
+        result = _gitlab_eval(scope, {}, "GET", path)
+        assert isinstance(result, registries.Violation)
+
+    GLAB_MR_LIST = ("/api/v4/projects/team%2Fbackend/merge_requests"
+                    "?page=1&per_page=30&state=opened")
+
+    @pytest.mark.parametrize("param", [
+        "source_branch=feature%2Fx",
+        "target_branch=main",
+        "order_by=merged_at",
+        "sort=asc",
+        "search=fix+login+on+%2Fapi",
+        "milestone=Release+2.0",
+        "environment=production",
+        "labels=bug%2Cpriority%3A%3Ahigh",
+        "not%5Blabels%5D=wontfix",
+        "wip=yes",
+        "scope=assigned_to_me",
+        "author_id=17",
+        "assignee_id=Any",
+        "reviewer_id=17",
+        "created_after=2026-10-01T00%3A00%3A00Z",
+        "deployed_before=2026-10-01T00%3A00%3A00%2B02%3A00",
+    ])
+    def test_glab_mr_list_filters_allowed(self, param):
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(scope, {}, "GET", f"{self.GLAB_MR_LIST}&{param}")
+        assert isinstance(result, registries.Allowed)
+
+    @pytest.mark.parametrize("param", [
+        "scope=all",
+        "author_username=someone",
+        "order_by=id",
+        "wip=maybe",
+        "assignee_id=None",
+        "search=" + "a" * 101,                      # over the length bound
+        "environment=" + "a" * 101,
+        "labels=" + "a" * 65,
+        "labels=" + "%2C".join(["l"] * 11),         # over 10 labels
+        "source_branch=a%3Bb",
+    ])
+    def test_glab_mr_list_bad_params_denied(self, param):
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(scope, {}, "GET", f"{self.GLAB_MR_LIST}&{param}")
+        assert isinstance(result, registries.Violation)
+
+    @pytest.mark.parametrize("path", [
+        "/merge_requests/7?include_diverged_commits_count=true"
+        "&include_rebase_in_progress=true&render_html=true",
+        "/merge_requests/7/approval_state",
+        "/merge_requests/7/discussions?page=1&per_page=30&sort=asc",
+    ])
+    def test_glab_mr_view_allowed(self, path):
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(scope, {}, "GET", f"/api/v4/projects/team%2Fbackend{path}")
+        assert isinstance(result, registries.Allowed)
+
+    @pytest.mark.parametrize("path", [
+        "/merge_requests/7?render_html=yes",
+        "/merge_requests/7/approval_state?x=1",
+        "/merge_requests/7/discussions?sort=random",
+    ])
+    def test_glab_mr_view_bad_params_denied(self, path):
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(scope, {}, "GET", f"/api/v4/projects/team%2Fbackend{path}")
+        assert isinstance(result, registries.Violation)
+
     def test_issue_notes_list_allowed(self):
         # glab issue view --comments
         scope = {"projects": ["team/backend"]}
