@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from config import Credential
+import gitlab_resolver
 from gitlab_resolver import FOUND_TTL, NOT_FOUND_TTL, GitLabProjectResolver
 
 CRED = Credential(host="gitlab.example.com", header="PRIVATE-TOKEN",
@@ -141,6 +142,58 @@ class TestCache:
         assert asyncio.run(both()) == ["/api/v4/projects/team%2Fbackend/issues",
                                        "/api/v4/projects/team%2Fbackend/merge_requests"]
         assert len(gitlab.calls) == 1
+
+
+    def test_cache_bounded(self, monkeypatch):
+        monkeypatch.setattr(gitlab_resolver, "MAX_CACHE", 3)
+        resolver, gitlab, clock = make({str(i): found(f"team/p{i}") for i in range(5)})
+        resolve(resolver, "/api/v4/projects/0")
+        clock.now += FOUND_TTL                      # 0 has expired
+        for i in range(1, 5):
+            resolve(resolver, f"/api/v4/projects/{i}")
+        assert list(resolver._cache) == ["2", "3", "4"]
+
+
+class TestHttpFetch:
+    def _resolver(self, handler):
+        return GitLabProjectResolver("gitlab.example.com",
+                                     transport=httpx.MockTransport(handler))
+
+    def test_request_shape(self):
+        seen = []
+
+        def handler(request):
+            seen.append(request)
+            return httpx.Response(200, json={"path_with_namespace": "team/backend"})
+
+        assert resolve(self._resolver(handler), "/api/v4/projects/1901/issues") == \
+            "/api/v4/projects/team%2Fbackend/issues"
+        [request] = seen
+        assert request.method == "GET"
+        assert str(request.url) == "https://gitlab.example.com/api/v4/projects/1901"
+        assert request.headers["PRIVATE-TOKEN"] == "glpat-real"
+
+    def test_without_credential_sends_no_token(self):
+        seen = []
+
+        def handler(request):
+            seen.append(request)
+            return httpx.Response(404)
+
+        assert resolve(self._resolver(handler), "/api/v4/projects/1", credential=None) is None
+        assert "PRIVATE-TOKEN" not in seen[0].headers
+
+    def test_redirect_not_followed(self):
+        def handler(request):
+            return httpx.Response(302, headers={"Location": "https://evil.example/"})
+
+        assert resolve(self._resolver(handler), "/api/v4/projects/1") is None
+
+    def test_transport_error_denies(self):
+        def handler(request):
+            raise httpx.ConnectError("refused")
+
+        assert resolve(self._resolver(handler), "/api/v4/projects/1") is None
 
 
 class TestThroughConfig:

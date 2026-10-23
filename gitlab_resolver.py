@@ -23,13 +23,15 @@ _PROJECT_ID_PATH = re.compile(r"/api/v4/projects/(\d{1,10})((?:/[^?]*)?(?:\?.*)?
 FOUND_TTL = 600.0     # a project moved out of scope stays reachable this long
 NOT_FOUND_TTL = 60.0  # 403/404: unknown ID, or one the token can't see
 TIMEOUT = 5.0
+MAX_CACHE = 10_000    # bounds memory if the agent walks through IDs
 
 
 class GitLabProjectResolver:
-    def __init__(self, host: str, fetch=None, clock=time.monotonic):
+    def __init__(self, host: str, fetch=None, clock=time.monotonic, transport=None):
         self.host = host
         # async (project_id, credential) -> (status, parsed JSON body or None)
         self._fetch = fetch or self._http_fetch
+        self._transport = transport  # httpx transport override, for tests
         self._clock = clock
         self._cache = {}    # project id -> (expires_at, project path | None)
         self._pending = {}  # project id -> in-flight lookup task
@@ -66,19 +68,29 @@ class GitLabProjectResolver:
             return None
         path = body.get("path_with_namespace") if isinstance(body, dict) else None
         if status == 200 and isinstance(path, str):
-            self._cache[project_id] = (self._clock() + FOUND_TTL, path)
+            self._store(project_id, FOUND_TTL, path)
             self._log("gitlab_project_resolved", project_id, path=path)
             return path
         if status in (403, 404):
-            self._cache[project_id] = (self._clock() + NOT_FOUND_TTL, None)
+            self._store(project_id, NOT_FOUND_TTL, None)
         self._log("gitlab_project_resolve_failed", project_id, status=status)
         return None
+
+    def _store(self, project_id: str, ttl: float, path: str | None):
+        now = self._clock()
+        if len(self._cache) >= MAX_CACHE:
+            self._cache = {k: v for k, v in self._cache.items() if now < v[0]}
+            while len(self._cache) >= MAX_CACHE:
+                del self._cache[next(iter(self._cache))]  # oldest insertion
+        self._cache.pop(project_id, None)
+        self._cache[project_id] = (now + ttl, path)
 
     async def _http_fetch(self, project_id: str, credential):
         headers = {credential.header: credential.real_value} if credential else {}
         # Direct, like mitmproxy's own upstream connections; certifi trust
         # store, mitmproxy's default for upstream verification.
-        async with httpx.AsyncClient(trust_env=False, timeout=TIMEOUT) as client:
+        async with httpx.AsyncClient(trust_env=False, timeout=TIMEOUT,
+                                     transport=self._transport) as client:
             r = await client.get(f"https://{self.host}/api/v4/projects/{project_id}",
                                  headers=headers)
         return r.status_code, (r.json() if r.status_code == 200 else None)
