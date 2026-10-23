@@ -189,6 +189,9 @@ GL_FILTER_LABEL = r"[A-Za-z0-9 _.:;#@!?'()&+/-]{1,64}"
 GL_FILTER_LABELS = rf"{GL_FILTER_LABEL}(?:,{GL_FILTER_LABEL}){{0,9}}"
 GL_MR_ORDER = (r"created_at|updated_at|merged_at|title|priority|label_priority|"
                r"milestone_due|popularity")
+GL_BUILD_STATE = (r"created|waiting_for_resource|preparing|pending|running|success|"
+                  r"failed|canceled|canceling|skipped|manual|scheduled")
+GL_USERNAME = r"[A-Za-z0-9_.-]{1,64}"
 GL_ISSUE_ORDER = (r"created_at|updated_at|priority|due_date|relative_position|"
                   r"label_priority|milestone_due|popularity|weight|title")
 GL_ISSUE_IN = r"title|description|title,description|description,title"
@@ -357,6 +360,36 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
                       query={"sort": GL_SORT, "order_by": "created_at|updated_at",
                              "per_page": GL_PER_PAGE, "page": GL_PAGE},
                       allow_percent=True),
+        # glab ci list/get/status/view/trace and job artifact: read-only
+        # pipeline and job state. Pipeline variables (ci get --with-variables)
+        # stay denied: they can carry trigger-time secrets.
+        registries._r(f"{base}/pipelines",
+                      query={"status": GL_BUILD_STATE,
+                             "scope": "running|pending|finished|branches|tags",
+                             "source": r"[a-z_]{1,40}", "ref": GL_REF, "sha": GL_SHA,
+                             "yaml_errors": GL_BOOL, "name": GL_FILTER_TEXT,
+                             "username": GL_USERNAME,
+                             "updated_after": GL_TIMESTAMP, "updated_before": GL_TIMESTAMP,
+                             "order_by": "id|status|ref|updated_at|user_id", "sort": GL_SORT,
+                             "per_page": GL_PER_PAGE, "page": GL_PAGE},
+                      allow_percent=True),
+        registries._r(f"{base}/pipelines/latest", query={"ref": GL_REF}, allow_percent=True),
+        registries._r(f"{base}/pipelines/{GL_ID}", allow_percent=True),
+        registries._r(f"{base}/pipelines/{GL_ID}/jobs",
+                      query={"scope[]": GL_BUILD_STATE, "include_retried": GL_BOOL,
+                             "per_page": GL_PER_PAGE, "page": GL_PAGE},
+                      allow_percent=True),
+        registries._r(f"{base}/pipelines/{GL_ID}/bridges",
+                      query={"per_page": GL_PER_PAGE, "page": GL_PAGE}, allow_percent=True),
+        registries._r(f"{base}/jobs/{GL_ID}", allow_percent=True),
+        registries._r(f"{base}/jobs/{GL_ID}/trace", allow_percent=True),
+        # glab ci artifact / job artifact <ref> <job>; the ref is sent unescaped.
+        registries._r(f"{base}/jobs/artifacts/{GL_REF}/download",
+                      query={"job": GL_FILTER_TEXT}, allow_percent=True),
+        # glab ci status/trace list external jobs of a pipeline's commit.
+        registries._r(f"{base}/repository/commits/{GL_SHA}/statuses",
+                      query={"all": GL_BOOL, "per_page": GL_PER_PAGE, "page": GL_PAGE},
+                      allow_percent=True),
         registries._r(f"{base}/repository/tree",
                       query={"ref": GL_REF, "path": GL_PATH, "per_page": GL_PER_PAGE,
                              "page": GL_PAGE},
@@ -382,6 +415,9 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
                           methods=["POST"], **write_kwargs),
             registries._r(f"{base}/issues/{GL_IID}/(?:reset_time_estimate|reset_spent_time)",
                           methods=["POST"], allow_percent=True),
+            # glab ci lint / ci config compile: validation only, but the
+            # body carries the whole CI config, so it's gated with the writes.
+            registries._r(f"{base}/ci/lint", methods=["POST"], **write_kwargs),
         ]
 
     return {host: {"rules": rules, "request_headers": sorted(request_headers)}}
