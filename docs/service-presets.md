@@ -165,6 +165,14 @@ explicit `%2[fF]` alternative rather than a free `%` character class, so it
 can't be repurposed to smuggle other percent-encoded bytes past the
 `%2e`-traversal check.
 
+GitLab also addresses projects by numeric ID (`/api/v4/projects/1901/...`).
+For those, the proxy looks up the project's path on the instance with the
+entry's own token (`GET /api/v4/projects/1901`) and checks the request as if
+it used that path; the request itself goes upstream unchanged. Lookups are
+cached for 10 minutes (an unknown ID for 1), so a project moved out of scope
+stays reachable for up to 10 minutes. The lookup trusts the same CA bundle
+as mitmproxy's default (certifi).
+
 **Why scope is expressed this way (`scope: {repos: [...]}`) instead of
 letting an entry carry a hand-written path regex the way a custom `hosts:`
 entry can:**
