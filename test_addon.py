@@ -456,12 +456,39 @@ class TestPathResolver:
         assert flow.request.path == "/id/1"
         assert resolver.calls == [("/id/1", CRED)]
 
-    def test_resolved_path_out_of_scope_is_denied(self):
+    def test_resolved_path_out_of_scope_is_denied(self, capsys):
         from config import HostEntry
         entry = HostEntry(rules=_resolved_rules("/name/1", FakeResolver()))
-        flow = run_with_resolver(make_state(hosts={"h.com": [entry]}),
-                                 make_flow("h.com", path="/id/2"))
+        state = make_state(hosts={"h.com": [entry]})
+        flow = run_with_resolver(state, make_flow("h.com", path="/id/2"))
         assert flow.response.status_code == 503
+        # The operator sees what the rules judged; the client doesn't.
+        assert state.deny_log[0]["reason"].endswith("(checked as /name/2)")
+        assert b"/name/2" not in flow.response.content
+        event = json.loads(capsys.readouterr().out)
+        assert event["path"] == "/id/2"
+        assert event["resolved_path"] == "/name/2"
+
+    def test_unresolved_violation_has_no_resolved_path(self, capsys):
+        from config import HostEntry
+        entry = HostEntry(rules=_resolved_rules("/name/1", FakeResolver()))
+        state = make_state(hosts={"h.com": [entry]})
+        run_with_resolver(state, make_flow("h.com", path="/x"))
+        assert "checked as" not in state.deny_log[0]["reason"]
+        assert "resolved_path" not in json.loads(capsys.readouterr().out)
+
+    @pytest.mark.parametrize("mismatch", [{"host_header": "other.com"}, {"sni": "other.com"}])
+    def test_host_mismatch_not_resolved(self, mismatch):
+        # The resolver may call upstream with the real credential; a request
+        # AllowlistAddon refuses outright mustn't trigger that.
+        from config import HostEntry
+        resolver = FakeResolver()
+        entry = HostEntry(rules=_resolved_rules("/name/1", resolver), credential=CRED)
+        flow = run_with_resolver(make_state(hosts={"h.com": [entry]}),
+                                 make_flow("h.com", path="/id/1", scheme="https",
+                                           port=443, **mismatch))
+        assert flow.response.status_code == 403
+        assert resolver.calls == []
 
     def test_none_keeps_request_path(self):
         from config import HostEntry
