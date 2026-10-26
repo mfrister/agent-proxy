@@ -140,12 +140,18 @@ class PathResolverAddon:
     addons under one error handler, so an exception here would skip
     AllowlistAddon and forward the request unchecked. It's logged and
     treated as None instead.
+
+    Requests AllowlistAddon will refuse for a Host/SNI mismatch aren't
+    resolved: a resolver may call the upstream with the entry's real
+    credential, which such a request shouldn't be able to trigger.
     """
 
     def __init__(self, state: ProxyState):
         self.state = state
 
     async def request(self, flow: HTTPFlow):
+        if host_header_mismatch(flow) is not None or sni_mismatch(flow) is not None:
+            return
         resolved = []
         for entry in active_entries(self.state, dest_host(flow)):
             resolver = entry.rules.path_resolver if entry.rules is not None else None
@@ -237,18 +243,22 @@ class AllowlistAddon:
         self._deny_violation(flow, *rejection)
 
     @staticmethod
-    def _evaluate(entry: HostEntry, flow: HTTPFlow):
+    def _resolved_path(entry: HostEntry, flow: HTTPFlow) -> str | None:
+        """A path_resolver's result (PathResolverAddon), if it produced one
+        for these exact rules; identity, not id(), which a config reload
+        during the resolver's await could hand to new rules."""
+        return next(
+            (path for rules, path in flow.metadata.get("resolved_paths", ())
+             if rules is entry.rules),
+            None,
+        )
+
+    @classmethod
+    def _evaluate(cls, entry: HostEntry, flow: HTTPFlow):
         return registries.evaluate(
             entry.rules,
             method=flow.request.method,
-            # A path_resolver's result (PathResolverAddon), if it produced
-            # one for these exact rules; identity, not id(), which a config
-            # reload during the resolver's await could hand to new rules.
-            path_with_query=next(
-                (path for rules, path in flow.metadata.get("resolved_paths", ())
-                 if rules is entry.rules),
-                flow.request.path,
-            ),
+            path_with_query=cls._resolved_path(entry, flow) or flow.request.path,
             headers=flow.request.headers,
             # raw_content is the buffered body mitmproxy actually forwards;
             # the client-supplied Content-Length header can lie.
@@ -350,15 +360,23 @@ class AllowlistAddon:
             "type": "policy_violation",
             "reason": verdict.reason,
         }
-        self._log_denial(flow, entry)
-        print(json.dumps({
+        event = {
             "event": "registry_policy_violation",
             "host": host,
             "method": flow.request.method,
             "path": flow.request.path[:512],
             "reason": verdict.reason,
             "policy": source,
-        }))
+        }
+        # The rules judged a resolved path (e.g. a numeric GitLab project ID
+        # as the project's path): show the operator what was out of scope.
+        # Not in the response, which stays the same as a pending approval.
+        resolved = self._resolved_path(host_entry, flow)
+        if resolved is not None:
+            entry["reason"] = f"{verdict.reason} (checked as {resolved[:512]})"
+            event["resolved_path"] = resolved[:512]
+        self._log_denial(flow, entry)
+        print(json.dumps(event))
 
     def _apply_scrubbing(self, flow: HTTPFlow, verdict):
         for name in verdict.drop_headers:
