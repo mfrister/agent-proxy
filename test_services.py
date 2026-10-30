@@ -545,6 +545,9 @@ class TestScopedGitLabRules:
         "/pipelines/123/jobs?per_page=500",
         "/pipelines/123/jobs?page=2&per_page=100&scope%5B%5D=failed",
         "/pipelines/123/bridges?page=1&per_page=500",
+        "/pipeline_schedules",
+        "/pipeline_schedules?page=1&per_page=30",
+        "/pipeline_schedules?scope=active",
         "/jobs/456",
         "/jobs/456/trace",
         "/jobs/artifacts/feature/x/download?job=build+linux",
@@ -561,6 +564,11 @@ class TestScopedGitLabRules:
         ("GET", "/pipelines?status=bogus"),
         ("GET", "/pipelines?name=" + "a" * 101),
         ("GET", "/pipelines/latest?ref=a%3Bb"),
+        ("GET", "/pipeline_schedules/9"),           # includes schedule variables
+        ("GET", "/pipeline_schedules?scope=all"),
+        ("POST", "/pipeline_schedules"),            # glab schedule create
+        ("POST", "/pipeline_schedules/9/play"),     # glab schedule run
+        ("DELETE", "/pipeline_schedules/9"),
         ("GET", "/jobs/456/artifacts/some/file"),
         ("POST", "/pipeline"),                      # glab ci run
         ("POST", "/pipelines/123/retry"),

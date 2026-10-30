@@ -384,6 +384,12 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
                       allow_percent=True),
         registries._r(f"{base}/pipelines/{GL_ID}/bridges",
                       query={"per_page": GL_PER_PAGE, "page": GL_PAGE}, allow_percent=True),
+        # glab schedule list. The list omits schedule variables; the
+        # single-schedule GET returns them, so it stays denied.
+        registries._r(f"{base}/pipeline_schedules",
+                      query={"scope": "active|inactive",
+                             "per_page": GL_PER_PAGE, "page": GL_PAGE},
+                      allow_percent=True),
         registries._r(f"{base}/jobs/{GL_ID}", allow_percent=True),
         registries._r(f"{base}/jobs/{GL_ID}/trace", allow_percent=True),
         # glab ci artifact / job artifact <ref> <job>; the ref is sent unescaped.
