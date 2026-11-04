@@ -390,6 +390,14 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
                       query={"scope": "active|inactive",
                              "per_page": GL_PER_PAGE, "page": GL_PAGE},
                       allow_percent=True),
+        # Lint the project's committed .gitlab-ci.yml (GET, unlike glab ci
+        # lint's POST of local content). dry_run only simulates pipeline
+        # creation; the result has the merged YAML and jobs, no CI variables.
+        # ref is the deprecated spelling of content_ref/dry_run_ref.
+        registries._r(f"{base}/ci/lint",
+                      query={"dry_run": GL_BOOL, "include_jobs": GL_BOOL,
+                             "ref": GL_REF, "content_ref": GL_REF, "dry_run_ref": GL_REF},
+                      allow_percent=True),
         registries._r(f"{base}/jobs/{GL_ID}", allow_percent=True),
         registries._r(f"{base}/jobs/{GL_ID}/trace", allow_percent=True),
         # glab ci artifact / job artifact <ref> <job>; the ref is sent unescaped.

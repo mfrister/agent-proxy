@@ -548,6 +548,9 @@ class TestScopedGitLabRules:
         "/pipeline_schedules",
         "/pipeline_schedules?page=1&per_page=30",
         "/pipeline_schedules?scope=active",
+        "/ci/lint",
+        "/ci/lint?dry_run=true&ref=main&include_jobs=true",
+        "/ci/lint?content_ref=feature%2Fx&dry_run=true&dry_run_ref=main",
         "/jobs/456",
         "/jobs/456/trace",
         "/jobs/artifacts/feature/x/download?job=build+linux",
@@ -569,6 +572,9 @@ class TestScopedGitLabRules:
         ("POST", "/pipeline_schedules"),            # glab schedule create
         ("POST", "/pipeline_schedules/9/play"),     # glab schedule run
         ("DELETE", "/pipeline_schedules/9"),
+        ("GET", "/ci/lint?dry_run=yes"),
+        ("GET", "/ci/lint?ref=a%3Bb"),
+        ("GET", "/ci/lint?content=x"),              # only POST takes content
         ("GET", "/jobs/456/artifacts/some/file"),
         ("POST", "/pipeline"),                      # glab ci run
         ("POST", "/pipelines/123/retry"),
