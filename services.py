@@ -390,6 +390,13 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
                       query={"scope": "active|inactive",
                              "per_page": GL_PER_PAGE, "page": GL_PAGE},
                       allow_percent=True),
+        # Pipelines a schedule triggered: plain pipeline objects, without
+        # the schedule's variables.
+        registries._r(f"{base}/pipeline_schedules/{GL_ID}/pipelines",
+                      query={"scope": "running|pending|finished|branches|tags",
+                             "status": GL_BUILD_STATE, "sort": GL_SORT,
+                             "per_page": GL_PER_PAGE, "page": GL_PAGE},
+                      allow_percent=True),
         # Lint the project's committed .gitlab-ci.yml (GET, unlike glab ci
         # lint's POST of local content). dry_run only simulates pipeline
         # creation; the result has the merged YAML and jobs, no CI variables.

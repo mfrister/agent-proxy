@@ -548,6 +548,8 @@ class TestScopedGitLabRules:
         "/pipeline_schedules",
         "/pipeline_schedules?page=1&per_page=30",
         "/pipeline_schedules?scope=active",
+        "/pipeline_schedules/9/pipelines?per_page=50",
+        "/pipeline_schedules/9/pipelines?page=2&per_page=20&sort=desc&status=failed",
         "/ci/lint",
         "/ci/lint?dry_run=true&ref=main&include_jobs=true",
         "/ci/lint?content_ref=feature%2Fx&dry_run=true&dry_run_ref=main",
@@ -569,6 +571,8 @@ class TestScopedGitLabRules:
         ("GET", "/pipelines/latest?ref=a%3Bb"),
         ("GET", "/pipeline_schedules/9"),           # includes schedule variables
         ("GET", "/pipeline_schedules?scope=all"),
+        ("GET", "/pipeline_schedules/9/pipelines?status=bogus"),
+        ("GET", "/pipeline_schedules/9/variables/KEY"),
         ("POST", "/pipeline_schedules"),            # glab schedule create
         ("POST", "/pipeline_schedules/9/play"),     # glab schedule run
         ("DELETE", "/pipeline_schedules/9"),

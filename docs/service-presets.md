@@ -361,7 +361,7 @@ leaked push credential cannot be exercised through the proxy.
 | `pypi` | `pypi.org`, `files.pythonhosted.org` | Simple index (PEP 503), JSON API (project and per-version), and package files. |
 | `crates` | `index.crates.io`, `crates.io`, `static.crates.io` | Sparse index, the API download endpoint, and `.crate` files. |
 | `github` | `api.github.com`, scoped to `scope.repos`/`scope.orgs` | Repo metadata, contents, commits, branches, pulls, issues, and git refs/trees/blobs (read-only). `write: true` adds issue/PR/comment POST/PATCH; `graphql: true` adds unscoped `POST /graphql`. |
-| `gitlab` | the entry's `host:`, scoped to `scope.projects`/`scope.groups` | The `/api/v4/projects/{id}` equivalent of the above: files, commits, branches, merge requests (with `glab mr list`'s filter parameters, the branch lookup `glab mr view` and friends do without an MR number, `mr view`'s approval state and discussions, and an MR's pipelines), issues (with `glab issue list`'s filter parameters) and issue comments, milestone lookup by title, repository tree/blobs, CI pipelines, jobs, job logs, commit statuses and artifact download for `glab ci list/get/status/view/trace/artifact`, the pipeline schedule list for `glab schedule list`, linting the committed CI config at a ref (`GET .../ci/lint`, optionally with `dry_run`/`include_jobs`) (all read-only), plus the token's own user (`GET /api/v4/user`, which `glab auth login`/`auth status` need). `write: true` adds issue/MR/note POST/PUT, issue subscribe/unsubscribe, issue time tracking, and `glab ci lint` (`POST .../ci/lint`). |
+| `gitlab` | the entry's `host:`, scoped to `scope.projects`/`scope.groups` | The `/api/v4/projects/{id}` equivalent of the above: files, commits, branches, merge requests (with `glab mr list`'s filter parameters, the branch lookup `glab mr view` and friends do without an MR number, `mr view`'s approval state and discussions, and an MR's pipelines), issues (with `glab issue list`'s filter parameters) and issue comments, milestone lookup by title, repository tree/blobs, CI pipelines, jobs, job logs, commit statuses and artifact download for `glab ci list/get/status/view/trace/artifact`, the pipeline schedule list for `glab schedule list` and the pipelines a schedule triggered, linting the committed CI config at a ref (`GET .../ci/lint`, optionally with `dry_run`/`include_jobs`) (all read-only), plus the token's own user (`GET /api/v4/user`, which `glab auth login`/`auth status` need). `write: true` adds issue/MR/note POST/PUT, issue subscribe/unsubscribe, issue time tracking, and `glab ci lint` (`POST .../ci/lint`). |
 
 Rule definitions live in `registries.py` (`PRESETS`) for registry presets and
 in `services.py` (`_github_rules`, `_gitlab_rules`) for the API presets; git
@@ -393,7 +393,7 @@ history for either is the audit trail for policy changes.
   the project's CI secrets and deploy access, so not even `write: true`
   allows them. `ci get --with-variables` is denied too: pipeline variables
   can carry trigger-time secrets. Likewise only `glab schedule list` works;
-  a single schedule's GET returns its variables and stays denied, and
+  a single schedule's GET returns its variables and stays denied (its triggered-pipelines list is allowed), and
   `schedule create/update/run/delete` are denied. If the instance serves
   artifacts by redirecting to object storage, that storage host needs its
   own entry.
