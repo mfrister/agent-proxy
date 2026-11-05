@@ -426,6 +426,8 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
                              "page": GL_PAGE},
                       allow_percent=True),
         registries._r(f"{base}/repository/blobs/{GL_SHA}", allow_percent=True),
+        # The project's language breakdown (percentages only).
+        registries._r(f"{base}/languages", allow_percent=True),
     ]
 
     if group_id is not None:
