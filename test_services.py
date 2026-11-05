@@ -406,6 +406,10 @@ class TestScopedGitLabRules:
         "&page=2&per_page=30&sort=desc",
         "/api/v4/groups/team%2Fsandbox/projects?per_page=100&visibility=private"
         "&with_issues_enabled=true&with_shared=false",
+        "/api/v4/groups/team%2Fsandbox/projects?archived=false&include_subgroups=true"
+        "&per_page=100&with_programming_language=Go",
+        "/api/v4/groups/team%2Fsandbox/projects?with_programming_language=C%2B%2B",
+        "/api/v4/groups/team%2Fsandbox/projects?with_programming_language=Vim+Script",
     ])
     def test_group_projects_list_allowed(self, path):
         scope = {"groups": ["team/sandbox"]}
@@ -417,6 +421,10 @@ class TestScopedGitLabRules:
         ({"groups": ["team/sandbox"]}, "GET", "/api/v4/groups/team/projects"),
         ({"groups": ["team/sandbox"]}, "GET", "/api/v4/groups/team%2Fsandbox"),
         ({"groups": ["team/sandbox"]}, "GET", "/api/v4/groups/team%2Fsandbox/projects?x=1"),
+        ({"groups": ["team/sandbox"]}, "GET",
+         "/api/v4/groups/team%2Fsandbox/projects?with_programming_language=a%3Bb"),
+        ({"groups": ["team/sandbox"]}, "GET",
+         "/api/v4/groups/team%2Fsandbox/projects?with_programming_language=" + "a" * 65),
         ({"groups": ["team/sandbox"]}, "GET", "/api/v4/groups/123/projects"),
         ({"groups": ["team/sandbox"]}, "POST", "/api/v4/groups/team%2Fsandbox/projects"),
         # a projects-only scope grants no group listing

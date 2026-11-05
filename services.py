@@ -442,6 +442,8 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
                    "with_issues_enabled": GL_BOOL,
                    "visibility": "public|internal|private",
                    "search": GL_FILTER_TEXT,
+                   # a language name: Go, C++, C#, Objective-C, Vim Script, ...
+                   "with_programming_language": r"[A-Za-z0-9 +#._'-]{1,64}",
                    "order_by": "id|name|path|created_at|updated_at|last_activity_at"
                                "|similarity|star_count",
                    "sort": GL_SORT, "per_page": GL_PER_PAGE, "page": GL_PAGE},
