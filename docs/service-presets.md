@@ -142,8 +142,9 @@ repo under that owner — GitHub repo paths are always exactly `owner/repo`,
 so there's no deeper nesting to bound the way GitLab's `groups` needs to) are
 the two `github` scope params; `gitlab` has `projects`
 (`namespace[/subgroup...]/project`, up to 10 path segments) and `groups`
-(same shape, up to 9 subgroup segments) plus a required scalar `host:` naming
-the self-hosted instance. `write` (both presets) adds issue/PR/MR/comment
+(same shape, up to 9 subgroup segments; a group covers every project in it
+and in its subgroups, down to GitLab's 20-level nesting limit) plus a
+required scalar `host:` naming the self-hosted instance. `write` (both presets) adds issue/PR/MR/comment
 POST/PATCH/PUT routes (and, for `gitlab`, the CI config lint); `graphql` (`github` only) is covered above. At least
 one scope param must be supplied — an entry with `scope: {}` or all-empty
 lists is rejected the same as a missing `scope:` key.
@@ -361,7 +362,7 @@ leaked push credential cannot be exercised through the proxy.
 | `pypi` | `pypi.org`, `files.pythonhosted.org` | Simple index (PEP 503), JSON API (project and per-version), and package files. |
 | `crates` | `index.crates.io`, `crates.io`, `static.crates.io` | Sparse index, the API download endpoint, and `.crate` files. |
 | `github` | `api.github.com`, scoped to `scope.repos`/`scope.orgs` | Repo metadata, contents, commits, branches, pulls, issues, and git refs/trees/blobs (read-only). `write: true` adds issue/PR/comment POST/PATCH; `graphql: true` adds unscoped `POST /graphql`. |
-| `gitlab` | the entry's `host:`, scoped to `scope.projects`/`scope.groups` | The `/api/v4/projects/{id}` equivalent of the above: files, commits, branches, merge requests (with `glab mr list`'s filter parameters, the branch lookup `glab mr view` and friends do without an MR number, `mr view`'s approval state and discussions, and an MR's pipelines), issues (with `glab issue list`'s filter parameters) and issue comments, milestone lookup by title, repository tree/blobs, CI pipelines, jobs, job logs, commit statuses and artifact download for `glab ci list/get/status/view/trace/artifact`, the pipeline schedule list for `glab schedule list` and the pipelines a schedule triggered, linting the committed CI config at a ref (`GET .../ci/lint`, optionally with `dry_run`/`include_jobs`) (all read-only), plus the token's own user (`GET /api/v4/user`, which `glab auth login`/`auth status` need). `write: true` adds issue/MR/note POST/PUT, issue subscribe/unsubscribe, issue time tracking, and `glab ci lint` (`POST .../ci/lint`). |
+| `gitlab` | the entry's `host:`, scoped to `scope.projects`/`scope.groups` | The `/api/v4/projects/{id}` equivalent of the above: files, commits, branches, merge requests (with `glab mr list`'s filter parameters, the branch lookup `glab mr view` and friends do without an MR number, `mr view`'s approval state and discussions, and an MR's pipelines), issues (with `glab issue list`'s filter parameters) and issue comments, milestone lookup by title, repository tree/blobs, CI pipelines, jobs, job logs, commit statuses and artifact download for `glab ci list/get/status/view/trace/artifact`, the project list of a scoped group or subgroup (`GET /api/v4/groups/{group}/projects`, for `glab repo list -g`/`repo clone -g`; by path only, and with GitLab's default `with_shared=true` it also names projects shared into the group from elsewhere), the pipeline schedule list for `glab schedule list` and the pipelines a schedule triggered, linting the committed CI config at a ref (`GET .../ci/lint`, optionally with `dry_run`/`include_jobs`) (all read-only), plus the token's own user (`GET /api/v4/user`, which `glab auth login`/`auth status` need). `write: true` adds issue/MR/note POST/PUT, issue subscribe/unsubscribe, issue time tracking, and `glab ci lint` (`POST .../ci/lint`). |
 
 Rule definitions live in `registries.py` (`PRESETS`) for registry presets and
 in `services.py` (`_github_rules`, `_gitlab_rules`) for the API presets; git

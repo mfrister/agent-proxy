@@ -157,6 +157,9 @@ GH_PER_PAGE = r"[1-9][0-9]{0,2}"           # 1-999
 GH_PAGE = r"[1-9][0-9]{0,3}"               # 1-9999
 
 GL_SEG = r"[A-Za-z0-9._-]{1,100}"          # one namespace/project path segment
+# GitLab nests groups at most 20 levels deep, so a scoped group has at most
+# 19 levels of subgroups below it.
+GL_MAX_SUBGROUP_DEPTH = 19
 GL_IID = r"\d{1,10}"                       # issue/MR internal id
 GL_SHA = r"[0-9a-fA-F]{4,40}"
 GL_REF = r"[A-Za-z0-9._/-]{1,250}"
@@ -272,10 +275,14 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
     allow_percent=True since {id} always contains a literal '%'.
     """
     alts = []
+    group_id = None
     if "projects" in escaped:
         alts.append(_gitlab_encode(escaped["projects"]))
     if "groups" in escaped:
-        alts.append(f"{_gitlab_encode(escaped['groups'])}%2[fF]{GL_SEG}")
+        # A scoped group covers its subgroups at any depth GitLab allows.
+        group_id = (f"{_gitlab_encode(escaped['groups'])}"
+                    f"(?:%2[fF]{GL_SEG}){{0,{GL_MAX_SUBGROUP_DEPTH}}}")
+        alts.append(f"{group_id}%2[fF]{GL_SEG}")
     project_id = "(?:" + "|".join(alts) + ")"
     base = f"/api/v4/projects/{project_id}"
 
@@ -420,6 +427,25 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
                       allow_percent=True),
         registries._r(f"{base}/repository/blobs/{GL_SHA}", allow_percent=True),
     ]
+
+    if group_id is not None:
+        # glab repo list -g / repo clone -g: the projects of a scoped group or
+        # one of its subgroups. GitLab's default with_shared=true also lists
+        # projects from elsewhere that were shared with the group (metadata
+        # only; their content stays out of scope).
+        rules.append(registries._r(
+            f"/api/v4/groups/{group_id}/projects",
+            query={"include_subgroups": GL_BOOL, "archived": GL_BOOL,
+                   "with_shared": GL_BOOL, "owned": GL_BOOL, "starred": GL_BOOL,
+                   "simple": GL_BOOL, "active": GL_BOOL,
+                   "with_merge_requests_enabled": GL_BOOL,
+                   "with_issues_enabled": GL_BOOL,
+                   "visibility": "public|internal|private",
+                   "search": GL_FILTER_TEXT,
+                   "order_by": "id|name|path|created_at|updated_at|last_activity_at"
+                               "|similarity|star_count",
+                   "sort": GL_SORT, "per_page": GL_PER_PAGE, "page": GL_PAGE},
+            allow_percent=True))
 
     request_headers = {"private-token"}
     if flags.get("write"):

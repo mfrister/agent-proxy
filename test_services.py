@@ -376,6 +376,56 @@ class TestScopedGitLabRules:
         assert isinstance(allowed, registries.Allowed)
         assert isinstance(evil, registries.Violation)
 
+    @pytest.mark.parametrize("project", [
+        "team%2Fsandbox%2Fsub%2Fproj",
+        "team%2Fsandbox%2Fa%2Fb%2Fc%2Fproj",
+        "team%2Fsandbox%2F" + "%2F".join(f"s{i}" for i in range(19)) + "%2Fproj",
+    ])
+    def test_group_scope_covers_subgroups(self, project):
+        scope = {"groups": ["team/sandbox"]}
+        result = _gitlab_eval(scope, {}, "GET", f"/api/v4/projects/{project}/issues/1")
+        assert isinstance(result, registries.Allowed)
+
+    @pytest.mark.parametrize("project", [
+        "team%2Fsandbox",                           # the group itself isn't a project
+        "team%2Fsandbox-evil%2Fsub%2Fproj",
+        "team%2Fother%2Fsandbox%2Fproj",
+        # deeper than GitLab's 20 group levels
+        "team%2Fsandbox%2F" + "%2F".join(f"s{i}" for i in range(20)) + "%2Fproj",
+    ])
+    def test_group_scope_boundary(self, project):
+        scope = {"groups": ["team/sandbox"]}
+        result = _gitlab_eval(scope, {}, "GET", f"/api/v4/projects/{project}/issues/1")
+        assert isinstance(result, registries.Violation)
+
+    @pytest.mark.parametrize("path", [
+        "/api/v4/groups/team%2Fsandbox/projects",
+        "/api/v4/groups/team%2Fsandbox/projects?archived=false&include_subgroups=true"
+        "&per_page=100",
+        "/api/v4/groups/team%2Fsandbox%2Fsub/projects?order_by=last_activity_at&owned=true"
+        "&page=2&per_page=30&sort=desc",
+        "/api/v4/groups/team%2Fsandbox/projects?per_page=100&visibility=private"
+        "&with_issues_enabled=true&with_shared=false",
+    ])
+    def test_group_projects_list_allowed(self, path):
+        scope = {"groups": ["team/sandbox"]}
+        result = _gitlab_eval(scope, {}, "GET", path)
+        assert isinstance(result, registries.Allowed)
+
+    @pytest.mark.parametrize("scope,method,path", [
+        ({"groups": ["team/sandbox"]}, "GET", "/api/v4/groups/team%2Fsandbox-evil/projects"),
+        ({"groups": ["team/sandbox"]}, "GET", "/api/v4/groups/team/projects"),
+        ({"groups": ["team/sandbox"]}, "GET", "/api/v4/groups/team%2Fsandbox"),
+        ({"groups": ["team/sandbox"]}, "GET", "/api/v4/groups/team%2Fsandbox/projects?x=1"),
+        ({"groups": ["team/sandbox"]}, "GET", "/api/v4/groups/123/projects"),
+        ({"groups": ["team/sandbox"]}, "POST", "/api/v4/groups/team%2Fsandbox/projects"),
+        # a projects-only scope grants no group listing
+        ({"projects": ["team/sandbox/proj"]}, "GET", "/api/v4/groups/team%2Fsandbox/projects"),
+    ])
+    def test_group_projects_list_denied(self, scope, method, path):
+        result = _gitlab_eval(scope, {}, method, path)
+        assert isinstance(result, registries.Violation)
+
     def test_traversal_denied(self):
         scope = {"projects": ["team/backend"]}
         result = _gitlab_eval(
