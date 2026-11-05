@@ -661,13 +661,15 @@ class TestScopedGitLabRules:
                               content_type="application/json")
         assert isinstance(result, registries.Allowed if allowed else registries.Violation)
 
-    def test_project_languages_allowed(self):
-        scope = {"groups": ["team/sandbox"]}
-        path = "/api/v4/projects/team%2Fsandbox%2Fproj/languages"
-        assert isinstance(_gitlab_eval(scope, {}, "GET", path), registries.Allowed)
-        assert isinstance(_gitlab_eval(scope, {}, "GET", path + "?x=1"), registries.Violation)
-        other = "/api/v4/projects/other%2Fproj/languages"
-        assert isinstance(_gitlab_eval(scope, {}, "GET", other), registries.Violation)
+    @pytest.mark.parametrize("path,allowed", [
+        ("/api/v4/projects/team%2Fbackend/languages", True),
+        ("/api/v4/projects/team%2Fbackend/languages?x=1", False),
+        ("/api/v4/projects/other%2Fproj/languages", False),
+    ])
+    def test_project_languages(self, path, allowed):
+        scope = {"projects": ["team/backend"]}
+        result = _gitlab_eval(scope, {}, "GET", path)
+        assert isinstance(result, registries.Allowed if allowed else registries.Violation)
 
     def test_issue_notes_list_allowed(self):
         # glab issue view --comments

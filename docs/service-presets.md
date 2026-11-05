@@ -144,8 +144,9 @@ the two `github` scope params; `gitlab` has `projects`
 (`namespace[/subgroup...]/project`, up to 10 path segments) and `groups`
 (same shape, up to 9 subgroup segments; a group covers every project in it
 and in its subgroups, down to GitLab's 20-level nesting limit) plus a
-required scalar `host:` naming the self-hosted instance. `write` (both presets) adds issue/PR/MR/comment
-POST/PATCH/PUT routes (and, for `gitlab`, the CI config lint); `graphql` (`github` only) is covered above. At least
+required scalar `host:` naming the self-hosted instance. `write` (both
+presets) adds issue/PR/MR/comment POST/PATCH/PUT routes (and, for `gitlab`,
+the CI config lint); `graphql` (`github` only) is covered above. At least
 one scope param must be supplied — an entry with `scope: {}` or all-empty
 lists is rejected the same as a missing `scope:` key.
 
@@ -394,10 +395,29 @@ history for either is the audit trail for policy changes.
   the project's CI secrets and deploy access, so not even `write: true`
   allows them. `ci get --with-variables` is denied too: pipeline variables
   can carry trigger-time secrets. Likewise only `glab schedule list` works;
-  a single schedule's GET returns its variables and stays denied (its triggered-pipelines list is allowed), and
-  `schedule create/update/run/delete` are denied. If the instance serves
-  artifacts by redirecting to object storage, that storage host needs its
-  own entry.
+  a single schedule's GET returns its variables and stays denied (its
+  triggered-pipelines list is allowed), and `schedule create/update/run/delete`
+  are denied. If the instance serves artifacts by redirecting to object
+  storage, that storage host needs its own entry.
+- **CI lint can reach beyond the `gitlab` scope.** Two effects to weigh
+  before relying on the scope as a hard boundary:
+  - The lint result's `merged_yaml` (and, with `include_jobs`, its job
+    list) inlines every file the config pulls in, including
+    `include: project:` files from projects outside the scope that the
+    token can read. This applies to the read-only `GET .../ci/lint` of a
+    committed config as well as to `write: true`'s `POST .../ci/lint`.
+  - With `dry_run`, GitLab evaluates `rules:` and `include: rules:`
+    against the project's CI/CD variables, so which jobs and includes
+    show up depends on their values. A config with
+    `rules: - if: $SECRET =~ /^a/` acts as an oracle that leaks a secret
+    one guess at a time. Under `write: true`, `POST .../ci/lint` takes the
+    config in the request body, so the agent can run this directly. The
+    read-only `GET` form only lints configs already committed to a branch;
+    the proxy denies git push, so the agent can't author one itself, but
+    anyone else who can push to the project can.
+
+  Leave `write` off a `gitlab` service whose project or group CI/CD
+  variables must stay secret from the agent.
 - If a preset pattern turns out too tight for a legitimate workflow, the
   violation shows up in the TUI; temp-allowing the host is the immediate
   escape hatch, and a custom `hosts:` entry (added alongside the preset's
