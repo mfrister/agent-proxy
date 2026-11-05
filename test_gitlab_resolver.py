@@ -223,19 +223,19 @@ class TestThroughConfig:
         return flow, gitlab
 
     def test_group_scope_allows_numeric_id(self):
-        state = self._state({"groups": ["cloud/load-balancer"]})
+        state = self._state({"groups": ["team/sandbox"]})
         flow, gitlab = self._run(state, "/api/v4/projects/1901/issues/3",
-                                 {"1901": found("cloud/load-balancer/lb-service")})
+                                 {"1901": found("team/sandbox/service")})
         assert flow.response is None
         assert flow.request.path == "/api/v4/projects/1901/issues/3"
         assert flow.request.headers["PRIVATE-TOKEN"] == "glpat-real"
         assert gitlab.calls[0][1].real_value == "glpat-real"
 
     @pytest.mark.parametrize("projects", [
-        {"1901": found("other/lb-service")},
+        {"1901": found("other/service")},
         {},                                         # 404
     ])
     def test_out_of_scope_or_unknown_id_denied(self, projects):
-        state = self._state({"groups": ["cloud/load-balancer"]})
+        state = self._state({"groups": ["team/sandbox"]})
         flow, _ = self._run(state, "/api/v4/projects/1901/issues/3", projects)
         assert flow.response.status_code == 503
