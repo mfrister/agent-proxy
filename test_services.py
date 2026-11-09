@@ -733,6 +733,7 @@ class TestScopedGitLabRules:
         ("add_spent_time", 20),
         ("reset_time_estimate", 0),
         ("reset_spent_time", 0),
+        ("links", 60),
     ])
     def test_write_gates_issue_subscription_and_time_tracking(self, action, body_len):
         scope = {"projects": ["team/backend"]}
@@ -751,6 +752,18 @@ class TestScopedGitLabRules:
         path = f"/api/v4/projects/team%2Fbackend/issues/7/{action}"
         result = _gitlab_eval(scope, {"write": True}, "POST", path, body_len=20,
                               content_type="application/json")
+        assert isinstance(result, registries.Violation)
+
+    @pytest.mark.parametrize("method,path", [
+        ("POST", "/api/v4/projects/other%2Fproject/issues/7/links"),
+        ("GET", "/api/v4/projects/team%2Fbackend/issues/7/links"),
+        ("DELETE", "/api/v4/projects/team%2Fbackend/issues/7/links/3"),
+    ])
+    def test_issue_links_other_shapes_denied(self, method, path):
+        scope = {"projects": ["team/backend"]}
+        body_len = 60 if method == "POST" else 0
+        result = _gitlab_eval(scope, {"write": True}, method, path, body_len=body_len,
+                              content_type="application/json" if body_len else None)
         assert isinstance(result, registries.Violation)
 
     def test_authorization_header_present_for_credential(self):

@@ -469,6 +469,11 @@ def _gitlab_rules(escaped: dict, flags: dict, host: str | None) -> dict:
                           methods=["POST"], **write_kwargs),
             registries._r(f"{base}/issues/{GL_IID}/(?:reset_time_estimate|reset_spent_time)",
                           methods=["POST"], allow_percent=True),
+            # glab issue create --linked-issues. The body's target_project_id
+            # is not checked, so the target issue may sit outside the scope; it
+            # then gets a "marked as related" system note, the same reach an
+            # issue or comment body has by mentioning group/project#iid.
+            registries._r(f"{base}/issues/{GL_IID}/links", methods=["POST"], **write_kwargs),
             # glab ci lint / ci config compile: validation only, but the
             # body carries the whole CI config, so it's gated with the writes.
             registries._r(f"{base}/ci/lint", methods=["POST"], **write_kwargs),
